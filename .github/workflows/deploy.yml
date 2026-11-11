@@ -1,4 +1,4 @@
-name: Deploy to Azure Container Apps
+name: Deploy to Google Cloud Run
 
 on:
   push:
@@ -6,16 +6,12 @@ on:
     paths: ["app/**", "Dockerfile", ".github/workflows/deploy.yml"]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-
 concurrency:
   group: deploy
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/planforge
+  REGION: asia-south1
 
 jobs:
   deploy:
@@ -26,23 +22,23 @@ jobs:
         run: |
           python -m py_compile app/server.py app/pipeline.py
           node --check app/static/app.js
-      - uses: docker/login-action@v3
+      - uses: google-github-actions/auth@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ env.IMAGE }}:${{ github.sha }},${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Update the container app
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Build and push the image
         run: |
-          az extension add --name containerapp --upgrade -y --only-show-errors
-          az containerapp update -n planforge -g planforge-rg --image $IMAGE:${{ github.sha }} --only-show-errors -o none
-          echo "Live at: https://$(az containerapp show -n planforge -g planforge-rg --query properties.configuration.ingress.fqdn -o tsv)"
+          IMAGE=$REGION-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/planforge/app:${{ github.sha }}
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          gcloud auth configure-docker $REGION-docker.pkg.dev -q
+          docker build -t $IMAGE .
+          docker push $IMAGE
+      - name: Deploy
+        run: |
+          # 2 CPU / 4 GB, scales to zero, never more than 1 instance (cost cap + one job queue);
+          # CPU stays on while an instance is up so background conversions are not throttled
+          gcloud run deploy planforge --image $IMAGE --region $REGION \
+            --cpu 2 --memory 4Gi --min-instances 0 --max-instances 1 --concurrency 40 \
+            --no-cpu-throttling --timeout 900 --port 8080 --allow-unauthenticated \
+            --set-secrets HF_TOKEN=hf-token:latest -q
+          echo "Live at: $(gcloud run services describe planforge --region $REGION --format='value(status.url)')"

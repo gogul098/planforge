@@ -8,5 +8,5 @@ RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 --index-url http
 COPY app/ .
 ENV PYTHONUNBUFFERED=1 MPLBACKEND=Agg YOLO_CONFIG_DIR=/tmp/yolo HF_HOME=/tmp/hf \
     P3D_NO_MAIN=1 P3D_NO_INSTALL=1 PLANFORGE_JOBS=/tmp/jobs
-EXPOSE 8000
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8080
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
