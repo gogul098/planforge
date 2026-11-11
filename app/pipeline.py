@@ -1,0 +1,1606 @@
+# Generated from plan_to_revit.py for the web app. Settings below are overridden per request by app.py.
+# ===================== FLOOR PLAN -> EXACT 3D FOR REVIT =====================
+# Reads the plan with your model + OCR, solves wall positions from the WRITTEN dimensions,
+# and writes plan.json (for build_in_revit.py), model.ifc (Revit: Open/Link IFC) and model.glb (preview).
+IMAGE = ""                    # floor-plan image URL or file path (clean scan/export, dimensions visible)
+HF_REPO = "floorplan-multitask-effb3-768"
+MAX_SIDE = 1280               # inference size (try 1536 for big/dense sheets)
+
+# --- scale: written dimensions are used automatically. Only if the plan has NO dimensions:
+METERS_PER_PIXEL = None
+BUILDING_WIDTH_M = None       # distance between outermost wall centre-lines
+DOOR_WIDTH_M = 0.9            # last-resort estimate
+
+# --- standards (metres). Wall thickness snaps to the nearest option within 35%.
+WALL_THICKNESSES = [0.115, 0.15, 0.2, 0.23, 0.3]
+EXTERNAL_WALL_M = None        # e.g. 0.23 to force all external walls
+INTERNAL_WALL_M = None        # e.g. 0.115 to force all internal walls
+DOOR_WIDTHS = [0.75, 0.8, 0.9, 1.0, 1.2]
+WALL_HEIGHT, DOOR_HEIGHT = 3.0, 2.1
+WINDOW_SILL, WINDOW_HEAD = 0.9, 2.1
+SLAB, STAIR_RISE = 0.15, 0.175
+OUT_DIR = "/kaggle/working/plan_revit"
+
+# --- furniture: fixtures from the floor-plan model + your trained furniture detector (if available)
+MAKE_FURNITURE = True
+FURNITURE_REPO = "floorplan-furniture-obb"   # HF model repo from the furniture notebook ("" to skip)
+FURNITURE_CONF = 0.4          # always accepted at/above this
+FURNITURE_LOW_CONF = 0.15     # weaker hits accepted only when the room fits (bed in a bedroom, ...)
+
+import os, sys, re, json, subprocess
+if not os.environ.get("P3D_NO_INSTALL"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "segmentation-models-pytorch==0.6.0",
+                    "timm==1.0.31", "huggingface_hub", "trimesh", "shapely", "mapbox-earcut",
+                    "ifcopenshell>=0.8.3", "rapidocr_onnxruntime"], check=False)
+import cv2, numpy as np, matplotlib.pyplot as plt
+from scipy import ndimage
+from skimage.morphology import skeletonize
+
+WALL, WIN, DOOR, STAIRS = 2, 1, 2, 11   # room-head wall id; icon-head ids
+LAST_ORIGINAL = None
+
+
+# ----------------------------------------------------------------------------- 1. model inference
+def predict(image_src):
+    import urllib.request, torch, segmentation_models_pytorch as smp
+    from huggingface_hub import HfApi, hf_hub_download
+    ckpt = "/kaggle/working/checkpoints/best.pt"
+    if not os.path.exists(ckpt):
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            from kaggle_secrets import UserSecretsClient
+            token = UserSecretsClient().get_secret("HF_TOKEN")
+        repo = f"{HfApi(token=token).whoami()['name']}/{HF_REPO}"
+        ckpt = hf_hub_download(repo, "checkpoints/best.pt", token=token)
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
+                   decoder_attention_type="scse")
+    net.load_state_dict(ck["ema"]); net.to(dev).eval()
+    if image_src.startswith("http"):
+        req = urllib.request.Request(image_src, headers={"User-Agent": "Mozilla/5.0"})
+        img = cv2.imdecode(np.frombuffer(urllib.request.urlopen(req, timeout=60).read(), np.uint8),
+                           cv2.IMREAD_UNCHANGED)
+    else:
+        img = cv2.imread(image_src, cv2.IMREAD_UNCHANGED)
+    assert img is not None, "could not read IMAGE"
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
+        a = img[:, :, 3:4] / 255.0
+        img = (img[:, :, :3] * a + 255 * (1 - a)).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    global LAST_ORIGINAL
+    LAST_ORIGINAL = img                       # full-resolution copy for OCR (small text needs it)
+    s = MAX_SIDE / max(img.shape[:2])
+    img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+    h, w = img.shape[:2]
+    pad = cv2.copyMakeBorder(img, 0, (32 - h % 32) % 32, 0, (32 - w % 32) % 32,
+                             cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    x = (pad.astype(np.float32) - [123.675, 116.28, 103.53]) / [58.395, 57.12, 57.375]
+    x = torch.from_numpy(x.transpose(2, 0, 1)).float()[None].to(dev)
+    with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
+        out = (net(x).float() + net(x.flip(3)).float().flip(3)) / 2
+    out = out[0, :, :h, :w]
+    room = out[:12].argmax(0).cpu().numpy().astype(np.uint8)
+    icon = out[12:24].argmax(0).cpu().numpy().astype(np.uint8)
+    print(f"model: epoch {ck['epoch'] + 1}, val score {ck['metrics']['score']:.3f}, image {w}x{h}, {dev}")
+    return img, room, icon
+
+
+# ----------------------------------------------------------------------------- 2. vectorise
+def _components(mask, min_area):
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    return [(lab == i, st[i]) for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= min_area]
+
+
+def _cluster(values, tol):
+    """Merge nearly equal coordinates so walls line up (grid snapping)."""
+    order = np.argsort(values)
+    out, group = np.array(values, float), [order[0]] if len(values) else []
+    for a, b in zip(order[:-1], order[1:]):
+        if values[b] - values[a] <= tol:
+            group.append(b)
+        else:
+            out[group] = np.mean([values[i] for i in group]); group = [b]
+    if group:
+        out[group] = np.mean([values[i] for i in group])
+    return out
+
+
+def _straight_runs(c, L, G, T):
+    """Split a blob (runs along axis 0) into straight, solid wall runs: (centre, a0, a1, thickness)."""
+    across = c.sum(0)
+    strong = across >= max(L * 0.5, 4)
+    out, j = [], 0
+    while j < len(strong):
+        if not strong[j]:
+            j += 1
+            continue
+        b0 = j
+        while j + 1 < len(strong) and (strong[j + 1] or (j + 2 < len(strong) and strong[j + 2])):
+            j += 1
+        b1 = j
+        j += 1
+        bands = [(b0, b1)]
+        if (b1 - b0 + 1) > 3 * T:
+            # wide blob: keep only the columns that run much longer (a wall touching a solid block)
+            a = across[b0:b1 + 1]
+            keep = a >= 0.6 * a.max()
+            sub, k = [], 0
+            while k < len(keep):
+                if keep[k]:
+                    k0 = k
+                    while k + 1 < len(keep) and keep[k + 1]:
+                        k += 1
+                    if (k - k0 + 1) <= 3 * T:
+                        sub.append((b0 + k0, b0 + k))
+                k += 1
+            bands = sub                                 # nothing narrow enough -> blob, skip
+        for b0, b1 in bands:
+            out.extend(_band_runs(c, b0, b1, L, G))
+    return out
+
+
+def _band_runs(c, b0, b1, L, G):
+    out = []
+    band = c[:, b0:b1 + 1]
+    rows = band.any(1)
+    idx = np.where(rows)[0]
+    if len(idx) == 0:
+        return out
+    # split where the band has a long gap (two collinear walls)
+    cuts = np.where(np.diff(idx) > G)[0]
+    for r0, r1 in zip(np.r_[idx[0], idx[cuts + 1]], np.r_[idx[cuts], idx[-1]]):
+        if r1 - r0 + 1 < L:
+            continue
+        seg = band[r0:r1 + 1]
+        if seg.any(1).mean() < 0.6:                # mostly empty -> bridged noise, not a wall
+            continue
+        widths = seg.sum(1)
+        t = float(np.median(widths[widths > 0]))
+        cols = seg.sum(0)
+        centre = b0 + float((cols * np.arange(len(cols))).sum() / cols.sum())
+        out.append((centre, float(r0), float(r1 + 1), t))
+    return out
+
+
+def vectorise(room, icon):
+    wall = room == WALL
+    openings_any = np.isin(icon, [WIN, DOOR])
+    # typical wall thickness T (px) from the medial axis
+    dist = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
+    sk = skeletonize(wall)
+    T = float(np.clip(2 * np.median(dist[sk]) if sk.any() else 6, 3, 60))
+    model_wall = wall.copy()
+    # the model's wall mask is trusted: only 1-2 px specks are removed (no thickness filtering,
+    # so thin partitions and walls detached from the main structure are kept)
+    # (no morphological opening: it erases thin double-line window walls the model got right;
+    #  specks are removed by size below)
+    comps = _components(wall, max(10, int(1.5 * T * T)))
+    if not comps:
+        raise RuntimeError("No walls detected.")
+    wall = np.any([m for m, s in comps], axis=0)
+    # add whole door/window blobs that touch a wall (they fill the gaps in the wall lines)
+    near = cv2.dilate(wall.astype(np.uint8), np.ones((int(2 * T),) * 2)) > 0
+    lab, n = ndimage.label(openings_any)
+    keep = np.unique(lab[near & (lab > 0)])
+    full = wall | np.isin(lab, keep[keep > 0])
+    full = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+
+    # straight segments: horizontal / vertical runs longer than ~2.5 T
+    L = max(int(2.5 * T), 12)
+    segs = []
+    G = max(int(3 * T), 6)
+    for o, ker, gap in (("h", np.ones((1, L), np.uint8), np.ones((1, G), np.uint8)),
+                        ("v", np.ones((L, 1), np.uint8), np.ones((G, 1), np.uint8))):
+        # merge double-line walls (window drawn as two thin parallel lines) into one solid band
+        P = max(3, int(round(0.8 * T)))
+        perp = np.ones((P, 1), np.uint8) if o == "h" else np.ones((1, P), np.uint8)
+        m = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, perp)
+        # keep only genuinely long runs in this direction FIRST, then bridge small gaps between them
+        # (bridging first would join side-by-side perpendicular walls into fake material)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ker)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, gap)
+        for comp, st in _components(m, L * 2):
+            x, y, w, h = st[:4]
+            c = comp[y:y + h, x:x + w]
+            if o == "h":                         # work in "vertical" orientation: runs go down rows
+                c, off_run, off_across = c.T, x, y
+            else:
+                off_run, off_across = y, x
+            for centre, a0, a1, t in _straight_runs(c, L, G, T):
+                segs.append({"o": o, "c": off_across + centre, "a0": float(off_run + a0),
+                             "a1": float(off_run + a1), "t": max(t, 0.6 * T)})
+    for o in "hv":
+        idx = [i for i, s in enumerate(segs) if s["o"] == o]
+        if idx:
+            snapped = _cluster([segs[i]["c"] for i in idx], 0.75 * T)
+            for i, c in zip(idx, snapped):
+                segs[i]["c"] = float(c)
+    # merge collinear pieces of the same wall
+    segs.sort(key=lambda s: (s["o"], round(s["c"], 1), s["a0"]))
+    merged_segs = []
+    for sg in segs:
+        p = merged_segs[-1] if merged_segs else None
+        bridged = False
+        if p and p["o"] == sg["o"] and abs(p["c"] - sg["c"]) < 0.5 and sg["a0"] - p["a1"] < 30 * T:
+            # a gap that contains door/window pixels is part of the same wall
+            c0, c1 = int(sg["c"] - sg["t"] / 2 - 2), int(sg["c"] + sg["t"] / 2 + 3)
+            g0, g1 = int(p["a1"]), int(sg["a0"]) + 1
+            band = openings_any[max(c0, 0):c1, g0:g1] if sg["o"] == "h" else openings_any[g0:g1, max(c0, 0):c1]
+            bridged = band.size > 0 and band.any(axis=0 if sg["o"] == "h" else 1).mean() > 0.25
+        if p and p["o"] == sg["o"] and abs(p["c"] - sg["c"]) < 0.5 and (sg["a0"] <= p["a1"] + 1.5 * T or bridged):
+            lp, ls = p["a1"] - p["a0"], sg["a1"] - sg["a0"]
+            p["t"] = (p["t"] * lp + sg["t"] * ls) / (lp + ls)
+            p["a1"] = max(p["a1"], sg["a1"])
+        else:
+            merged_segs.append(dict(sg))
+    segs = merged_segs
+    # snap ends onto perpendicular walls (clean corners / T-junctions); two passes so both meet
+    for _ in range(2):
+        for sg in segs:
+            for p in segs:
+                reach = sg["t"] / 2 + 1.5 * T
+                if p["o"] == sg["o"] or not (p["a0"] - reach <= sg["c"] <= p["a1"] + reach):
+                    continue
+                tol = p["t"] / 2 + 1.5 * T
+                if abs(sg["a0"] - p["c"]) <= tol:
+                    sg["a0"] = p["c"] - p["t"] / 2
+                    sg["j0"] = (p["c"], p["t"])      # joined: perpendicular centre-line + thickness
+                if abs(sg["a1"] - p["c"]) <= tol:
+                    sg["a1"] = p["c"] + p["t"] / 2
+                    sg["j1"] = (p["c"], p["t"])
+    segs = [sg for sg in segs if sg["a1"] - sg["a0"] >= 2 * T]
+    if not segs:
+        raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
+
+    # openings -> intervals on their host wall
+    openings = []
+    for kind, cls in (("door", DOOR), ("window", WIN)):
+        for comp, st in _components(icon == cls, max(12, 0.3 * T * T)):
+            x, y, w, h = [float(v) for v in st[:4]]
+            cx, cy = x + w / 2, y + h / 2
+            best, best_ov = None, 0.0
+            for i, s in enumerate(segs):
+                # blob centre must sit on the wall band; score = overlap along the wall axis
+                if s["o"] == "h":
+                    near, ov = abs(cy - s["c"]) <= s["t"] / 2 + T, min(x + w, s["a1"]) - max(x, s["a0"])
+                else:
+                    near, ov = abs(cx - s["c"]) <= s["t"] / 2 + T, min(y + h, s["a1"]) - max(y, s["a0"])
+                if near and ov > best_ov:
+                    best, best_ov = i, ov
+            if best is None:
+                continue
+            s = segs[best]
+            u0, u1 = (x, x + w) if s["o"] == "h" else (y, y + h)
+            u0, u1 = max(u0, s["a0"]), min(u1, s["a1"])
+            if u1 - u0 >= 0.5 * T:
+                openings.append({"kind": kind, "wall": best, "u0": u0, "u1": u1})
+    # merge overlapping / nearly touching openings on the same wall (doors win over windows)
+    openings.sort(key=lambda o: (o["wall"], o["u0"]))
+    merged = []
+    for o in openings:
+        p = merged[-1] if merged else None
+        if p and p["wall"] == o["wall"] and o["u0"] <= p["u1"] + T:
+            if o["kind"] == p["kind"] or "door" in (o["kind"], p["kind"]):
+                p["u1"] = max(p["u1"], o["u1"])
+                p["kind"] = "door" if "door" in (o["kind"], p["kind"]) else p["kind"]
+                continue
+        merged.append(dict(o))
+
+    stairs = []
+    for comp, st in _components(icon == STAIRS, 4 * T * T):
+        x, y, w, h = [float(v) for v in st[:4]]
+        stairs.append({"x0": x, "y0": y, "x1": x + w, "y1": y + h})
+    struct = np.zeros(full.shape, np.uint8)
+    for sg in segs:
+        h0, h1 = int(round(sg["c"] - sg["t"] / 2)), int(round(sg["c"] + sg["t"] / 2))
+        a0, a1 = int(round(sg["a0"])), int(round(sg["a1"]))
+        if sg["o"] == "h":
+            cv2.rectangle(struct, (a0, h0), (a1, h1), 1, -1)
+        else:
+            cv2.rectangle(struct, (h0, a0), (h1, a1), 1, -1)
+    # how much of the model's wall prediction made it into the vector walls
+    covered = cv2.dilate(struct, np.ones((max(3, int(T)),) * 2, np.uint8)) > 0
+    missed = model_wall & ~covered
+    coverage = 1.0 - missed.sum() / max(1, model_wall.sum())
+    return {"T": T, "walls": segs, "openings": merged, "stairs": stairs, "full": struct > 0,
+            "model_wall": model_wall, "missed": missed, "coverage": float(coverage),
+            "openings_mask": full & ~wall}
+
+
+# ----------------------------------------------------------------------------- 2b. dimension solving (OCR)
+NUM = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def ocr_tokens(img_rgb, ocr=None):
+    """Run RapidOCR; split multi-number boxes ('5.00 11.00') into separate tokens with estimated centres."""
+    if ocr is None:
+        from rapidocr_onnxruntime import RapidOCR
+        ocr = RapidOCR()
+    res, _ = ocr(img_rgb[:, :, ::-1].copy())
+    toks = []
+    for box, txt, conf in res or []:
+        b = np.array(box, float)
+        x0, x1, y0, y1 = b[:, 0].min(), b[:, 0].max(), b[:, 1].min(), b[:, 1].max()
+        vertical_text = (y1 - y0) > 1.6 * (x1 - x0) and len(txt) > 2
+        n = max(len(txt), 1)
+        nums = list(NUM.finditer(txt))
+        letters = sum(ch.isalpha() for ch in txt)
+        size = parse_size(txt)
+        if size:
+            toks.append({"kind": "size", "value": size, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
+                         "text": txt.strip(), "conf": float(conf)})
+        elif nums and letters <= 1 and not re.search(r"[xX×]", txt):
+            for m in nums:
+                f = (m.start() + m.end()) / 2 / n
+                cx, cy = (x0 + f * (x1 - x0), (y0 + y1) / 2) if not vertical_text else \
+                         ((x0 + x1) / 2, y1 - f * (y1 - y0))
+                toks.append({"kind": "num", "value": float(m.group().replace(",", ".")), "x": cx, "y": cy,
+                             "text": m.group(), "conf": float(conf)})
+        elif letters >= 2:
+            toks.append({"kind": "label", "text": txt, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
+                         "h": float(min(y1 - y0, x1 - x0) if vertical_text else (y1 - y0)), "conf": float(conf)})
+    return toks
+
+
+QUOTES = "'\"°′″`’”"
+
+
+def parse_length(side):
+    """One length from OCR text: feet-inches (14'-0\", 8-6\", 12 -5\") or metric (3.60, 360, 3600)."""
+    nums = re.findall(r"\d+(?:\.\d+)?", side)
+    if not nums or len(nums) > 2:
+        return None
+    imperial = any(c in side for c in QUOTES) or (len(nums) == 2 and "." not in "".join(nums))
+    if imperial:
+        ft = float(nums[0])
+        inch = float(nums[1]) if len(nums) == 2 else 0.0
+        if inch >= 12 or ft > 150:
+            return None
+        return (ft + inch / 12.0) * 0.3048
+    v = float(nums[0])
+    return v if v < 40 else (v / 100 if v < 1000 else v / 1000)
+
+
+def parse_size(text):
+    """'W x D' room-size label -> (a_m, b_m) or None."""
+    parts = re.split(r"\s*[xX×]\s*", text.strip())
+    if len(parts) != 2 or sum(ch.isalpha() for ch in text if ch not in "xX") > 0:
+        return None
+    a, b = parse_length(parts[0]), parse_length(parts[1])
+    if a and b and 0.6 <= a <= 40 and 0.6 <= b <= 40:
+        return (a, b)
+    return None
+
+
+def _unit_factor(values):
+    """Plans write metres (3.00), centimetres (300) or millimetres (3000). Return factor to metres."""
+    v = np.median(values)
+    return 1.0 if v < 40 else (0.01 if v < 400 else 0.001)
+
+
+def _room_constraints(struct, segs, T, toks, gx, gy):
+    """Room-size labels -> clear sizes. Rays are cast from the label to the walls around it
+    (works for rooms whose doors leave gaps). Returns measurements between wall centre-lines (px)."""
+    sizes = [t for t in toks if t["kind"] == "size"]
+    if not sizes or struct is None:
+        return []
+    H, W = struct.shape
+
+    def thick(o, c):
+        ts = [sg["t"] for sg in segs if sg["o"] == o and abs(sg["c"] - c) < 0.75 * T]
+        return float(np.median(ts)) if ts else T
+
+    def ray(x, y, dx, dy):
+        while 0 <= x < W and 0 <= y < H:
+            if struct[y, x]:
+                return x, y
+            x += dx; y += dy
+        return None
+
+    def span(x, y, horizontal):
+        """Most common wall-to-wall distance over several parallel rays near (x, y)."""
+        found = []
+        for off in np.linspace(-4 * T, 4 * T, 9):
+            if horizontal:
+                yy = int(round(y + off))
+                a, b = ray(int(x), yy, -1, 0), ray(int(x), yy, 1, 0)
+                if a and b:
+                    found.append((a[0], b[0]))
+            else:
+                xx = int(round(x + off))
+                a, b = ray(xx, int(y), 0, -1), ray(xx, int(y), 0, 1)
+                if a and b:
+                    found.append((a[1], b[1]))
+        if len(found) < 3:
+            return None
+        lens = np.array([q - p for p, q in found])
+        med = np.median(lens)
+        agree = [f for f, l in zip(found, lens) if abs(l - med) <= 2]
+        if len(agree) < 3:
+            return None                                  # rays disagree (door gap, odd shape)
+        return int(np.median([p for p, _ in agree])), int(np.median([q for _, q in agree]))
+
+    out = []
+    for t in sizes:
+        sx, sy = span(t["x"], t["y"], True), span(t["x"], t["y"], False)
+        if not sx or not sy:
+            continue
+        w, h = sx[1] - sx[0] - 1, sy[1] - sy[0] - 1      # clear size in px (between wall faces)
+        if w < 2 * T or h < 2 * T:
+            continue
+        a, b = t["value"]
+        if abs(np.log((a / w) / (b / h))) > abs(np.log((b / w) / (a / h))):
+            a, b = b, a                                  # label order is not always W x D
+        if abs(np.log((a / w) / (b / h))) > 0.08:
+            continue                                     # proportions disagree -> wrong region
+        for ax, (p0, p1), clear, cpx, g, o in (("x", sx, a, w, gx, "v"), ("y", sy, b, h, gy, "h")):
+            lo = [i for i, q in enumerate(g) if q <= p0 + 1 and p0 - q <= 1.5 * T]
+            hi = [i for i, q in enumerate(g) if q >= p1 - 1 and q - p1 <= 1.5 * T]
+            if lo and hi and hi[0] > lo[-1]:
+                i, j = lo[-1], hi[0]
+                out.append({"axis": ax, "i": i, "j": j, "clear": clear, "clear_px": cpx,
+                            "half_t_px": (thick(o, g[i]) + thick(o, g[j])) / 2, "text": t["text"]})
+    return out
+
+
+def solve(grid_x, grid_y, bbox, toks, struct=None, segs=None, T=6.0):
+    """Exact grid positions from written dimension chains and room-size labels.
+    Conflicting measurements are rejected instead of distorting the model."""
+    grids = {"x": list(grid_x), "y": list(grid_y)}
+    cons = []
+    # ---- (a) dimension chains written outside the building
+    nums = [t for t in toks if t["kind"] == "num" and t["value"] > 0]
+    chain_ratios = []
+    if nums:
+        f = _unit_factor([t["value"] for t in nums])
+        bx0, by0, bx1, by1 = bbox
+        pad = 0.02 * max(bx1 - bx0, by1 - by0)
+        for t in nums:
+            outside_lr = t["x"] < bx0 - pad or t["x"] > bx1 + pad
+            outside_tb = t["y"] < by0 - pad or t["y"] > by1 + pad
+            ax = "x" if (outside_tb and not outside_lr) else ("y" if (outside_lr and not outside_tb) else None)
+            if ax is None:
+                continue
+            g, c = grids[ax], (t["x"] if ax == "x" else t["y"])
+            pairs = [(i, j) for i in range(len(g)) for j in range(i + 1, len(g))
+                     if abs((g[i] + g[j]) / 2 - c) <= 0.2 * (g[j] - g[i]) + 15]
+            for i, j in pairs:
+                chain_ratios.append(t["value"] * f / (g[j] - g[i]))
+            cons.append({"kind": "dim", "axis": ax, "tok": t, "d": t["value"] * f, "pairs": pairs})
+    # ---- (b) room-size labels
+    rooms = _room_constraints(struct, segs or [], T, toks, grids["x"], grids["y"])
+    room_ratios = [r["clear"] / r["clear_px"] for r in rooms]
+
+    def consensus(r):
+        r = np.array(r)
+        if len(r) == 0:
+            return None, 0
+        sup = [(np.abs(np.log(r / q)) < 0.03).sum() for q in r]
+        best = r[int(np.argmax(sup))]
+        sel = r[np.abs(np.log(r / best)) < 0.03]
+        return float(np.median(sel)), len(sel)
+
+    s_chain, n_chain = consensus(chain_ratios)
+    s_room, n_room = consensus(room_ratios)
+    if n_chain >= 2:
+        s, source = s_chain, "written dimension chains"
+    elif n_room >= 2:
+        s, source = s_room, "room-size labels"
+    elif n_chain or n_room:
+        s, source = (s_chain or s_room), "single measurement (low confidence)"
+    else:
+        return None
+
+    out = {"scale_m_per_px": s, "source": source, "axes": {}, "report": []}
+    for ax in ("x", "y"):
+        g = grids[ax]
+        n = len(g)
+        eqs = []                                   # (i, j, d, report-entry)
+        for c in cons:
+            if c["axis"] != ax:
+                continue
+            best = None
+            for i, j in c["pairs"]:
+                L = g[j] - g[i]
+                err = abs(s * L - c["d"]) / c["d"]
+                cost = err + 0.3 * abs((g[i] + g[j]) / 2 - (c["tok"]["x"] if ax == "x" else c["tok"]["y"])) / L
+                if err < 0.08 and (best is None or cost < best[0]):
+                    best = (cost, i, j)
+            if best:
+                eqs.append([best[1], best[2], c["d"], {"kind": "dimension", "axis": ax, "text": c["tok"]["text"],
+                                                       "written_m": round(c["d"], 4)}])
+        for r in rooms:
+            if r["axis"] != ax:
+                continue
+            d = r["clear"] + r["half_t_px"] * s
+            if abs(s * (g[r["j"]] - g[r["i"]]) - d) / d < 0.08:
+                eqs.append([r["i"], r["j"], d, {"kind": "room clear size", "axis": ax, "text": r["text"],
+                                                "written_m": round(r["clear"], 4), "half_t_m": r["half_t_px"] * s}])
+        active = list(range(len(eqs)))
+        rejected = []
+        for _ in range(len(eqs) + 1):
+            rows, rhs, w = [], [], []
+            for k in active:
+                i, j, d, _ = eqs[k]
+                r_ = np.zeros(n); r_[j], r_[i] = 1, -1
+                rows.append(r_); rhs.append(d); w.append(1.0)
+            for k in range(1, n):
+                r_ = np.zeros(n); r_[k], r_[k - 1] = 1, -1
+                rows.append(r_); rhs.append(s * (g[k] - g[k - 1])); w.append(0.02)
+            r_ = np.zeros(n); r_[0] = 1; rows.append(r_); rhs.append(0.0); w.append(10.0)
+            A, b, W = np.array(rows), np.array(rhs), np.array(w)
+            sol = np.linalg.lstsq(A * W[:, None], b * W, rcond=None)[0] if n else np.array([])
+            res = [(abs(sol[eqs[k][1]] - sol[eqs[k][0]] - eqs[k][2]), k) for k in active]
+            worst = max(res) if res else (0, None)
+            if worst[0] > max(0.02, 0.01 * eqs[worst[1]][2]):
+                active.remove(worst[1]); rejected.append(worst[1])   # conflicts with the others
+            else:
+                break
+        # never allow a distorted grid: spacing must stay within 20% of the global scale
+        if n > 1 and np.any(np.abs(np.log(np.maximum(np.diff(sol), 1e-9) / (s * np.maximum(np.diff(g), 1e-9)))) > 0.2):
+            sol = np.array([(q - g[0]) * s for q in g])
+            out["report"].append({"axis": ax, "text": "grid", "status": "distorted -> uniform scale used"})
+        out["axes"][ax] = {"px": g, "m": sol.tolist(), "n_dims": len(active)}
+        for k, (i, j, d, rep) in enumerate(eqs):
+            got = sol[j] - sol[i]
+            rep = dict(rep)
+            if "half_t_m" in rep:
+                got -= rep.pop("half_t_m")
+                d = rep["written_m"]
+            rep.update({"model_m": round(float(got), 4), "error_mm": round((got - d) * 1000, 1),
+                        "status": "rejected (conflicts)" if k in rejected else
+                        ("ok" if abs(got - d) < 0.005 else "conflict")})
+            out["report"].append(rep)
+    return out
+
+
+def make_mapper(sol, axis):
+    """px -> metres. Exact at grid lines, linear in between, measured scale outside."""
+    px = np.array(sol["axes"][axis]["px"], float)
+    m = np.array(sol["axes"][axis]["m"], float)
+    s = sol["scale_m_per_px"]
+
+    def f(v):
+        v = np.asarray(v, float)
+        if len(px) == 0:
+            return v * s
+        if len(px) == 1:
+            return m[0] + (v - px[0]) * s
+        out = np.interp(v, px, m)
+        out = np.where(v < px[0], m[0] + (v - px[0]) * s, out)
+        out = np.where(v > px[-1], m[-1] + (v - px[-1]) * s, out)
+        return out
+    return f
+
+
+# ----------------------------------------------------------------------------- furniture detector helpers
+# FloorPlanCAD classes we train on (doors / windows / stairs / walls come from the floor-plan model)
+FURN_CLASSES = ["bed", "sofa", "chair", "table", "bedside_cupboard", "tv_cabinet", "half_height_cabinet",
+                "high_cabinet", "wardrobe", "sink", "bath", "bath_tub", "toilet", "squat_toilet", "urinal",
+                "gas_stove", "refrigerator", "washing_machine"]
+ZOOM_FACTORS = (0.75, 1.0, 1.4)
+# typical real sizes (long side, metres) used to measure the drawing scale of the dataset
+TYPICAL_LONG_M = {"bed": 2.0, "toilet": 0.7, "bath_tub": 1.7, "sofa": 2.0, "refrigerator": 0.7}
+
+
+def norm_label(s):
+    return str(s).strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def to_rgb_white(img):
+    """PNG with alpha -> RGB on white (FloorPlanCAD renders are 4-channel)."""
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        a = img[:, :, 3:4].astype(np.float32) / 255.0
+        return (img[:, :, :3].astype(np.float32) * a + 255.0 * (1 - a)).astype(np.uint8)
+    return img
+
+
+def det_to_obb(bbox, mask, W, H):
+    """FiftyOne detection (normalised [x,y,w,h] + cropped mask) -> 4 corner points in pixels.
+    The rotated rectangle is fitted to the drawn strokes, so it follows the furniture's rotation."""
+    bx, by, bw, bh = [float(v) for v in bbox]
+    x0, y0, w, h = bx * W, by * H, bw * W, bh * H
+    pts = None
+    if mask is not None:
+        m = np.asarray(mask)
+        if m.ndim == 3:
+            m = m[..., 0]
+        ys, xs = np.nonzero(m)
+        if len(xs) >= 5:
+            sx, sy = w / m.shape[1], h / m.shape[0]
+            pts = np.stack([x0 + (xs + 0.5) * sx, y0 + (ys + 0.5) * sy], 1).astype(np.float32)
+    if pts is None:
+        pts = np.array([[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]], np.float32)
+    rect = cv2.minAreaRect(pts)
+    (cw, ch) = rect[1]
+    if cw < 2 or ch < 2:                     # degenerate -> axis-aligned box
+        rect = ((x0 + w / 2, y0 + h / 2), (max(w, 2), max(h, 2)), 0.0)
+    return cv2.boxPoints(rect), rect
+
+
+def obb_line(cls_id, corners, W, H):
+    c = np.clip(corners, 0, [W - 1, H - 1]) / [W, H]
+    return "{} ".format(cls_id) + " ".join("{:.6f}".format(v) for v in c.reshape(-1))
+
+
+def write_sample(img_path, dets, out_img, out_lbl, stats):
+    """dets: list of (label, bbox, mask). Writes RGB jpg + YOLO-OBB label file. Returns #objects."""
+    img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return 0
+    img = to_rgb_white(img)
+    H, W = img.shape[:2]
+    lines = []
+    for label, bbox, mask in dets:
+        lab = norm_label(label)
+        if lab not in FURN_CLASSES:
+            continue
+        corners, rect = det_to_obb(bbox, mask, W, H)
+        lines.append(obb_line(FURN_CLASSES.index(lab), corners, W, H))
+        stats.setdefault(lab, []).append(max(rect[1]))
+    cv2.imwrite(out_img, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    with open(out_lbl, "w") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+    return len(lines)
+
+
+def dataset_px_per_m(stats):
+    """Drawing scale of the dataset from typical object sizes (median of several classes)."""
+    est = [np.median(stats[k]) / v for k, v in TYPICAL_LONG_M.items() if len(stats.get(k, [])) >= 20]
+    return float(np.median(est)) if est else None
+
+
+# ----------------------------------------------------------------------------- inference on a plan
+def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25):
+    """Rescale the plan so furniture has its training size, run tiled OBB detection, merge.
+    Returns list of dicts in ORIGINAL image pixels: cls, conf, corners(4x2)."""
+    names = model.names
+    base = train_px_per_m / plan_px_per_m if (train_px_per_m and plan_px_per_m) else 1.0
+    scales = [base * f for f in ZOOM_FACTORS]              # several zooms, merged below
+    found = []
+    for s in scales:
+        s = float(np.clip(s, 0.2, 6.0))
+        im = cv2.resize(img_rgb, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+        H, W = im.shape[:2]
+        step = int(tile * (1 - overlap))
+        ys = list(range(0, max(H - tile, 0) + 1, step)) or [0]
+        xs = list(range(0, max(W - tile, 0) + 1, step)) or [0]
+        if ys[-1] + tile < H:
+            ys.append(max(H - tile, 0))
+        if xs[-1] + tile < W:
+            xs.append(max(W - tile, 0))
+        for y0 in ys:
+            for x0 in xs:
+                crop = np.full((tile, tile, 3), 255, np.uint8)
+                c = im[y0:y0 + tile, x0:x0 + tile]
+                crop[:c.shape[0], :c.shape[1]] = c
+                res = model.predict(crop[:, :, ::-1], imgsz=tile, conf=conf, verbose=False)[0]
+                if res.obb is None or len(res.obb) == 0:
+                    continue
+                pts = res.obb.xyxyxyxy.cpu().numpy()
+                for k in range(len(pts)):
+                    p = pts[k].reshape(4, 2)
+                    cx, cy = p[:, 0].mean(), p[:, 1].mean()
+                    # ignore detections centred in the overlap margin of an inner tile edge
+                    m = tile * overlap / 2
+                    if (x0 > 0 and cx < m) or (y0 > 0 and cy < m) or \
+                       (x0 + tile < W and cx > tile - m) or (y0 + tile < H and cy > tile - m):
+                        continue
+                    found.append({"cls": names[int(res.obb.cls[k])], "conf": float(res.obb.conf[k]),
+                                  "corners": (p + [x0, y0]) / s})
+    return rotated_nms(found)
+
+
+def rotated_nms(dets, iou_thr=0.4):
+    from shapely.geometry import Polygon
+    dets = sorted(dets, key=lambda d: -d["conf"])
+    keep = []
+    for d in dets:
+        p = Polygon(d["corners"]).buffer(0)
+        if p.area <= 0:
+            continue
+        ok = True
+        for k in keep:
+            q = k["_poly"]
+            inter = p.intersection(q).area
+            if inter / (p.area + q.area - inter + 1e-9) > iou_thr or inter / min(p.area, q.area) > 0.8:
+                ok = False
+                break
+        if ok:
+            d["_poly"] = p
+            keep.append(d)
+    for k in keep:
+        k.pop("_poly", None)
+    return keep
+
+
+# ----------------------------------------------------------------------------- 4c. furniture & fixtures
+# height (m), category, which side goes against a wall ("short" = head/tank end, "long" = back, None = free)
+FURN_SPEC = {
+    "bed": (0.55, "furniture", "short"), "sofa": (0.80, "furniture", "long"), "chair": (0.85, "furniture", None),
+    "table": (0.75, "furniture", None), "bedside_cupboard": (0.55, "furniture", "long"),
+    "tv_cabinet": (0.50, "furniture", "long"), "half_height_cabinet": (0.90, "furniture", "long"),
+    "high_cabinet": (2.10, "furniture", "long"), "wardrobe": (2.10, "furniture", "long"),
+    "closet": (2.10, "furniture", "long"), "sauna_bench": (0.45, "furniture", "long"),
+    "sink": (0.85, "plumbing", "long"), "bath": (0.55, "plumbing", "long"), "bath_tub": (0.55, "plumbing", "long"),
+    "toilet": (0.75, "plumbing", "short"), "squat_toilet": (0.10, "plumbing", "short"), "urinal": (0.60, "plumbing", "short"),
+    "gas_stove": (0.90, "appliance", "long"), "refrigerator": (1.80, "appliance", "long"),
+    "washing_machine": (0.85, "appliance", "long"), "appliance": (0.90, "appliance", "long"),
+    "fireplace": (1.00, "appliance", "long"), "chimney": (1.20, "appliance", None),
+}
+# floor-plan model icon classes -> furniture types (doors/windows/stairs are handled elsewhere)
+ICON_FIXTURES = {3: "closet", 4: "appliance", 5: "toilet", 6: "sink", 7: "sauna_bench", 8: "fireplace",
+                 9: "bath_tub", 10: "chimney"}
+SAME_KIND = [{"toilet", "squat_toilet", "urinal"}, {"sink"}, {"bath", "bath_tub"},
+             {"closet", "wardrobe", "high_cabinet", "half_height_cabinet"},
+             {"appliance", "refrigerator", "washing_machine", "gas_stove"}, {"fireplace", "chimney"}]
+
+
+def _kind(t):
+    for k in SAME_KIND:
+        if t in k:
+            return frozenset(k)
+    return frozenset([t])
+
+
+def icon_fixtures(icon, T):
+    """Fixtures the floor-plan model already segments -> rotated rectangles in px."""
+    out = []
+    for cls, name in ICON_FIXTURES.items():
+        m = cv2.morphologyEx((icon == cls).astype(np.uint8), cv2.MORPH_CLOSE,
+                             np.ones((max(3, int(0.6 * T)),) * 2, np.uint8))     # join fragments of one object
+        n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        for i in range(1, n):
+            if st[i, cv2.CC_STAT_AREA] < max(12, 0.5 * T * T):
+                continue
+            ys, xs = np.nonzero(lab == i)
+            rect = cv2.minAreaRect(np.stack([xs, ys], 1).astype(np.float32))
+            out.append({"type": name, "conf": 1.0, "corners": cv2.boxPoints(rect), "source": "floor-plan model"})
+    return out
+
+
+WET_ONLY = {"bath", "bath_tub", "toilet", "squat_toilet", "urinal"}
+# floor-plan model room classes: 1 Outdoor, 3 Kitchen, 4 LivingRoom, 5 Bedroom, 6 Bath, 7 Entry/Hallway,
+# 9 Storage, 10 Garage, 11 OtherRoom
+DRY_ROOMS = {1, 3, 4, 5, 7, 10}                 # a bath / toilet can never be here
+FITS_ROOM = {                                   # where a weak detection is believable
+    "bed": {5, 11}, "bedside_cupboard": {5, 11}, "wardrobe": {5, 9, 11}, "high_cabinet": {3, 5, 9, 11},
+    "half_height_cabinet": {3, 4, 9, 11}, "sofa": {4, 11}, "tv_cabinet": {4, 5, 11}, "chair": {3, 4, 5, 11},
+    "table": {3, 4, 11}, "gas_stove": {3}, "refrigerator": {3, 9, 11}, "washing_machine": {6, 9, 11},
+    "sink": {3, 6, 9, 11}, "bath": {6, 11}, "bath_tub": {6, 11}, "toilet": {6, 11}, "squat_toilet": {6, 11},
+    "urinal": {6, 11}}
+
+
+def _room_at(room, it, r):
+    H, W = room.shape
+    cx, cy = np.asarray(it["corners"], float).mean(0)
+    x, y = int(np.clip(round(cx), 0, W - 1)), int(np.clip(round(cy), 0, H - 1))
+    win = room[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1].ravel()
+    win = win[(win != 0) & (win != 2)]                       # ignore background / wall pixels
+    indoor = win[win != 1]
+    if indoor.size:                                          # pixels across an exterior wall are outdoors:
+        return int(np.bincount(indoor, minlength=12).argmax())   # prefer the room the object is in
+    return 1 if win.size else None
+
+
+def filter_by_room(items, room, T):
+    """Cross-check furniture with the floor-plan model's rooms.
+    - a bath / toilet in a clearly dry room (hall, living, bedroom, kitchen, garage, outdoors) is a
+      look-alike symbol (skylight, shaft) -> dropped
+    - a weak detector hit (below FURNITURE_CONF) is kept only when the room fits (bed in a bedroom ...)"""
+    keep, dropped = [], 0
+    r = max(2, int(2 * T))
+    for it in items:
+        rc = _room_at(room, it, r)
+        if it["type"] in WET_ONLY and rc in DRY_ROOMS:
+            dropped += 1
+            continue
+        if it["source"] == "furniture detector" and it["conf"] < FURNITURE_CONF:
+            if rc is None or rc not in FITS_ROOM.get(it["type"], set()):
+                dropped += 1
+                continue
+        keep.append(it)
+    return keep, dropped
+
+
+def detector_furniture(img, mpp):
+    """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
+    if not FURNITURE_REPO:
+        return []
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            from kaggle_secrets import UserSecretsClient
+            token = UserSecretsClient().get_secret("HF_TOKEN")
+        repo = "{}/{}".format(HfApi(token=token).whoami()["name"], FURNITURE_REPO)
+        w = hf_hub_download(repo, "checkpoints/best.pt", token=token)
+        meta = json.load(open(hf_hub_download(repo, "furniture_meta.json", token=token)))
+    except Exception as e:
+        print("furniture detector not available yet ({}): using fixtures from the floor-plan model only".format(
+            type(e).__name__))
+        return []
+    if not os.environ.get("P3D_NO_INSTALL"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
+    from ultralytics import YOLO
+    dets = detect_furniture(YOLO(w), img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
+                            conf=FURNITURE_LOW_CONF)          # weak hits are checked against the rooms later
+    return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
+            for d in dets if d["cls"] in FURN_SPEC]
+
+
+def build_furniture(items_px, plan):
+    """Rotated px rectangles -> metres, with the back placed against the nearest wall."""
+    from shapely.geometry import Polygon, Point
+    from shapely.ops import unary_union
+    mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    walls = []
+    for w in plan["walls"]:
+        a, d, n, L = wall_frame(w)
+        h = w["thickness"] / 2
+        walls.append(Polygon([a - n * h, a + d * L - n * h, a + d * L + n * h, a + n * h]))
+    wall_union = unary_union(walls) if walls else None
+    # detector first (exact rotation), then model fixtures that do not duplicate a detected object
+    items_px = sorted(items_px, key=lambda d: (d["source"] != "furniture detector", -d["conf"]))
+    out, polys = [], []
+    for it in items_px:
+        c = np.array([[float(mx(x)), float(my(y))] for x, y in it["corners"]])
+        poly = Polygon(c).buffer(0)
+        if poly.area < 0.04:
+            continue
+        if (it["type"] in WET_ONLY and it["source"] == "furniture detector" and wall_union is not None
+                and wall_union.distance(poly) > 0.3):
+            continue          # baths / toilets stand against a wall; free-floating X-boxes are skylights
+        dup = False
+        for q, o in zip(polys, out):
+            inter = poly.intersection(q).area
+            if inter / min(poly.area, q.area) > 0.5 and _kind(it["type"]) == _kind(o["type"]):
+                dup = True
+                break
+        if dup:
+            continue
+        e01, e12 = np.linalg.norm(c[1] - c[0]), np.linalg.norm(c[2] - c[1])
+        if e01 >= e12:
+            long_dir, width, depth = (c[1] - c[0]) / e01, e01, e12
+        else:
+            long_dir, width, depth = (c[2] - c[1]) / e12, e12, e01
+        centre = c.mean(0)
+        # furniture sits square to the walls: snap the rotation to the wall grid when it is close
+        ang = np.degrees(np.arctan2(long_dir[1], long_dir[0])) % 90
+        tol = 25 if it["source"] == "floor-plan model" else 12      # model blobs give rough angles
+        if min(ang, 90 - ang) <= tol:
+            k = np.round(np.degrees(np.arctan2(long_dir[1], long_dir[0])) / 90.0) * 90.0
+            long_dir = np.array([np.cos(np.radians(k)), np.sin(np.radians(k))])
+            if it["source"] == "floor-plan model":
+                # rough blob: measure the real extent along the snapped axes
+                sd = np.array([-long_dir[1], long_dir[0]])
+                width = float(np.ptp(c @ long_dir)); depth = float(np.ptp(c @ sd))
+                if depth > width:
+                    long_dir, width, depth = sd, depth, width
+            short = np.array([-long_dir[1], long_dir[0]])
+            c = np.array([centre + sa * long_dir * width / 2 + sb * short * depth / 2
+                          for sa, sb in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
+        # real size settles look-alike symbols (seats in particular)
+        if it["type"] == "chair" and width >= 1.1:
+            it = dict(it, type="sofa")
+        elif it["type"] == "sofa" and width < 0.9:
+            it = dict(it, type="chair")
+        height, cat, back = FURN_SPEC.get(it["type"], (0.8, "furniture", None))
+        short_dir = np.array([-long_dir[1], long_dir[0]])
+        front = short_dir
+        if back and wall_union is not None:
+            if back == "short":   # head / tank end against the wall -> faces along the long axis
+                cands = [(centre + long_dir * width / 2, -long_dir), (centre - long_dir * width / 2, long_dir)]
+            else:                 # back of the unit against the wall -> faces across
+                cands = [(centre + short_dir * depth / 2, -short_dir), (centre - short_dir * depth / 2, short_dir)]
+            front = min(cands, key=lambda pc: wall_union.distance(Point(pc[0])))[1]
+        out.append({"id": len(out), "type": it["type"], "category": cat, "source": it["source"],
+                    "confidence": it["conf"], "center": [round(float(v), 4) for v in centre],
+                    "width": round(float(width), 3), "depth": round(float(depth), 3), "height": height,
+                    "front": [round(float(v), 4) for v in front],
+                    "rotation_deg": round(float(np.degrees(np.arctan2(front[1], front[0]))), 2),
+                    "corners": [[round(float(x), 4), round(float(y), 4)] for x, y in c]})
+        polys.append(poly)
+    return out
+
+
+FURN_COLORS = {"furniture": [176, 132, 92, 255], "plumbing": [240, 242, 246, 255], "appliance": [150, 155, 162, 255]}
+
+
+def furniture_meshes(furniture):
+    import trimesh
+    parts = {}
+    for f in furniture:
+        v, fc = prism(f["corners"], 0.0, f["height"])
+        parts.setdefault(f["category"], []).append(trimesh.Trimesh(v, fc, process=False))
+    meshes = {}
+    for cat, ms in parts.items():
+        m = trimesh.util.concatenate(ms)
+        m.visual = trimesh.visual.ColorVisuals(m, face_colors=np.tile(FURN_COLORS[cat], (len(m.faces), 1)))
+        meshes[cat] = m
+    return meshes
+
+
+# ----------------------------------------------------------------------------- 3. exact plan in metres
+def _snap(v, options, tol):
+    best = min(options, key=lambda o: abs(o - v))
+    return best if abs(best - v) <= tol * best else v
+
+
+def _round(v, step):
+    return round(round(v / step) * step, 4)
+
+
+NOTE_WORDS = ("VAULT", "SKY", "SHOWER", "SOAKER", "TUB", "FRIDGE", "FREEZ", "OVEN", "BENCH", "HOOKS",
+              "WALL HT", "PK. HT", "CABINET", "BUFFET", "LINEN", "STRG", "WORKSPACE", "PLANTER", "ROOF",
+              "OPENING", "ABOVE", "BELOW", "DROP", "UP", "DN", "SCALE", "FLOOR PLAN", "AREA:", "SF")
+
+
+def _is_note(text):
+    t = text.strip().upper()
+    if len(re.sub(r"[^A-Z]", "", t)) < 2:
+        return True
+    return any(t.startswith(w) or (" " + w) in (" " + t) for w in NOTE_WORDS) and not any(
+        k in t for k in ("ROOM", "BED", "BATH", "KITCHEN", "LIVING", "DINING", "TOILET", "STORE"))
+
+
+def _room_name(text):
+    t = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", text.strip())
+    t = re.sub(r"(?i)^W\.*I?\.*C\.*$", "W.I.C.", t)                         # OCR: W..C. -> W.I.C.
+    t = re.sub(r"(?i)(primary|master|guest|kids|main)(bed|living|bath)", r"\1 \2", t)
+    if "." in t and len(t) <= 8:
+        return t.upper()                                                     # abbreviations: W.I.C., C.R.
+    return t.title() if len(t) >= 3 and t.isupper() else (t[:1].upper() + t[1:])
+
+
+def build_plan(v, sol, toks, room):
+    from shapely.geometry import Polygon, Point, LineString
+    from shapely.ops import unary_union
+    segs = v["walls"]
+    if sol is None:          # no readable dimensions -> fallback scale
+        doors = [o["u1"] - o["u0"] for o in v["openings"] if o["kind"] == "door"]
+        s = DOOR_WIDTH_M / float(np.median(doors)) if doors else 0.2 / v["T"]
+        if METERS_PER_PIXEL:
+            s = METERS_PER_PIXEL
+        gx = sorted({sg["c"] for sg in segs if sg["o"] == "v"})
+        gy = sorted({sg["c"] for sg in segs if sg["o"] == "h"})
+        sol = {"scale_m_per_px": s, "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
+                                             "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
+               "report": [], "fallback": True}
+    mx, my = make_mapper(sol, "x"), make_mapper(sol, "y")
+    s = sol["scale_m_per_px"]
+    MX = lambda q: float(mx(q))
+    MY = lambda q: float(my(q))
+
+    # walls: centre-lines meeting at the centre-line of the wall they join (Revit joins them)
+    walls = []
+    for sg in segs:
+        t = _snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if WALL_THICKNESSES else _round(sg["t"] * s, 0.005)
+        if sg["o"] == "h":
+            y = MY(sg["c"])
+            x0 = MX(sg["j0"][0]) if "j0" in sg else MX(sg["a0"])
+            x1 = MX(sg["j1"][0]) if "j1" in sg else MX(sg["a1"])
+            a, b = [x0, y], [x1, y]
+        else:
+            x = MX(sg["c"])
+            y0 = MY(sg["j0"][0]) if "j0" in sg else MY(sg["a0"])
+            y1 = MY(sg["j1"][0]) if "j1" in sg else MY(sg["a1"])
+            a, b = [x, y0], [x, y1]
+        walls.append({"start": [round(c, 4) for c in a], "end": [round(c, 4) for c in b], "thickness": t,
+                      "height": WALL_HEIGHT, "joined": ["j0" in sg, "j1" in sg]})
+    # extensions so solids close the corner (half the joined wall's thickness)
+    for w, sg in zip(walls, segs):
+        e = []
+        for key in ("j0", "j1"):
+            if key in sg:
+                e.append(round(_snap(sg[key][1] * s, WALL_THICKNESSES, 0.35) / 2 if WALL_THICKNESSES
+                               else sg[key][1] * s / 2, 4))
+            else:
+                e.append(0.0)
+        w["ext"] = e
+    for i, w in enumerate(walls):
+        w["id"] = i
+
+    def wall_poly(w):
+        a, b = np.array(w["start"]), np.array(w["end"])
+        d = (b - a) / max(np.linalg.norm(b - a), 1e-9)
+        n = np.array([-d[1], d[0]])
+        a2, b2 = a - d * w["ext"][0], b + d * w["ext"][1]
+        h = w["thickness"] / 2
+        return Polygon([a2 - n * h, b2 - n * h, b2 + n * h, a2 + n * h])
+
+    union = unary_union([wall_poly(w) for w in walls])
+    polys = [union] if union.geom_type == "Polygon" else list(union.geoms)
+    main = max(polys, key=lambda p: p.area)
+    # outline: close door/window-sized gaps (<= 2 m) between wall groups, keep the biggest piece
+    closed = union.buffer(1.0, join_style=2).buffer(-1.0, join_style=2)
+    cpolys = [closed] if closed.geom_type == "Polygon" else list(closed.geoms)
+    footprint = Polygon(max(cpolys, key=lambda p: p.area).exterior)
+    ring = footprint.exterior
+    for w in walls:
+        w["external"] = bool(LineString([w["start"], w["end"]]).distance(ring) <= w["thickness"] * 0.75)
+    if EXTERNAL_WALL_M or INTERNAL_WALL_M:
+        for w in walls:
+            w["thickness"] = (EXTERNAL_WALL_M if w["external"] else INTERNAL_WALL_M) or w["thickness"]
+
+    # openings: centre point on the wall centre-line, exact width from the solved grid
+    openings = []
+    for o in v["openings"]:
+        sg, w = segs[o["wall"]], walls[o["wall"]]
+        if sg["o"] == "h":
+            u0, u1 = MX(o["u0"]), MX(o["u1"])
+            centre = [(u0 + u1) / 2, w["start"][1]]
+            along = centre[0] - w["start"][0]
+        else:
+            u0, u1 = MY(o["u0"]), MY(o["u1"])
+            centre = [w["start"][0], (u0 + u1) / 2]
+            along = centre[1] - w["start"][1]
+        width = abs(u1 - u0)
+        if width < (0.5 if o["kind"] == "door" else 0.3):
+            continue
+        if o["kind"] == "door":
+            width = _snap(width, DOOR_WIDTHS, 0.09)
+            width = width if width in DOOR_WIDTHS else _round(width, 0.05)
+            sill, head = 0.0, DOOR_HEIGHT
+        else:
+            width = _round(width, 0.05)
+            sill, head = WINDOW_SILL, WINDOW_HEAD
+        openings.append({"id": len(openings), "type": o["kind"], "wall": o["wall"],
+                         "center": [round(c, 4) for c in centre], "offset": round(abs(along), 4),
+                         "width": width, "height": round(head - sill, 4), "sill": sill})
+
+    openings.sort(key=lambda o: (o["wall"], o["offset"]))
+    merged = []
+    for o in openings:
+        p = merged[-1] if merged else None
+        if p and p["wall"] == o["wall"] and p["type"] == o["type"] == "window" and \
+                (o["offset"] - o["width"] / 2) - (p["offset"] + p["width"] / 2) < 0.25:
+            lo, hi = p["offset"] - p["width"] / 2, o["offset"] + o["width"] / 2
+            w_ = walls[p["wall"]]
+            a_, d_, _, _ = wall_frame(w_)
+            p["width"] = _round(hi - lo, 0.05)
+            p["offset"] = round((lo + hi) / 2, 4)
+            p["center"] = [round(c, 4) for c in (a_ + d_ * p["offset"])]
+            continue
+        merged.append(o)
+    openings = merged
+    for i, o in enumerate(openings):
+        o["id"] = i
+
+    # rooms = closed regions between walls; names from the text written inside them
+    NOT_ROOMS = {"UP", "DN", "DOWN", "UP.", "DN."}
+    labels = [t for t in toks if t["kind"] == "label"]
+    room_labels = [t for t in labels if t["text"].strip().upper() not in NOT_ROOMS]
+    rooms = []
+    for hole in main.interiors:
+        poly = Polygon(hole)
+        if poly.area < 1.0:
+            continue
+        inside = [t for t in room_labels if poly.contains(Point(MX(t["x"]), MY(t["y"])))
+                  and not _is_note(t["text"])]
+        # the room title is the biggest text in the room (notes like VAULT / SKYLIGHT are smaller)
+        inside.sort(key=lambda t: -t.get("h", 0))
+        names = []
+        for t in inside:                      # open-plan areas keep every title of the same size
+            n = _room_name(t["text"])
+            if t.get("h", 0) >= 0.85 * inside[0].get("h", 0) and n not in names and len(names) < 3:
+                names.append(n)
+        names = names or ["Room {}".format(len(rooms) + 1)]
+        p = poly.representative_point()
+        rooms.append({"id": len(rooms), "name": " / ".join(names), "area_m2": round(poly.area, 2),
+                      "point": [round(p.x, 4), round(p.y, 4)],
+                      "polygon": [[round(x, 4), round(y, 4)] for x, y in list(poly.exterior.coords)[:-1]]})
+
+    # stairs: run along the long side, starting at the end nearest the "UP" label
+    stairs = []
+    up = [t for t in labels if t["text"].strip().upper() in ("UP", "UP.")]
+    for st in v["stairs"]:
+        x0, y0, x1, y1 = MX(st["x0"]), MY(st["y0"]), MX(st["x1"]), MY(st["y1"])
+        short, long_ = sorted([x1 - x0, y1 - y0])
+        if short < 0.7 or long_ < 1.5 or short * long_ < 1.5:
+            continue                                     # too small to be a real stair -> false positive
+        along_x = (x1 - x0) >= (y1 - y0)
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        if along_x:
+            p0, p1, width = [x0, cy], [x1, cy], y1 - y0
+        else:
+            p0, p1, width = [cx, y0], [cx, y1], x1 - x0
+        if up:
+            ux, uy = MX(up[0]["x"]), MY(up[0]["y"])
+            if np.hypot(ux - p1[0], uy - p1[1]) < np.hypot(ux - p0[0], uy - p0[1]):
+                p0, p1 = p1, p0
+        n = int(np.clip(round(WALL_HEIGHT / STAIR_RISE), 3, 30))
+        run = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+        stairs.append({"start": [round(c, 4) for c in p0], "end": [round(c, 4) for c in p1],
+                       "width": round(width, 4), "risers": n, "riser": round(WALL_HEIGHT / n, 4),
+                       "tread": round(run / max(n - 1, 1), 4),
+                       "straight_run_fits": bool(run / max(n - 1, 1) >= 0.22),
+                       "outline": [[round(x0, 4), round(y0, 4)], [round(x1, 4), round(y0, 4)],
+                                   [round(x1, 4), round(y1, 4)], [round(x0, 4), round(y1, 4)]],
+                       "direction_from_UP_label": bool(up)})
+
+    # structural grids (labelled 1..n across, A.. down)
+    letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+    def major(axis):
+        """Grid only where a dimension lands or where walls run long (keeps Revit tidy)."""
+        load = {}
+        for w in walls:
+            vert = abs(w["start"][0] - w["end"][0]) < 1e-6
+            if (axis == "x") != vert:
+                continue
+            key = round(w["start"][0] if vert else w["start"][1], 3)
+            load[key] = load.get(key, 0.0) + abs((w["end"][1] - w["start"][1]) if vert else (w["end"][0] - w["start"][0]))
+        ext = (max(load) - min(load)) if load else 0.0
+        keep = sorted(k for k, L in load.items() if L >= 0.25 * ext)
+        merged = []
+        for k in keep:
+            if not merged or k - merged[-1] > 0.5:
+                merged.append(k)
+        return merged
+    xs, ys = major("x"), major("y")
+    bx0, by0, bx1, by1 = footprint.bounds
+    grids = [{"name": str(i + 1), "start": [x, by0 - 1.5], "end": [x, by1 + 1.5]} for i, x in enumerate(xs)]
+    grids += [{"name": letters[i % len(letters)], "start": [bx0 - 1.5, y], "end": [bx1 + 1.5, y]}
+              for i, y in enumerate(ys)]
+
+    rep = sol["report"]
+    ok = [r for r in rep if r.get("status") == "ok"]
+    mapping = {"scale_m_per_px": s, "axes": {a: {"px": [float(q) for q in sol["axes"][a]["px"]],
+                                                  "m": [float(q) for q in sol["axes"][a]["m"]]} for a in "xy"}}
+    return {"units": "m", "mapping": mapping, "axes": "x right, y down the sheet (Revit script flips y)",
+            "level": {"name": "Ground Floor", "elevation": 0.0, "wall_height": WALL_HEIGHT},
+            "precision": {"dimensions_read": len([r for r in rep if "written_m" in r]),
+                          "dimensions_exact": len(ok), "report": rep,
+                          "scale_source": sol.get("source", "written dimensions") if not sol.get("fallback")
+                          else "estimated (no dimensions read) - set BUILDING_WIDTH_M or METERS_PER_PIXEL"},
+            "walls": walls, "openings": openings, "rooms": rooms, "stairs": stairs, "grids": grids,
+            "floor": {"polygon": [[round(x, 4), round(y, 4)] for x, y in list(footprint.exterior.coords)[:-1]],
+                      "thickness": SLAB},
+            "defaults": {"wall_height": WALL_HEIGHT, "door_height": DOOR_HEIGHT, "window_sill": WINDOW_SILL,
+                         "window_head": WINDOW_HEAD, "slab": SLAB}}
+
+
+# ----------------------------------------------------------------------------- 4. 3D preview mesh (GLB)
+def wall_frame(w):
+    a, b = np.array(w["start"], float), np.array(w["end"], float)
+    d = b - a
+    L = float(np.linalg.norm(d))
+    d = d / max(L, 1e-9)
+    return a, d, np.array([-d[1], d[0]]), L
+
+
+def pieces(plan):
+    by_wall = {}
+    for o in plan["openings"]:
+        by_wall.setdefault(o["wall"], []).append(o)
+    for w in plan["walls"]:
+        a, d, n, L = wall_frame(w)
+        t = w["thickness"]
+        rect = lambda u0, u1, th: [a + d * u0 - n * th / 2, a + d * u1 - n * th / 2,
+                                   a + d * u1 + n * th / 2, a + d * u0 + n * th / 2]
+        cur = -w["ext"][0]
+        for o in sorted(by_wall.get(w["id"], []), key=lambda o: o["offset"]):
+            u0, u1 = o["offset"] - o["width"] / 2, o["offset"] + o["width"] / 2
+            u0, u1 = max(u0, cur), min(u1, L + w["ext"][1])
+            if u1 <= u0:
+                continue
+            top = o["sill"] + o["height"]
+            if u0 > cur:
+                yield "wall", rect(cur, u0, t), 0.0, w["height"]
+            if o["sill"] > 0:
+                yield "wall", rect(u0, u1, t), 0.0, o["sill"]
+            if top < w["height"]:
+                yield "wall", rect(u0, u1, t), top, w["height"]
+            if o["type"] == "door":
+                yield "door", rect(u0 + 0.03, u1 - 0.03, 0.05), 0.0, top
+            else:
+                yield "glass", rect(u0 + 0.03, u1 - 0.03, 0.03), o["sill"], top
+            cur = u1
+        if cur < L + w["ext"][1]:
+            yield "wall", rect(cur, L + w["ext"][1], t), 0.0, w["height"]
+    for s in plan["stairs"]:
+        a, b = np.array(s["start"]), np.array(s["end"])
+        L = float(np.linalg.norm(b - a))
+        d = (b - a) / max(L, 1e-9)
+        n = np.array([-d[1], d[0]])
+        h = s["width"] / 2
+        for i in range(s["risers"]):
+            u0, u1 = L * i / s["risers"], L * (i + 1) / s["risers"]
+            q = [a + d * u0 - n * h, a + d * u1 - n * h, a + d * u1 + n * h, a + d * u0 + n * h]
+            yield "stairs", q, 0.0, s["riser"] * (i + 1)
+
+
+def prism(corners, z0, z1):
+    c = [np.asarray(p, float) for p in corners]
+    v = np.array([[p[0], z0, p[1]] for p in c] + [[p[0], z1, p[1]] for p in c])
+    f = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6]]
+    for i in range(4):
+        j = (i + 1) % 4
+        f += [[i, 4 + i, j], [j, 4 + i, 4 + j]]
+    f = np.array(f)
+    t = v[f]
+    if np.einsum("ij,ij->i", t[:, 0], np.cross(t[:, 1], t[:, 2])).sum() < 0:
+        f = f[:, ::-1]
+    return v, f
+
+
+COLORS = {"wall": [235, 232, 225, 255], "door": [150, 95, 55, 255], "glass": [140, 190, 235, 140],
+          "stairs": [190, 190, 190, 255], "floor": [205, 185, 150, 255],
+          "furniture": [176, 132, 92, 255], "plumbing": [240, 242, 246, 255], "appliance": [150, 155, 162, 255]}
+
+
+def build_glb(plan, path, extra=None):
+    import trimesh
+    from shapely.geometry import Polygon
+    parts = {}
+    for cat, quad, z0, z1 in pieces(plan):
+        vv, ff = prism(quad, z0, z1)
+        parts.setdefault(cat, []).append(trimesh.Trimesh(vv, ff, process=False))
+    fl = trimesh.creation.extrude_polygon(Polygon([(x, -y) for x, y in plan["floor"]["polygon"]]), SLAB)
+    fl.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
+    fl.apply_translation([0, -SLAB, 0])
+    parts["floor"] = [fl]
+    scene = trimesh.Scene()
+    for cat, ms in parts.items():
+        m = trimesh.util.concatenate(ms)
+        m.visual = trimesh.visual.ColorVisuals(m, face_colors=np.tile(COLORS[cat], (len(m.faces), 1)))
+        scene.add_geometry(m, geom_name=cat)
+    for cat, m in (extra or {}).items():
+        scene.add_geometry(m.copy(), geom_name=cat)
+    scene.export(path)
+    return scene
+
+
+# ----------------------------------------------------------------------------- 4b. faithful projection of the model's masks
+def mask_polygons(mask, mx, my, eps_px=1.0):
+    """Binary mask -> shapely polygons in metres (holes kept), via the OCR-solved px->m mapping."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    cs, hier = cv2.findContours(mask.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None:
+        return None
+    hier = hier[0]
+    to_m = lambda c: [(float(mx(x)), float(my(y))) for x, y in cv2.approxPolyDP(c, eps_px, True)[:, 0]]
+    polys = []
+    for i, c in enumerate(cs):
+        if hier[i][3] != -1 or len(c) < 3:
+            continue
+        holes, k = [], hier[i][2]
+        while k != -1:
+            if len(cs[k]) >= 3:
+                h = to_m(cs[k])
+                if len(h) >= 3:
+                    holes.append(h)
+            k = hier[k][0]
+        shell = to_m(c)
+        if len(shell) >= 3:
+            p = Polygon(shell, holes).buffer(0)
+            if not p.is_empty:
+                polys.append(p)
+    return unary_union(polys) if polys else None
+
+
+def build_faithful(v, icon, mapping, path, extra=None):
+    """Every wall/door/window pixel the model predicted, extruded to its height. Nothing is dropped."""
+    import trimesh
+    mx, my = make_mapper(mapping, "x"), make_mapper(mapping, "y")
+    wall = v["model_wall"]
+    T = v["T"]
+    near = cv2.dilate(wall.astype(np.uint8), np.ones((int(2 * T),) * 2, np.uint8)) > 0
+    lab, _ = ndimage.label(np.isin(icon, [WIN, DOOR]))
+    keep = np.unique(lab[near & (lab > 0)])
+    keep = keep[keep > 0]
+    door = np.isin(lab, keep) & (icon == DOOR) & ~wall
+    win = np.isin(lab, keep) & (icon == WIN) & ~wall
+    stairs = (icon == STAIRS)
+    layers = [("wall", wall, 0.0, WALL_HEIGHT),
+              ("wall", door, DOOR_HEIGHT, WALL_HEIGHT), ("door", door, 0.0, DOOR_HEIGHT),
+              ("wall", win, 0.0, WINDOW_SILL), ("glass", win, WINDOW_SILL, WINDOW_HEAD),
+              ("wall", win, WINDOW_HEAD, WALL_HEIGHT), ("stairs", stairs, 0.0, 0.05)]
+    parts = {}
+    for cat, mask, z0, z1 in layers:
+        if not mask.any() or z1 <= z0:
+            continue
+        geom = mask_polygons(mask, mx, my)
+        if geom is None:
+            continue
+        for p in ([geom] if geom.geom_type == "Polygon" else list(geom.geoms)):
+            if p.area < 1e-4:
+                continue
+            from shapely.geometry import Polygon
+            flipped = Polygon([(x, -y) for x, y in p.exterior.coords],
+                              [[(x, -y) for x, y in r.coords] for r in p.interiors])
+            try:
+                m = trimesh.creation.extrude_polygon(flipped, z1 - z0)
+            except Exception:
+                continue
+            m.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
+            m.apply_translation([0, z0, 0])
+            parts.setdefault(cat, []).append(m)
+    scene = trimesh.Scene()
+    for cat, ms in parts.items():
+        m = trimesh.util.concatenate(ms)
+        m.visual = trimesh.visual.ColorVisuals(m, face_colors=np.tile(COLORS[cat], (len(m.faces), 1)))
+        scene.add_geometry(m, geom_name=cat)
+    for cat, m in (extra or {}).items():
+        scene.add_geometry(m.copy(), geom_name=cat)
+    scene.export(path)
+    return scene
+
+
+# ----------------------------------------------------------------------------- 5. IFC with wall/door/window types
+def build_ifc(plan, path):
+    from ifcopenshell.api import root, unit, context, aggregate, spatial, geometry, feature, project, material
+    from ifcopenshell.api import type as ifctype
+    f = project.create_file(version="IFC4")
+    proj = root.create_entity(f, ifc_class="IfcProject", name="Floorplan to Revit")
+    unit.assign_unit(f, units=[unit.add_si_unit(f, unit_type="LENGTHUNIT"),
+                               unit.add_si_unit(f, unit_type="AREAUNIT")])
+    model = context.add_context(f, context_type="Model")
+    body = context.add_context(f, context_type="Model", context_identifier="Body",
+                               target_view="MODEL_VIEW", parent=model)
+    axis_ctx = context.add_context(f, context_type="Plan", context_identifier="Axis",
+                                   target_view="GRAPH_VIEW", parent=model)
+    site = root.create_entity(f, ifc_class="IfcSite", name="Site")
+    bldg = root.create_entity(f, ifc_class="IfcBuilding", name="Building")
+    storey = root.create_entity(f, ifc_class="IfcBuildingStorey", name=plan["level"]["name"])
+    storey.Elevation = 0.0
+    aggregate.assign_object(f, products=[site], relating_object=proj)
+    aggregate.assign_object(f, products=[bldg], relating_object=site)
+    aggregate.assign_object(f, products=[storey], relating_object=bldg)
+    for e in (site, bldg, storey):
+        geometry.edit_object_placement(f, product=e, matrix=np.eye(4))
+    masonry = material.add_material(f, name="Masonry", category="brick")
+
+    def M(origin, d2, z=0.0):
+        x_ax = np.array([d2[0], -d2[1], 0.0]); z_ax = np.array([0.0, 0.0, 1.0])
+        m = np.eye(4)
+        m[:3, 0], m[:3, 1], m[:3, 2] = x_ax, np.cross(z_ax, x_ax), z_ax
+        m[:3, 3] = [origin[0], -origin[1], z]
+        return m
+
+    wall_types = {}
+
+    def wall_type(t):
+        key = int(round(t * 1000))
+        if key not in wall_types:
+            wt = root.create_entity(f, ifc_class="IfcWallType", name="Masonry {} mm".format(key),
+                                    predefined_type="STANDARD")
+            ls = material.add_material_set(f, name="Masonry {} mm".format(key), set_type="IfcMaterialLayerSet")
+            layer = material.add_layer(f, layer_set=ls, material=masonry)
+            material.edit_layer(f, layer=layer, attributes={"LayerThickness": t})
+            material.assign_material(f, products=[wt], type="IfcMaterialLayerSet", material=ls)
+            wall_types[key] = wt
+        return wall_types[key]
+
+    ifc_walls = {}
+    for w in plan["walls"]:
+        a, d, n, L = wall_frame(w)
+        e = root.create_entity(f, ifc_class="IfcWall", name="Wall {}".format(w["id"]), predefined_type="STANDARD")
+        ifctype.assign_type(f, related_objects=[e], relating_type=wall_type(w["thickness"]))
+        start = a - d * w["ext"][0]
+        length = L + w["ext"][0] + w["ext"][1]
+        geometry.assign_representation(f, product=e, representation=geometry.add_wall_representation(
+            f, context=body, length=length, height=w["height"], thickness=w["thickness"],
+            offset=-w["thickness"] / 2))
+        geometry.assign_representation(f, product=e, representation=geometry.add_axis_representation(
+            f, context=axis_ctx, axis=[(0.0, 0.0), (length, 0.0)]))
+        geometry.edit_object_placement(f, product=e, matrix=M(start, d))
+        spatial.assign_container(f, products=[e], relating_structure=storey)
+        ifc_walls[w["id"]] = (e, start, d, w)
+
+    op_types = {}
+    for o in plan["openings"]:
+        e_wall, start, d, w = ifc_walls[o["wall"]]
+        org = np.array(w["start"]) + d * (o["offset"] - o["width"] / 2)
+        op = root.create_entity(f, ifc_class="IfcOpeningElement", name="Opening {}".format(o["id"]))
+        geometry.assign_representation(f, product=op, representation=geometry.add_wall_representation(
+            f, context=body, length=o["width"], height=o["height"], thickness=w["thickness"] + 0.2,
+            offset=-(w["thickness"] + 0.2) / 2))
+        geometry.edit_object_placement(f, product=op, matrix=M(org, d, o["sill"]))
+        feature.add_feature(f, feature=op, element=e_wall)
+        cls = "IfcDoor" if o["type"] == "door" else "IfcWindow"
+        key = (cls, int(o["width"] * 1000), int(o["height"] * 1000))
+        if key not in op_types:
+            op_types[key] = root.create_entity(f, ifc_class=cls + "Type",
+                                               name="{} {} x {}".format(cls[3:], key[1], key[2]))
+        fill = root.create_entity(f, ifc_class=cls, name="{} {}".format(cls[3:], o["id"]))
+        fill.OverallWidth, fill.OverallHeight = o["width"], o["height"]
+        ifctype.assign_type(f, related_objects=[fill], relating_type=op_types[key])
+        geometry.assign_representation(f, product=fill, representation=geometry.add_wall_representation(
+            f, context=body, length=o["width"], height=o["height"], thickness=0.05, offset=-0.025))
+        geometry.edit_object_placement(f, product=fill, matrix=M(org, d, o["sill"]))
+        feature.add_filling(f, opening=op, element=fill)
+        spatial.assign_container(f, products=[fill], relating_structure=storey)
+
+    slab = root.create_entity(f, ifc_class="IfcSlab", name="Ground floor slab", predefined_type="FLOOR")
+    geometry.assign_representation(f, product=slab, representation=geometry.add_slab_representation(
+        f, context=body, depth=SLAB, polyline=[(x, -y) for x, y in plan["floor"]["polygon"]]))
+    mm = np.eye(4); mm[2, 3] = -SLAB
+    geometry.edit_object_placement(f, product=slab, matrix=mm)
+    spatial.assign_container(f, products=[slab], relating_structure=storey)
+    for r in plan["rooms"]:
+        sp = root.create_entity(f, ifc_class="IfcSpace", name=r["name"])
+        sp.LongName = "{} ({} m2)".format(r["name"], r["area_m2"])
+        geometry.assign_representation(f, product=sp, representation=geometry.add_slab_representation(
+            f, context=body, depth=WALL_HEIGHT, polyline=[(x, -y) for x, y in r["polygon"]]))
+        geometry.edit_object_placement(f, product=sp, matrix=np.eye(4))
+        aggregate.assign_object(f, products=[sp], relating_object=storey)
+    ifc_cls = {"furniture": "IfcFurniture", "plumbing": "IfcSanitaryTerminal", "appliance": "IfcElectricAppliance"}
+    for fu in plan.get("furniture", []):
+        c = np.array(fu["corners"], float)
+        e01, e12 = np.linalg.norm(c[1] - c[0]), np.linalg.norm(c[2] - c[1])
+        d = (c[1] - c[0]) / e01 if e01 >= e12 else (c[2] - c[1]) / e12
+        ctr = np.array(fu["center"])
+        el = root.create_entity(f, ifc_class=ifc_cls.get(fu["category"], "IfcFurniture"),
+                                name=fu["type"].replace("_", " ").title())
+        geometry.assign_representation(f, product=el, representation=geometry.add_wall_representation(
+            f, context=body, length=fu["width"], height=fu["height"], thickness=fu["depth"], offset=-fu["depth"] / 2))
+        geometry.edit_object_placement(f, product=el, matrix=M(ctr - d * fu["width"] / 2, d))
+        spatial.assign_container(f, products=[el], relating_structure=storey)
+    for k, s in enumerate(plan["stairs"]):
+        verts, faces, off = [], [], 0
+        for _, quad, z0, z1 in pieces({"walls": [], "openings": [], "stairs": [s]}):
+            vv, ff = prism(quad, z0, z1)
+            verts += [[p[0], -p[2], p[1]] for p in vv]
+            faces += [[int(i) + off for i in tri] for tri in ff]
+            off += len(vv)
+        st = root.create_entity(f, ifc_class="IfcStair", name="Stair {}".format(k))
+        geometry.assign_representation(f, product=st, representation=geometry.add_mesh_representation(
+            f, context=body, vertices=[verts], faces=[faces]))
+        geometry.edit_object_placement(f, product=st, matrix=np.eye(4))
+        spatial.assign_container(f, products=[st], relating_structure=storey)
+    f.write(path)
+
+
+# ----------------------------------------------------------------------------- 6. previews + report
+def _render3d(ax3, scene, title):
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    tris, cols = [], []
+    for name, g in scene.geometry.items():
+        t = g.vertices[g.faces][:, :, [0, 2, 1]] * [1, -1, 1]
+        tris.append(t); cols.append(np.tile(np.array(COLORS[name]) / 255.0, (len(t), 1)))
+    tris, cols = np.vstack(tris), np.vstack(cols)
+    nrm = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-9
+    cols[:, :3] *= (0.55 + 0.45 * np.clip(nrm @ np.array([0.35, -0.45, 0.82]), 0, 1))[:, None]
+    ax3.add_collection3d(Poly3DCollection(tris, facecolors=cols, edgecolors=cols, linewidths=0.3))
+    lo, hi = tris.reshape(-1, 3).min(0), tris.reshape(-1, 3).max(0)
+    ax3.set_xlim(lo[0], hi[0]); ax3.set_ylim(lo[1], hi[1]); ax3.set_zlim(lo[2], hi[2])
+    ax3.set_box_aspect(tuple(hi - lo)); ax3.set_axis_off(); ax3.view_init(elev=40, azim=-60)
+    ax3.set_title(title, fontsize=14)
+
+
+def previews(img, v, plan, sol, scene, faithful, out_dir):
+    fig = plt.figure(figsize=(30, 10))
+    ax = fig.add_subplot(1, 3, 1)
+    ax.imshow(img); ax.axis("off")
+    ax.set_title("model walls kept {:.1f}%  (yellow = model wall pixels not in Revit walls)".format(
+        100 * v["coverage"]), fontsize=13)
+    mp = plan["mapping"]
+    for axis in ("x", "y"):
+        for px, m in zip(mp["axes"][axis]["px"], mp["axes"][axis]["m"]):
+            if axis == "x":
+                ax.axvline(px, color="m", lw=0.5, ls="--")
+            else:
+                ax.axhline(px, color="m", lw=0.5, ls="--")
+    for sg in v["walls"]:
+        x0, x1 = (sg["a0"], sg["a1"]) if sg["o"] == "h" else (sg["c"] - sg["t"] / 2, sg["c"] + sg["t"] / 2)
+        y0, y1 = (sg["c"] - sg["t"] / 2, sg["c"] + sg["t"] / 2) if sg["o"] == "h" else (sg["a0"], sg["a1"])
+        ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
+    miss = np.zeros(v["missed"].shape + (4,))
+    miss[v["missed"]] = (1.0, 0.85, 0.0, 1.0)
+    ax.imshow(miss)
+    _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
+    _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "preview.png"), dpi=80)
+    plt.show()
+
+
+def print_report(plan):
+    pr = plan["precision"]
+    print("\n=== PRECISION ({}) ===".format(pr["scale_source"]))
+    for r in pr["report"]:
+        if "written_m" in r:
+            mark = "OK " if r["status"] == "ok" else ("-- " if r["status"].startswith("rejected") else "!! ")
+            print("  {} {:<15} {}  {:<22} written {:>7.3f} m  model {:>7.3f} m  error {:+7.1f} mm{}".format(
+                mark, r.get("kind", "dimension"), r["axis"], r["text"][:22], r["written_m"], r["model_m"],
+                r["error_mm"], "  (rejected: conflicts)" if r["status"].startswith("rejected") else ""))
+        else:
+            print("  ?? {}: {} {}".format(r["axis"], r["text"], r.get("status", "")))
+    print("  {}/{} written dimensions reproduced exactly".format(pr["dimensions_exact"], pr["dimensions_read"]))
+    nd = sum(o["type"] == "door" for o in plan["openings"])
+    nw = len(plan["openings"]) - nd
+    xs = [c for w in plan["walls"] for c in (w["start"][0], w["end"][0])]
+    ys = [c for w in plan["walls"] for c in (w["start"][1], w["end"][1])]
+    print("\n=== MODEL ===\n  walls {} ({} external) | doors {} | windows {} | rooms {} | stairs {} | grids {}".format(
+        len(plan["walls"]), sum(w["external"] for w in plan["walls"]), nd, nw, len(plan["rooms"]),
+        len(plan["stairs"]), len(plan["grids"])))
+    print("  building size {:.3f} x {:.3f} m (wall centre-lines)".format(max(xs) - min(xs), max(ys) - min(ys)))
+    for r in plan["rooms"]:
+        print("  room: {:<34} {:>6.2f} m2".format(r["name"], r["area_m2"]))
+    print("  model wall pixels kept in Revit walls: {:.1f}%".format(100 * plan.get("coverage", 0)))
+    if plan.get("furniture"):
+        cnt = {}
+        for fu in plan["furniture"]:
+            cnt[fu["type"]] = cnt.get(fu["type"], 0) + 1
+        print("  furniture/fixtures:", ", ".join("{} {}".format(v, k) for k, v in sorted(cnt.items())))
+    th = sorted({w["thickness"] for w in plan["walls"]})
+    print("  wall thicknesses (m):", th)
+
+
+# ----------------------------------------------------------------------------- run
+def ocr_full_res(img, original=None):
+    """OCR on the full-resolution plan (room sizes / dimensions are tiny after the 1280 px resize),
+    token positions mapped back to the inference image."""
+    if original is None or original.shape[:2] == img.shape[:2]:
+        return ocr_tokens(img)
+    f = img.shape[1] / original.shape[1]
+    big = original
+    if max(big.shape[:2]) > 4000:                  # keep OCR fast on huge scans
+        k = 4000 / max(big.shape[:2])
+        big = cv2.resize(big, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+        f = img.shape[1] / big.shape[1]
+    toks = ocr_tokens(big)
+    for t in toks:
+        t["x"] *= f
+        t["y"] *= f
+    return toks
+
+
+def main(img=None, room=None, icon=None, original=None):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    if room is None:
+        assert IMAGE, "Set IMAGE at the top of the cell to a floor-plan URL or file path"
+        img, room, icon = predict(IMAGE)
+        original = LAST_ORIGINAL
+    v = vectorise(room, icon)
+    toks = ocr_full_res(img, original)
+    print("OCR: {} dimension numbers, {} room sizes, {} labels".format(
+        sum(t["kind"] == "num" for t in toks), sum(t["kind"] == "size" for t in toks),
+        sum(t["kind"] == "label" for t in toks)))
+    gx = sorted({round(sg["c"], 2) for sg in v["walls"] if sg["o"] == "v"})
+    gy = sorted({round(sg["c"], 2) for sg in v["walls"] if sg["o"] == "h"})
+    ys_, xs_ = np.where(v["full"])
+    sol = None if (METERS_PER_PIXEL or BUILDING_WIDTH_M) else solve(
+        gx, gy, (xs_.min(), ys_.min(), xs_.max(), ys_.max()), toks, struct=v["full"], segs=v["walls"], T=v["T"])
+    if sol is None and BUILDING_WIDTH_M:
+        s = BUILDING_WIDTH_M / (gx[-1] - gx[0])
+        sol = {"scale_m_per_px": s, "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
+                                             "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
+               "report": [], "fallback": True}
+    plan = build_plan(v, sol, toks, room)
+    plan["coverage"] = round(v["coverage"], 4)
+    if MAKE_FURNITURE:
+        items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
+        items, dropped = filter_by_room(items, room, v["T"])
+        if dropped:
+            print("  furniture: {} detections rejected by room check (wrong room for the object)".format(dropped))
+        plan["furniture"] = build_furniture(items, plan)
+    else:
+        plan["furniture"] = []
+    jp = os.path.join(OUT_DIR, "plan.json")
+    json.dump(plan, open(jp, "w"), indent=1)
+    fmesh = furniture_meshes(plan["furniture"]) if plan["furniture"] else {}
+    scene = build_glb(plan, os.path.join(OUT_DIR, "model.glb"), extra=fmesh)
+    faithful = build_faithful(v, icon, plan["mapping"], os.path.join(OUT_DIR, "model_faithful.glb"), extra=fmesh)
+    try:
+        build_ifc(plan, os.path.join(OUT_DIR, "model.ifc"))
+    except Exception as e:
+        print("IFC export failed (plan.json / GLB are fine):", type(e).__name__, e)
+    print_report(plan)
+    previews(img, v, plan, sol, scene, faithful, OUT_DIR)
+    print("\nfiles in", OUT_DIR, ":", ", ".join(sorted(os.listdir(OUT_DIR))))
+    print("Next: download plan.json -> run build_in_revit.py inside Revit (pyRevit / RevitPythonShell).")
+    return plan
+
+
+if not os.environ.get("P3D_NO_MAIN"):
+    plan = main()

@@ -1,0 +1,35 @@
+name: Deploy to Modal
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", "modal_app.py", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check the code
+        run: |
+          python -m py_compile app/server.py app/pipeline.py modal_app.py
+          node --check app/static/app.js
+      - name: Install Modal
+        run: pip install modal==1.6.3
+      - name: Save the HF token on Modal
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: modal secret create hf-token "HF_TOKEN=$HF_TOKEN" --force > /dev/null
+      - name: Deploy
+        run: modal deploy modal_app.py

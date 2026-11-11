@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlanForge — floor plan to Revit</title>
+<link rel="stylesheet" href="app.css">
+<script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/":"./vendor/addons/"}}</script>
+</head>
+<body>
+<div id="app" class="mode-view">
+  <header class="top">
+    <div class="logo"><div class="mark"></div>PlanForge</div>
+    <span class="crumb" id="crumb">/ new plan</span>
+    <div class="sp"></div>
+    <span class="hint view-only" id="saveState"></span>
+    <button class="btn view-only" id="btnEdit" disabled>Edit furniture</button>
+    <a class="btn pri view-only disabled" id="btnExport">Export to Revit</a>
+    <button class="btn edit-only" id="btnCancel">Cancel</button>
+    <button class="btn pri edit-only" id="btnApply">Apply &amp; re-export</button>
+  </header>
+
+  <!-- ===== left: input & options (view mode) / furniture library (edit mode) ===== -->
+  <aside class="side left">
+    <section class="view-only">
+      <h4>Input</h4>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept=".dxf,.dwg,.pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp" hidden>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <b>Drop floor plan</b><span class="muted">or click to browse · max 50 MB</span>
+        <div class="chips"><span class="chip">DXF</span><span class="chip" title="Save as DXF first">DWG</span><span class="chip">PDF</span><span class="chip">PNG</span><span class="chip">JPG</span></div>
+      </label>
+      <div class="file hidden" id="fileCard"><div class="ft" id="fileExt">PDF</div><div class="grow"><b id="fileName"></b><div class="muted" id="fileMeta"></div></div><span class="ok" id="fileOk">✓</span></div>
+    </section>
+
+    <section class="view-only">
+      <h4>Furniture</h4>
+      <div class="row"><span>Need furniture placement</span><button class="tog on" id="togFurn" role="switch" aria-checked="true"></button></div>
+      <div class="seg" id="furnMode"><span class="on" data-v="copy">Copy from plan</span><span data-v="manual">Place manually</span></div>
+      <p class="muted small" id="furnHelp">Furniture drawn on the plan is copied exactly; edit it after conversion.</p>
+    </section>
+
+    <section class="view-only">
+      <h4>Scale &amp; heights</h4>
+      <div class="inp">
+        <label class="f"><small>Building width (m)</small><input id="o_bw" placeholder="Auto (dims)"></label>
+        <label class="f"><small>Wall height (m)</small><input id="o_wh" value="3.00"></label>
+        <label class="f"><small>Ext. wall (mm)</small><input id="o_ew" placeholder="Auto"></label>
+        <label class="f"><small>Int. wall (mm)</small><input id="o_iw" placeholder="Auto"></label>
+        <label class="f"><small>Door head (m)</small><input id="o_dh" value="2.10"></label>
+        <label class="f"><small>Sill (m)</small><input id="o_ws" value="0.90"></label>
+        <label class="f dxf-only hidden"><small>DXF units</small><select id="o_units"><option value="">From file</option><option value="4">mm</option><option value="5">cm</option><option value="6">m</option><option value="1">inch</option><option value="2">feet</option></select></label>
+      </div>
+    </section>
+
+    <div class="sp view-only"></div>
+    <div class="progress view-only hidden" id="prog"><div class="bar"><i id="progBar"></i></div><span id="progMsg"></span></div>
+    <button class="btn pri big view-only" id="btnConvert" disabled>Convert to 3D</button>
+
+    <section class="edit-only">
+      <h4>Add furniture</h4>
+      <div class="lib" id="lib"></div>
+      <p class="muted small">Click an item, then click in the plan to place it.</p>
+    </section>
+    <section class="edit-only grow-sec">
+      <h4>Placed (<span id="placedN">0</span>)</h4>
+      <div class="list" id="placed"></div>
+    </section>
+  </aside>
+
+  <!-- ===== centre: viewer ===== -->
+  <main class="view" id="view">
+    <canvas id="c3d"></canvas>
+    <img id="traceImg" class="trace hidden" alt="trace check">
+    <div class="tabs" id="tabs"><span class="on" data-t="3d">3D</span><span data-t="plan">Plan</span><span data-t="trace" class="view-only">Trace check</span><span data-t="raw" class="view-only">AI raw</span></div>
+    <canvas id="cube" width="168" height="168" title="View cube: click a face"></canvas>
+    <button class="home" id="btnHome" title="Home view">⌂</button>
+    <div class="empty" id="empty"><div class="emark"></div><b>Upload a floor plan to start</b><span class="muted">DXF gives exact scale · PDF / PNG / JPG use the written dimensions</span></div>
+    <div class="section-ui hidden" id="sectionUi"><small>Cut height</small><input type="range" id="cutH" min="0.1" max="3.2" step="0.05" value="1.2"><b id="cutV">1.20 m</b></div>
+    <div class="measure-out hidden" id="measOut"></div>
+    <div class="tip" id="tip"></div>
+
+    <div class="tb view-only" id="tbView">
+      <i data-tool="orbit" class="on" title="Orbit (O)">Orbit</i><i data-tool="pan" title="Pan (P)">Pan</i><i data-tool="zoom" title="Zoom (Z)">Zoom</i><i data-act="fit" title="Fit (F)">Fit</i>
+      <span class="sepv"></span>
+      <i data-tog="section" title="Section cut">Section</i><i data-tool="measure" title="Measure (M)">Measure</i><i data-tool="walk" title="Walk (W)">Walk</i>
+      <span class="sepv"></span>
+      <i data-act="layers" title="Layers">Layers</i><i data-tog="xray" title="X-ray">X-ray</i><i data-tog="edges" title="Edges">Edges</i>
+    </div>
+    <div class="tb edit-only" id="tbEdit">
+      <i data-etool="select" class="on">Select</i><i data-etool="move">Move</i><i data-etool="rotate">Rotate</i>
+      <span class="sepv"></span>
+      <i data-etog="snap" class="on">Snap</i><i data-act="undo">Undo</i><i data-act="redo">Redo</i>
+    </div>
+    <div class="pop hidden" id="layersPop"></div>
+    <div class="pop ctx hidden" id="ctx"><span data-c="rot">Rotate 90°</span><span data-c="dup">Duplicate</span><span data-c="wall">Back to wall</span><span data-c="del" class="danger">Delete</span></div>
+  </main>
+
+  <!-- ===== right: precision / properties / downloads ===== -->
+  <aside class="side right">
+    <section>
+      <h4>Precision</h4>
+      <div class="stat">
+        <div class="st"><b id="s_cov">—</b><span class="muted">walls kept</span></div>
+        <div class="st"><b id="s_dim">—</b><span class="muted">dims matched</span></div>
+        <div class="st"><b id="s_rooms">—</b><span class="muted">rooms</span></div>
+        <div class="st"><b id="s_furn">—</b><span class="muted">furniture</span></div>
+      </div>
+      <p class="muted small" id="s_scale"></p>
+    </section>
+    <section>
+      <h4 id="selTitle">Selection</h4>
+      <div id="props"><p class="muted small">Click a wall, room or furniture item.</p></div>
+    </section>
+    <section class="view-only grow-sec">
+      <h4>Rooms</h4>
+      <div class="list" id="roomList"></div>
+    </section>
+    <section class="view-only">
+      <h4>Downloads</h4>
+      <div id="dls" class="dls">
+        <a class="dl disabled" data-f="model.ifc"><b>model.ifc</b><span class="muted">IFC4 · opens in Revit</span></a>
+        <a class="dl disabled" data-f="plan.json"><b>plan.json</b><span class="muted">native Revit build</span></a>
+        <a class="dl disabled" data-f="build_in_revit.py"><b>build_in_revit.py</b><span class="muted">pyRevit script</span></a>
+        <a class="dl disabled" data-f="model.glb"><b>model.glb</b><span class="muted">3D</span></a>
+        <a class="dl disabled" data-f="floorplan_3d.zip"><b>All files (.zip)</b><span class="muted">everything</span></a>
+      </div>
+      <details class="report"><summary>Full report</summary><pre id="report"></pre></details>
+    </section>
+  </aside>
+</div>
+<div class="toast hidden" id="toast"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
