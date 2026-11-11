@@ -32,6 +32,9 @@ OUT_FILES = ("plan.json", "model.ifc", "model.glb", "model_faithful.glb", "previ
 
 app = FastAPI(title="PlanForge")
 
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402  the website may be hosted elsewhere
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 # ----------------------------------------------------------------------------- input formats
 def dxf_to_png(path, out, unit_override=None, max_px=7000):

@@ -4,6 +4,9 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
+// API location: same site by default; a static host (Azure Static Web Apps / GitHub Pages) points it at the
+// conversion engine via config.js or ?api=https://... in the URL.
+const API = (new URLSearchParams(location.search).get("api") || window.PLANFORGE_API || "").replace(/\/$/, "");
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const app = $("#app");
@@ -254,7 +257,7 @@ function setTab(t) {
   else if (t === "3d" || t === "raw") { if (camera !== persp) { setCamera(persp); fit(); } }
   if (S.job && (t === "raw") !== !!S.rawLoaded) {
     S.rawLoaded = t === "raw";
-    loadBuilding(`/api/files/${S.job}/${t === "raw" ? "model_faithful.glb" : "shell.glb"}`, t === "raw")
+    loadBuilding(`${API}/api/files/${S.job}/${t === "raw" ? "model_faithful.glb" : "shell.glb"}`, t === "raw")
       .then(() => { furnG.visible = t !== "raw"; });
   }
 }
@@ -636,9 +639,9 @@ $("#btnApply").onclick = async () => {
       type: f.type, center: f.center, width: f.width, depth: f.depth, height: f.height,
       angle_deg: THREE.MathUtils.radToDeg(f.angle), front: [Math.cos(f.angle + f.frontRel), Math.sin(f.angle + f.frontRel)],
       source: f.source, confidence: f.confidence })) };
-    const r = await fetch(`/api/export/${S.job}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(`${API}/api/export/${S.job}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    S.plan = await (await fetch(`/api/files/${S.job}/plan.json?t=${Date.now()}`)).json();
+    S.plan = await (await fetch(`${API}/api/files/${S.job}/plan.json?t=${Date.now()}`)).json();
     toast(`Saved · IFC, GLB, plan.json and zip rebuilt with ${S.furn.length} items`);
     $("#saveState").textContent = "furniture edited · exports up to date";
     leaveEdit(); renderStats();
@@ -710,13 +713,13 @@ $("#btnConvert").onclick = async () => {
   const fd = new FormData(); fd.append("file", S.file); fd.append("options", JSON.stringify(opt));
   $("#btnConvert").disabled = true; $("#prog").classList.remove("hidden"); progress(0.02, "Uploading");
   try {
-    const r = await fetch("/api/convert", { method: "POST", body: fd });
+    const r = await fetch(API + "/api/convert", { method: "POST", body: fd });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const { job } = await r.json();
     let st;
     for (;;) {
       await new Promise((res) => setTimeout(res, 1200));
-      st = await (await fetch(`/api/status/${job}`)).json();
+      st = await (await fetch(`${API}/api/status/${job}`)).json();
       progress(st.progress, st.msg);
       if (st.state === "done" || st.state === "error") break;
     }
@@ -730,14 +733,14 @@ function progress(p, m) { $("#progBar").style.width = Math.round(p * 100) + "%";
 
 async function loadJob(job, st) {
   S.job = job; S.rawLoaded = false;
-  S.plan = await (await fetch(`/api/files/${job}/plan.json?t=${Date.now()}`)).json();
+  S.plan = await (await fetch(`${API}/api/files/${job}/plan.json?t=${Date.now()}`)).json();
   S.furn = (S.plan.furniture || []).map(fromPlan);
-  await loadBuilding(`/api/files/${job}/shell.glb`);
+  await loadBuilding(`${API}/api/files/${job}/shell.glb`);
   drawGrids(); rebuildFurniture(); renderStats(st); renderRooms();
   $("#report").textContent = st?.report || "";
-  $("#traceImg").src = `/api/files/${job}/preview.png?t=${Date.now()}`;
-  $$("#dls .dl").forEach((a) => { a.href = `/api/files/${job}/${a.dataset.f}`; a.setAttribute("download", a.dataset.f); a.classList.remove("disabled"); });
-  const ex = $("#btnExport"); ex.href = `/api/files/${job}/floorplan_3d.zip`; ex.setAttribute("download", "floorplan_3d.zip"); ex.classList.remove("disabled");
+  $("#traceImg").src = `${API}/api/files/${job}/preview.png?t=${Date.now()}`;
+  $$("#dls .dl").forEach((a) => { a.href = `${API}/api/files/${job}/${a.dataset.f}`; a.setAttribute("download", a.dataset.f); a.classList.remove("disabled"); });
+  const ex = $("#btnExport"); ex.href = `${API}/api/files/${job}/floorplan_3d.zip`; ex.setAttribute("download", "floorplan_3d.zip"); ex.classList.remove("disabled");
   $("#btnEdit").disabled = false; $("#empty").classList.add("hidden");
   $("#saveState").textContent = "";
   setTab("3d"); setTool("orbit"); fit(); select(null);
@@ -762,8 +765,11 @@ function loop(now) {
   cubeR.render(cubeS, cubeC);
   requestAnimationFrame(loop);
 }
-fetch("/api/catalog").then((r) => r.json()).then((c) => (CATALOG = c)).catch(() => {});
+fetch(API + "/api/catalog").then((r) => r.json()).then((c) => (CATALOG = c)).catch(() => {
+  $("#progMsg").textContent = "Conversion engine is offline right now: start it, or open the site with ?api=<engine URL>";
+  $("#prog").classList.remove("hidden");
+});
 resize(); fit(); requestAnimationFrame(loop);
 // deep link: /?job=<id> reopens a finished conversion
 const qj = new URLSearchParams(location.search).get("job");
-if (qj) fetch(`/api/status/${qj}`).then((r) => r.ok && r.json()).then((st) => st && st.state === "done" && loadJob(qj, st)).catch(() => {});
+if (qj) fetch(`${API}/api/status/${qj}`).then((r) => r.ok && r.json()).then((st) => st && st.state === "done" && loadJob(qj, st)).catch(() => {});

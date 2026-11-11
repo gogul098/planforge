@@ -4,7 +4,7 @@ Upload a floor plan (**DXF, PDF, PNG or JPG**) and get a measured 3D building mo
 stairs, rooms and furniture, exported as **IFC4**, **glTF** and a **native Revit build script**.
 Architects then only add elevations and detailing, which cuts most of the manual modelling work.
 
-**Live demo:** _add your Modal link here_ · built by [@gogul098](https://github.com/gogul098)
+**Live demo:** _add the Azure Static Web Apps link here_ · built by [@gogul098](https://github.com/gogul098)
 
 ![3D viewer](docs/screenshots/viewer.png)
 
@@ -45,12 +45,12 @@ plan ─► U-Net (rooms + icons) ─► vectorise walls/openings ─► OCR dim
 | Path | What |
 |---|---|
 | `app/` | FastAPI backend (`server.py`), pipeline (`pipeline.py`), web frontend (`static/`, three.js) |
-| `Dockerfile`, `deploy/` | Container image + one-time Google Cloud setup script |
+| `Dockerfile` | Container image for the conversion engine |
 | `pipeline/` | Pipeline source modules (`assemble.py` builds the single-file `pipeline.py`) |
 | `training/` | Kaggle notebooks + training code for both models (2× T4, DDP, fp16, EMA) |
 | `revit/` | `build_in_revit.py`: builds the model in Revit from `plan.json` |
 | `kaggle/` | Diagnostics and a run-on-Kaggle cell |
-| `.github/workflows/deploy.yml` | Every push to `main` redeploys the site on Google Cloud Run |
+| `.github/workflows/azure-static-web-app.yml` | Every push to `main` redeploys the website on Azure Static Web Apps |
 
 ## Run locally
 
@@ -60,15 +60,24 @@ export HF_TOKEN=...            # read access to the model repos
 cd app && uvicorn server:app --port 7860
 ```
 
-## Deploy (GitHub → Google Cloud Run, inside the free tier)
+## Deploy
 
-Cloud Run free tier: 180k vCPU-s + 360k GiB-s a month (about 25 h of a 2 CPU / 4 GB instance). The app scales to zero
-when idle and is capped at one instance, with a budget alert as a safety net.
+**Website: Azure Static Web Apps, Free plan.** It costs $0, needs no card, and uses no Azure credit. It's a separate
+resource, so other apps on the same subscription are not affected.
 
-1. Create a Google Cloud project and link billing (UPI autopay works in India: one ₹500–1000 prepayment, kept as credit).
-2. In **Cloud Shell**: `bash deploy/gcp_setup.sh <PROJECT_ID> <HF_TOKEN>`, then copy the printed JSON.
-3. Here: Settings → Secrets and variables → Actions → add `GCP_SA_KEY` (the JSON) and `GCP_PROJECT` (project id).
-4. Actions → *Deploy to Google Cloud Run* → Run. Every push to `main` redeploys; the link is printed in the log.
+1. Azure portal → *Create a resource* → **Static Web App** → Plan: **Free** → Deployment source: **Other**.
+   Pick a new resource group (e.g. `planforge-rg`).
+2. In the new Static Web App → *Manage deployment token* → copy it.
+3. Here: Settings → Secrets and variables → Actions → **Secrets** → `AZURE_STATIC_WEB_APPS_API_TOKEN` = the token.
+4. Optional: Actions → **Variables** → `PLANFORGE_API` = URL of the conversion engine.
+5. Every push to `main` that touches `app/static/` redeploys the site.
+
+**Conversion engine (`app/server.py`):** runs wherever there is about 4 GB of RAM: your PC (`uvicorn server:app`), a Kaggle
+notebook (`kaggle/run_planforge_kaggle.py` prints a public link), or any container host (`Dockerfile`).
+Open the website with `?api=<engine URL>` to use it.
+
+**Models are never stored in this repo.** The engine downloads the weights from the private Hugging Face repos at
+runtime with `HF_TOKEN`, and the deploy workflow refuses to publish any weight file.
 
 ## Credits & licence
 
