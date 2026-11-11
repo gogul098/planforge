@@ -1,35 +1,48 @@
-name: Deploy to Modal
+name: Deploy to Azure Container Apps
 
 on:
   push:
     branches: [main]
-    paths: ["app/**", "modal_app.py", ".github/workflows/deploy.yml"]
+    paths: ["app/**", "Dockerfile", ".github/workflows/deploy.yml"]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 concurrency:
   group: deploy
   cancel-in-progress: true
 
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/planforge
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - name: Check the code
         run: |
-          python -m py_compile app/server.py app/pipeline.py modal_app.py
+          python -m py_compile app/server.py app/pipeline.py
           node --check app/static/app.js
-      - name: Install Modal
-        run: pip install modal==1.6.3
-      - name: Save the HF token on Modal
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: modal secret create hf-token "HF_TOKEN=$HF_TOKEN" --force > /dev/null
-      - name: Deploy
-        run: modal deploy modal_app.py
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }},${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Update the container app
+        run: |
+          az extension add --name containerapp --upgrade -y --only-show-errors
+          az containerapp update -n planforge -g planforge-rg --image $IMAGE:${{ github.sha }} --only-show-errors -o none
+          echo "Live at: https://$(az containerapp show -n planforge -g planforge-rg --query properties.configuration.ingress.fqdn -o tsv)"

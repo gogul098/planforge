@@ -45,12 +45,12 @@ plan ─► U-Net (rooms + icons) ─► vectorise walls/openings ─► OCR dim
 | Path | What |
 |---|---|
 | `app/` | FastAPI backend (`server.py`), pipeline (`pipeline.py`), web frontend (`static/`, three.js) |
-| `modal_app.py` | Serverless GPU deployment on Modal |
+| `Dockerfile`, `deploy/` | Container image + one-time Azure setup script |
 | `pipeline/` | Pipeline source modules (`assemble.py` builds the single-file `pipeline.py`) |
 | `training/` | Kaggle notebooks + training code for both models (2× T4, DDP, fp16, EMA) |
 | `revit/` | `build_in_revit.py`: builds the model in Revit from `plan.json` |
 | `kaggle/` | Diagnostics and a run-on-Kaggle cell |
-| `.github/workflows/deploy.yml` | Every push to `main` redeploys the site |
+| `.github/workflows/deploy.yml` | Every push to `main` redeploys the site on Azure |
 
 ## Run locally
 
@@ -60,13 +60,15 @@ export HF_TOKEN=...            # read access to the model repos
 cd app && uvicorn server:app --port 7860
 ```
 
-## Deploy (GitHub → Modal, free monthly credit)
+## Deploy (GitHub → Azure Container Apps, free with Azure for Students)
 
-1. Create a Modal account → Settings → API Tokens → new token.
-2. In this repo: Settings → Secrets and variables → Actions → add `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` and
-   `HF_TOKEN`.
-3. Push to `main` (or Actions → *Deploy to Modal* → Run). The link appears in the action log:
-   `https://<modal-user>--planforge-web.modal.run`.
+1. Activate **Azure for Students** (GitHub Student Developer Pack, no card): $100/year credit, plus the Container Apps
+   free monthly grant (180k vCPU-s, 360k GiB-s), which covers about 25 h of compute a month. The app sleeps when idle.
+2. In **Azure Cloud Shell**: `bash deploy/azure_setup.sh <github-user> <HF_TOKEN>`. Copy the printed JSON.
+3. Here: Settings → Secrets and variables → Actions → new secret `AZURE_CREDENTIALS` = that JSON.
+4. Actions → *Deploy to Azure Container Apps* → Run. After the first run, make the image public:
+   your profile → Packages → `planforge` → Package settings → Change visibility → Public.
+   Then run the workflow once more. Every push to `main` redeploys; the link is printed in the log.
 
 ## Credits & licence
 
