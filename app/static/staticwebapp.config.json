@@ -1,0 +1,5 @@
+{
+  "navigationFallback": { "rewrite": "/index.html", "exclude": ["/vendor/*", "*.{js,css,json,png,svg}"] },
+  "mimeTypes": { ".glb": "model/gltf-binary", ".js": "text/javascript" },
+  "globalHeaders": { "X-Content-Type-Options": "nosniff" }
+}

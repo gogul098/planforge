@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+out/
+plan_revit/
+*.pt
+*.npy
+.env
+# model weights never go in the repo - they are downloaded from Hugging Face at runtime
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+checkpoints/
