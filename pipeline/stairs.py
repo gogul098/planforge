@@ -562,8 +562,13 @@ def build_stairs(v, toks, room, plan, original=None):
                 w.append("tiers could not be counted: 3 assumed")
             total = r * i["n"]
             base = -total if STEPPED_AREAS == "down" else 0.0
-            rsrc = "riser note" if "riser" in i["notes"] else "assumed {:.0f} mm per tier".format(r * 1000)
-            i["direction"] = ("goes DOWN towards the walls (sunken area, floor cut out)" if STEPPED_AREAS == "down"
+            if STEPPED_AREAS == "down" and plinth > 0.01:
+                # steps going down lead to the open ground: they drop the full plinth height
+                total, base = plinth, -plinth
+                rsrc = "plinth: " + psrc + " split over the drawn steps"
+            if not (STEPPED_AREAS == "down" and plinth > 0.01):
+                rsrc = "riser note" if "riser" in i["notes"] else "assumed {:.0f} mm per tier".format(r * 1000)
+            i["direction"] = ("goes DOWN from the raised floor to the open ground (floor and plinth cut out)" if STEPPED_AREAS == "down"
                               else "rises towards the walls (raised seating)")
             w.append("stepped area going {}: tier height {}; check".format(
                 STEPPED_AREAS, "written" if "riser" in i["notes"] else "assumed"))

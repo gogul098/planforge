@@ -1834,8 +1834,13 @@ def build_stairs(v, toks, room, plan, original=None):
                 w.append("tiers could not be counted: 3 assumed")
             total = r * i["n"]
             base = -total if STEPPED_AREAS == "down" else 0.0
-            rsrc = "riser note" if "riser" in i["notes"] else "assumed {:.0f} mm per tier".format(r * 1000)
-            i["direction"] = ("goes DOWN towards the walls (sunken area, floor cut out)" if STEPPED_AREAS == "down"
+            if STEPPED_AREAS == "down" and plinth > 0.01:
+                # steps going down lead to the open ground: they drop the full plinth height
+                total, base = plinth, -plinth
+                rsrc = "plinth: " + psrc + " split over the drawn steps"
+            if not (STEPPED_AREAS == "down" and plinth > 0.01):
+                rsrc = "riser note" if "riser" in i["notes"] else "assumed {:.0f} mm per tier".format(r * 1000)
+            i["direction"] = ("goes DOWN from the raised floor to the open ground (floor and plinth cut out)" if STEPPED_AREAS == "down"
                               else "rises towards the walls (raised seating)")
             w.append("stepped area going {}: tier height {}; check".format(
                 STEPPED_AREAS, "written" if "riser" in i["notes"] else "assumed"))
@@ -2212,6 +2217,63 @@ COLORS = {"wall": [235, 232, 225, 255], "door": [150, 95, 55, 255], "glass": [14
           "furniture": [176, 132, 92, 255], "plumbing": [240, 242, 246, 255], "appliance": [150, 155, 162, 255]}
 
 
+def open_ground(plan):
+    """Steps that go down lead to an open space at ground level.
+    For each group of down-steps: find the side that faces the nearest walls (that is the low side),
+    sweep the steps that way until the walls stop them -> that space is left empty (no slab, no plinth),
+    re-order the tiers so they fall from the floor towards it. Returns the slab openings (steps + space)."""
+    from shapely.geometry import Polygon, LineString
+    from shapely.ops import unary_union
+    from shapely import affinity
+    down = [st for st in plan["stairs"] if st.get("sunken")]
+    if not down:
+        return []
+    walls = unary_union([Polygon(q).buffer(0) for cat, q, z0, z1 in pieces(plan) if cat == "wall"])
+    floor = Polygon(plan["floor"]["polygon"]).buffer(0)
+    free = floor.difference(walls.buffer(0.02))
+    pl = float(plan["levels"].get("plinth", 0.0))
+    holes = []
+    for st in down:
+        ol = Polygon(st["outline"]).buffer(0)
+        a, b = np.array(st["start"]), np.array(st["end"])
+        d = (b - a) / max(np.linalg.norm(b - a), 1e-9)
+        c = np.array(ol.centroid.coords[0])
+        best = None
+        for sgn in (1, -1):                              # how far can the area sweep each way before a wall?
+            dn = d * sgn
+            reach = 6.0
+            for t in np.arange(0.2, 6.01, 0.2):
+                moved = affinity.translate(ol, *(dn * t))
+                if moved.intersection(walls).area > 0.15 * ol.area or not floor.buffer(0.05).contains(moved.centroid):
+                    reach = t
+                    break
+            if best is None or reach < best[0]:
+                best = (reach, dn)
+        reach, dn = best
+        sweep = unary_union([affinity.translate(ol, *(dn * t)) for t in np.linspace(0, reach, 12)]).convex_hull
+        cell = [g for g in getattr(free, "geoms", [free]) if g.intersects(ol)]
+        space = sweep.intersection(unary_union(cell)) if cell else sweep
+        st["open_ground"] = round(float(space.difference(ol).area), 2)
+        st["direction"] = "goes DOWN from the raised floor ({:+.2f}) to the open ground ({:+.2f})".format(0.0, -pl)
+        # tiers: highest next to the floor, lowest next to the open space
+        trs = sorted(st["treads"], key=lambda tr: float(np.mean(np.array(tr["polygon"]) @ dn)))
+        n = len(trs)
+        for r, tr in enumerate(trs):
+            tr["z0"] = round(-pl, 4) if pl else tr["z0"]
+            tr["z1"] = round(-st["riser"] * (r + 1), 4) if r < n - 1 else round(-pl + st["riser"], 4) if pl else tr["z1"]
+        st["treads"] = trs
+        holes.append(unary_union([ol, space]).buffer(0))
+    merged = unary_union(holes).buffer(0.01).buffer(-0.01)
+    out = []
+    for g in getattr(merged, "geoms", [merged]):
+        g = g.simplify(0.02)
+        if g.area > 0.3:
+            out.append([[round(float(x), 4), round(float(y), 4)] for x, y in list(g.exterior.coords)[:-1]])
+    print("  open ground left for {} down-going step areas: {:.1f} m2 (floor + plinth cut out)".format(
+        len(down), sum(Polygon(o).area for o in out)))
+    return out
+
+
 def build_glb(plan, path, extra=None):
     import trimesh
     from shapely.geometry import Polygon
@@ -2220,9 +2282,8 @@ def build_glb(plan, path, extra=None):
         vv, ff = prism(quad, z0, z1)
         parts.setdefault(cat, []).append(trimesh.Trimesh(vv, ff, process=False))
     fpoly = Polygon([(x, -y) for x, y in plan["floor"]["polygon"]]).buffer(0)
-    for st in plan.get("stairs", []):
-        if st.get("sunken"):                          # leave the space for steps going down
-            fpoly = fpoly.difference(Polygon([(x, -y) for x, y in st["outline"]]).buffer(0))
+    for h in plan["floor"].get("holes", []):         # steps going down + the open ground they lead to
+        fpoly = fpoly.difference(Polygon([(x, -y) for x, y in h]).buffer(0))
     fpieces = [fpoly] if fpoly.geom_type == "Polygon" else [q for q in getattr(fpoly, "geoms", []) if q.area > 0.05]
     fl = trimesh.util.concatenate([trimesh.creation.extrude_polygon(q, SLAB) for q in fpieces])
     fl.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
@@ -2231,6 +2292,9 @@ def build_glb(plan, path, extra=None):
     pl = float(plan.get("levels", {}).get("plinth", 0.0))
     if pl > 0.01:                       # building raised on a plinth, entrance steps come down to the ground
         fp = Polygon([(x, -y) for x, y in plan["floor"]["polygon"]]).buffer(0)
+        for h in plan["floor"].get("holes", []):
+            fp = fp.difference(Polygon([(x, -y) for x, y in h]).buffer(0))
+        fp = max(getattr(fp, "geoms", [fp]), key=lambda g: g.area) if fp.geom_type != "Polygon" else fp
         if pl > SLAB + 0.01:
             pb = trimesh.creation.extrude_polygon(fp, pl - SLAB)
             pb.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
@@ -2816,7 +2880,7 @@ def main(img=None, room=None, icon=None, original=None):
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
-    plan["floor"]["holes"] = [st["outline"] for st in plan["stairs"] if st.get("sunken")]
+    plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
