@@ -741,8 +741,7 @@ $("#btnConvert").onclick = async () => {
     const { job } = await r.json();
     let st;
     for (;;) {
-      await new Promise((res) => setTimeout(res, 1200));
-      st = await (await fetch(`${API}/api/status/${job}`)).json();
+      st = await (await fetch(`${API}/api/status/${job}?wait=25`)).json();   // answers when progress changes
       progress(st.progress, st.msg);
       if (st.state === "done" || st.state === "error") break;
     }

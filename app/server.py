@@ -196,7 +196,9 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
 
 
 @app.get("/api/status/{job}")
-def status(job: str):
+def status(job: str, wait: float = 0):
+    """wait > 0: long poll - the answer comes as soon as the status changes, or after `wait` seconds
+    (max 25 s, well under Azure's 230 s request limit). One request every ~25 s instead of every second."""
     job = os.path.basename(job)
     sp = os.path.join(JOBS, job, "status.json")
     if job not in STATUS and os.path.exists(sp):
@@ -205,7 +207,24 @@ def status(job: str):
             STATUS[job].update(state="error", msg="Server restarted during conversion: please convert again")
     if job not in STATUS:
         raise HTTPException(404, "unknown job")
+    before = json.dumps(STATUS[job], sort_keys=True, default=str)
+    end = time.time() + min(max(wait, 0), 25)
+    while time.time() < end and STATUS[job].get("state") not in ("done", "error"):
+        if json.dumps(STATUS[job], sort_keys=True, default=str) != before:
+            break
+        time.sleep(0.5)
     return STATUS[job]
+
+
+import logging  # noqa: E402
+
+
+class _QuietStatus(logging.Filter):            # keep the log readable: no line per status check
+    def filter(self, rec):
+        return "/api/status/" not in rec.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietStatus())
 
 
 @app.get("/api/files/{job}/{name}")
