@@ -2233,6 +2233,24 @@ def fill_floor_gaps(plan, v, room):
     from shapely.ops import unary_union
     T = v["T"]
     mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    floor0 = Polygon(plan["floor"]["polygon"]).buffer(0)
+    _fill_floor_gaps(plan, v, room, T, mx, my)
+    # stairs outside the building stay outside: the added floor never covers them
+    st_out = [Polygon(st["outline"]).buffer(0.1, join_style=2) for st in plan.get("stairs", [])
+              if st["kind"] in ("entrance",) or (st["kind"] == "terrace" and not st.get("sunken"))]
+    if st_out:
+        new = Polygon(plan["floor"]["polygon"]).buffer(0)
+        added = new.difference(floor0).difference(unary_union(st_out))
+        new = unary_union([floor0, added])
+        if new.geom_type != "Polygon":
+            new = max(new.geoms, key=lambda g: g.area)
+        new = Polygon(new.exterior).simplify(0.03)
+        plan["floor"]["polygon"] = [[round(float(x), 4), round(float(y), 4)] for x, y in list(new.exterior.coords)[:-1]]
+
+
+def _fill_floor_gaps(plan, v, room, T, mx, my):
+    from shapely.geometry import Polygon, LineString, Point
+    from shapely.ops import unary_union
     # ---- 1. floor
     bld = ((room >= 2) & (room <= 11)).astype(np.uint8)
     k = int(2 * T) | 1
@@ -2276,7 +2294,15 @@ def fill_floor_gaps(plan, v, room):
                 continue
             dist_, h = min(hits, key=lambda t: t[0])
             gap = LineString([p, (h.x, h.y)])
-            if dist_ > 0.3 and gap.difference(floor.buffer(-0.15)).length > 0.8 * gap.length:
+            # a door / window gap: the same wall carries on further along the line -> never close it
+            def parallel_ahead(j):
+                wj = plan["walls"][j]
+                dj = np.subtract(wj["end"], wj["start"]); dj = dj / max(np.linalg.norm(dj), 1e-9)
+                return abs(np.dot(dj, d)) > 0.98 and lines0[j].distance(LineString([p, p + d * sgn * 6.0])) < 0.4
+            if any(parallel_ahead(j) for j in range(len(lines0)) if j != i):
+                continue
+            mid = gap.interpolate(0.5, normalized=True)
+            if dist_ > 0.3 and floor.distance(mid) > 0.3 and gap.difference(floor.buffer(-0.15)).length > 0.8 * gap.length:
                 w[end] = [round(h.x, 4), round(h.y, 4)]
                 lines0[i] = LineString([w["start"], w["end"]])
                 a, b = np.array(w["start"], float), np.array(w["end"], float)
@@ -2981,8 +3007,8 @@ def main(img=None, room=None, icon=None, original=None):
         sol = uniform_sol(v, s_new, "room sizes written on the plan ({} rooms)".format(n_rooms),
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
-    fill_floor_gaps(plan, v, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
+    fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
