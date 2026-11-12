@@ -2509,6 +2509,37 @@ def dimension_line_scale(toks, original, img_w):
                     lo, hi = r0, r1
             if lo is None:
                 continue
+            # a chain (4.05 | 7.89 | 4.06) is one straight line: cut it at the ticks / extension lines crossing it
+            # and keep the piece the number belongs to
+            p0 = np.array([x0, y0])
+            Hg, Wg = g.shape
+
+            def ink_at(q):
+                x_, y_ = int(round(q[0])), int(round(q[1]))
+                return 0 <= x_ < Wg and 0 <= y_ < Hg and g[y_, x_] < 140
+
+            def crossing(u):
+                c_ = p0 + d * u
+                return sum(ink_at(c_ + nrm * o) for o in (-7, -6, -5, 5, 6, 7)) >= 4
+            cuts = [u for u in np.arange(lo + 3, hi - 3, 1.0) if crossing(u)]
+            if cuts:
+                groups_ = np.split(np.array(cuts), np.where(np.diff(cuts) > 3)[0] + 1)
+                marks = [lo] + [float(gq.mean()) for gq in groups_] + [hi]
+                for m0, m1 in zip(marks[:-1], marks[1:]):
+                    if m0 <= tc <= m1:
+                        lo, hi = m0, m1
+                        break
+            # filled arrowheads were removed with the thick strokes: walk on to the arrow tips
+            for sgn in (-1, 1):
+                end = hi if sgn > 0 else lo
+                step = 0
+                while step < 30 and any(ink_at(p0 + d * (end + sgn * (step + 1)) + nrm * o) for o in (-1, 0, 1)) \
+                        and not crossing(end + sgn * (step + 1)):
+                    step += 1
+                if sgn > 0:
+                    hi = end + step
+                else:
+                    lo = end - step
             length = hi - lo
             if length < 3 * h or not (lo + 0.15 * length <= tc <= hi - 0.15 * length):
                 continue                                   # the number is written at the middle of its line
