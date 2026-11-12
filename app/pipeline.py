@@ -478,86 +478,6 @@ def _drawn_windows(segs, merged, image, T, model_shape):
     return segs, merged, found
 
 
-def _faces_outside(i, P, segs, masks, T):
-    """Fan of rays from the wall's middle on each side: if on one side most rays leave the image
-    without hitting another wall, the wall is on the outside of the building."""
-    a, b = P[i]
-    others = np.zeros_like(masks[0])
-    for k, m in enumerate(masks):
-        if k != i:
-            others |= m
-    Hh, Ww = others.shape
-    d = (b - a) / max(np.linalg.norm(b - a), 1e-9); n = np.array([-d[1], d[0]])
-    c = (a + b) / 2
-    for sgn in (1, -1):
-        hits = 0
-        angs = (-70, -52, -35, -17, 0, 17, 35, 52, 70)
-        for ang in angs:
-            r = np.radians(ang)
-            v = n * sgn * np.cos(r) + d * np.sin(r)
-            p = c + n * sgn * (segs[i]["t"] / 2 + 2)
-            while 0 <= p[0] < Ww and 0 <= p[1] < Hh:
-                if others[int(p[1]), int(p[0])]:
-                    hits += 1
-                    break
-                p = p + v
-        if hits < len(angs) / 3:
-            return True
-    return False
-
-
-def _drop_stray_walls(segs, merged, icon, T, shape, room=None):
-    """The model also paints stair sides / railings and free-standing furniture (desks, screens) as wall.
-    Drop (1) walls lying along a staircase and (2) short walls touching no other wall at either end,
-    unless a door or window sits in them."""
-    Hh, Ww = shape
-    st = cv2.dilate((icon == STAIRS).astype(np.uint8), np.ones((int(2 * T) | 1,) * 2, np.uint8)) > 0
-    P = [(np.array(sg["p0"], float), np.array(sg["p1"], float)) for sg in segs]
-    L = [np.linalg.norm(b - a) for a, b in P]
-
-    def dist(p, a, b):
-        d = b - a
-        t = np.clip(np.dot(p - a, d) / max(np.dot(d, d), 1e-9), 0, 1)
-        return np.linalg.norm(p - (a + d * t))
-    with_open = {o["wall"] for o in merged}
-    mask_all = []
-    for k, (a, b) in enumerate(P):
-        m = np.zeros(shape, np.uint8)
-        cv2.line(m, tuple(int(round(v)) for v in a), tuple(int(round(v)) for v in b), 1, max(1, int(round(segs[k]["t"] + 2))))
-        mask_all.append(m)
-    hull = cv2.convexHull(np.array([e for ab in P for e in ab], np.float32))
-    drop = set()
-    for i, (a, b) in enumerate(P):
-        if i in with_open:
-            continue
-        n_ = max(2, int(L[i]))
-        ts = np.linspace(0, 1, n_)
-        xs = np.clip(np.round(a[0] + (b[0] - a[0]) * ts).astype(int), 0, Ww - 1)
-        ys = np.clip(np.round(a[1] + (b[1] - a[1]) * ts).astype(int), 0, Hh - 1)
-        mid = (a + b) / 2
-        if (cv2.pointPolygonTest(hull, (float(mid[0]), float(mid[1])), True) < 10 * T
-                and _faces_outside(i, P, segs, mask_all, T)):
-            if DEBUG_WALLS:
-                print("   kept as outside wall", mid)       # an outside wall (open on one side) stays
-            continue
-        if st[ys, xs].mean() > 0.8 and L[i] < 30 * T:
-            drop.add(i); why = "along a staircase"
-        else:
-            tol = segs[i]["t"] / 2 + (2 if L[i] < 8 * T else 4) * T
-            opn = np.isin(icon, (1, 2))
-            def near_opening(e, r=int(3 * T)):
-                x0, y0 = int(max(e[0] - r, 0)), int(max(e[1] - r, 0))
-                return bool(opn[y0:int(e[1] + r) + 1, x0:int(e[0] + r) + 1].any())
-            touch = [near_opening(e) or any(dist(e, *P[k]) <= tol + segs[k]["t"] / 2 for k in range(len(P)) if k != i) for e in (a, b)]
-            if not any(touch) and L[i] < 25 * T:
-                drop.add(i); why = "free-standing (touches no wall)"
-        if i in drop:
-            print("  dropped wall: {} ({:.0f} px long, at {:.0f},{:.0f})".format(why, L[i], *((a + b) / 2)))
-    keep = [i for i in range(len(segs)) if i not in drop]
-    km = {i: k for k, i in enumerate(keep)}
-    return [segs[i] for i in keep], [dict(o, wall=km[o["wall"]]) for o in merged if o["wall"] in km]
-
-
 def vectorise(room, icon, image=None):
     wall = room == WALL
     openings_any = np.isin(icon, [WIN, DOOR])
@@ -673,11 +593,6 @@ def vectorise(room, icon, image=None):
     segs = [segs[i] for i in segs_ok]
     merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
     segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
-    for _ in range(3):                                    # removing stair sides can free a rail wall
-        n0 = len(segs)
-        segs, merged = _drop_stray_walls(segs, merged, icon, T, full.shape, room)
-        if len(segs) == n0:
-            break
     if n_win:
         print("  windows read from the drawing (not marked by the model): {}".format(n_win))
 
