@@ -154,29 +154,9 @@ def _band_runs(c, b0, b1, L, G):
     return out
 
 
-def vectorise(room, icon):
-    wall = room == WALL
-    openings_any = np.isin(icon, [WIN, DOOR])
-    # typical wall thickness T (px) from the medial axis
-    dist = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
-    sk = skeletonize(wall)
-    T = float(np.clip(2 * np.median(dist[sk]) if sk.any() else 6, 3, 60))
-    model_wall = wall.copy()
-    # the model's wall mask is trusted: only 1-2 px specks are removed (no thickness filtering,
-    # so thin partitions and walls detached from the main structure are kept)
-    # (no morphological opening: it erases thin double-line window walls the model got right;
-    #  specks are removed by size below)
-    comps = _components(wall, max(10, int(1.5 * T * T)))
-    if not comps:
-        raise RuntimeError("No walls detected.")
-    wall = np.any([m for m, s in comps], axis=0)
-    # add whole door/window blobs that touch a wall (they fill the gaps in the wall lines)
-    near = cv2.dilate(wall.astype(np.uint8), np.ones((int(2 * T),) * 2)) > 0
-    lab, n = ndimage.label(openings_any)
-    keep = np.unique(lab[near & (lab > 0)])
-    full = wall | np.isin(lab, keep[keep > 0])
-    full = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
-
+def _frame_walls(full, openings_any, icon, T):
+    """Horizontal / vertical walls + their openings in one frame (the image, or the image rotated so a
+    family of angled walls runs horizontally)."""
     # straight segments: horizontal / vertical runs longer than ~2.5 T
     L = max(int(2.5 * T), 12)
     segs = []
@@ -241,8 +221,6 @@ def vectorise(room, icon):
                     sg["a1"] = p["c"] + p["t"] / 2
                     sg["j1"] = (p["c"], p["t"])
     segs = [sg for sg in segs if sg["a1"] - sg["a0"] >= 2 * T]
-    if not segs:
-        raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
 
     # openings -> intervals on their host wall
     openings = []
@@ -278,6 +256,168 @@ def vectorise(room, icon):
                 continue
         merged.append(dict(o))
 
+    return segs, merged
+
+
+def _wall_angles(full, T):
+    """Dominant wall directions (degrees, mod 90) other than the image axes, e.g. 30 / 60 for a hexagonal plan."""
+    edges = cv2.Canny(full.astype(np.uint8) * 255, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=max(20, int(3 * T)),
+                            minLineLength=max(int(4 * T), 20), maxLineGap=int(T))
+    if lines is None:
+        return []
+    hist = np.zeros(90)
+    for x0, y0, x1, y1 in lines.reshape(-1, 4):
+        ang = np.degrees(np.arctan2(y1 - y0, x1 - x0)) % 90
+        hist[int(round(ang)) % 90] += np.hypot(x1 - x0, y1 - y0)
+    sm = np.array([hist[[(i + k) % 90 for k in (-2, -1, 0, 1, 2)]].sum() for i in range(90)])
+    out = []
+    total = sm.sum()
+    for i in np.argsort(-sm):
+        if sm[i] < 0.06 * total:
+            break
+        if min(i, 90 - i) <= 6 or any(min(abs(i - j), 90 - abs(i - j)) <= 8 for j in out):
+            continue                        # the image axes, or next to an angle already taken
+        # refine to a weighted mean inside the peak
+        ks = [(i + k) % 90 for k in range(-3, 4)]
+        w = hist[ks]
+        ang = (i + np.dot(w, np.arange(-3, 4)) / max(w.sum(), 1e-9)) % 90
+        out.append(float(ang))
+    return out
+
+
+def _rot_frame(shape, ang):
+    """Affine that rotates the image by -ang (degrees) into an enlarged canvas, and its inverse."""
+    H, W = shape
+    M = cv2.getRotationMatrix2D((W / 2, H / 2), ang, 1.0)       # positive ang = counter-clockwise on screen
+    c, s_ = abs(M[0, 0]), abs(M[0, 1])
+    nW, nH = int(H * s_ + W * c) + 2, int(H * c + W * s_) + 2
+    M[0, 2] += nW / 2 - W / 2
+    M[1, 2] += nH / 2 - H / 2
+    Mi = cv2.invertAffineTransform(M)
+    return M, Mi, (nW, nH)
+
+
+def _hv_point(o, c, u):
+    return (u, c) if o == "h" else (c, u)
+
+
+def _join_across(segs, T):
+    """Ends of walls that meet at an angle (not both h / v in the same frame): extend / trim each end to the
+    intersection of the two centre-lines and remember the other wall's thickness (corner solids close)."""
+    def line(sg):
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        L = max(np.linalg.norm(p1 - p0), 1e-9)
+        return p0, (p1 - p0) / L, L
+    for _ in range(2):
+        for sg in segs:
+            p0, d, L = line(sg)
+            for end, key in ((0, "j0"), (1, "j1")):
+                if sg.get(key + "_hv"):
+                    continue                                   # already joined to a perpendicular wall in its frame
+                pe = np.array(sg["p0"] if end == 0 else sg["p1"])
+                best = None
+                for q in segs:
+                    if q is sg:
+                        continue
+                    q0, e, M = line(q)
+                    cr = d[0] * e[1] - d[1] * e[0]
+                    if abs(cr) < np.sin(np.radians(12)):      # parallel-ish: not a corner
+                        continue
+                    # intersection of the two centre-lines
+                    tq = ((pe[0] - q0[0]) * d[1] - (pe[1] - q0[1]) * d[0]) / (e[0] * d[1] - e[1] * d[0])
+                    X = q0 + e * tq
+                    reach_q = q["t"] / 2 + 2 * T
+                    if not (-reach_q <= tq <= M + reach_q):
+                        continue
+                    dist = np.linalg.norm(X - pe)
+                    if dist > q["t"] / (2 * abs(cr)) + 2 * T:
+                        continue
+                    # do not cut a wall in half: the new end must stay on the same side of the old one
+                    u = (X - p0) @ d
+                    if (end == 0 and u > 0.6 * L) or (end == 1 and u < 0.4 * L):
+                        continue
+                    if best is None or dist < best[0]:
+                        best = (dist, X, q["t"])
+                if best is not None:
+                    if end == 0:
+                        sg["p0"] = [float(best[1][0]), float(best[1][1])]
+                    else:
+                        sg["p1"] = [float(best[1][0]), float(best[1][1])]
+                    sg[key] = (None, best[2])
+    return segs
+
+
+def vectorise(room, icon):
+    wall = room == WALL
+    openings_any = np.isin(icon, [WIN, DOOR])
+    # typical wall thickness T (px) from the medial axis
+    dist = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
+    sk = skeletonize(wall)
+    T = float(np.clip(2 * np.median(dist[sk]) if sk.any() else 6, 3, 60))
+    model_wall = wall.copy()
+    # the model's wall mask is trusted: only 1-2 px specks are removed (no thickness filtering,
+    # so thin partitions and walls detached from the main structure are kept)
+    # (no morphological opening: it erases thin double-line window walls the model got right;
+    #  specks are removed by size below)
+    comps = _components(wall, max(10, int(1.5 * T * T)))
+    if not comps:
+        raise RuntimeError("No walls detected.")
+    wall = np.any([m for m, s in comps], axis=0)
+    # add whole door/window blobs that touch a wall (they fill the gaps in the wall lines)
+    near = cv2.dilate(wall.astype(np.uint8), np.ones((int(2 * T),) * 2)) > 0
+    lab, n = ndimage.label(openings_any)
+    keep = np.unique(lab[near & (lab > 0)])
+    full = wall | np.isin(lab, keep[keep > 0])
+    full = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+
+    segs, merged = _frame_walls(full, openings_any, icon, T)
+    for sg in segs:                                            # every wall also as two end points (image px)
+        sg["frame"] = 0
+        e0 = sg["j0"][0] if "j0" in sg else sg["a0"]
+        e1 = sg["j1"][0] if "j1" in sg else sg["a1"]
+        sg["p0"], sg["p1"] = list(_hv_point(sg["o"], sg["c"], e0)), list(_hv_point(sg["o"], sg["c"], e1))
+        sg["j0_hv"], sg["j1_hv"] = "j0" in sg, "j1" in sg
+    for o in merged:
+        sg = segs[o["wall"]]
+        o["q0"], o["q1"] = list(_hv_point(sg["o"], sg["c"], o["u0"])), list(_hv_point(sg["o"], sg["c"], o["u1"]))
+    # angled walls (30 / 45 / 60 degree wings ...): rotate the image so they run straight, extract, rotate back
+    claimed = np.zeros(full.shape, np.uint8)
+    for sg in segs:
+        cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                 1, max(1, int(round(sg["t"] + T))))
+    angles = _wall_angles(full & ~(claimed > 0), T)
+    for ang in angles:
+        M, Mi, size = _rot_frame(full.shape, ang)
+        rest = (full & ~(claimed > 0)).astype(np.uint8)
+        rf = cv2.warpAffine(rest, M, size, flags=cv2.INTER_NEAREST) > 0
+        ro = cv2.warpAffine(openings_any.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST) > 0
+        ri = cv2.warpAffine(icon.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST)
+        fsegs, fops = _frame_walls(rf, ro, ri, T)
+        back = lambda pt: [float(Mi[0, 0] * pt[0] + Mi[0, 1] * pt[1] + Mi[0, 2]),
+                           float(Mi[1, 0] * pt[0] + Mi[1, 1] * pt[1] + Mi[1, 2])]
+        base = len(segs)
+        for o in fops:                                         # openings: frame coordinates -> image px
+            fs = fsegs[o["wall"]]
+            merged.append(dict(o, wall=base + o["wall"], q0=back(_hv_point(fs["o"], fs["c"], o["u0"])),
+                               q1=back(_hv_point(fs["o"], fs["c"], o["u1"]))))
+        for sg in fsegs:
+            e0 = sg["j0"][0] if "j0" in sg else sg["a0"]
+            e1 = sg["j1"][0] if "j1" in sg else sg["a1"]
+            sg.update({"frame": ang, "p0": back(_hv_point(sg["o"], sg["c"], e0)),
+                       "p1": back(_hv_point(sg["o"], sg["c"], e1)), "o": "a",
+                       "j0_hv": "j0" in sg, "j1_hv": "j1" in sg})
+            segs.append(sg)
+            cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                     1, max(1, int(round(sg["t"] + T))))
+    segs = _join_across(segs, T)
+    segs_ok = [i for i, sg in enumerate(segs) if np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1]) >= 2 * T]
+    if not segs_ok:
+        raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
+    remap = {i: k for k, i in enumerate(segs_ok)}
+    segs = [segs[i] for i in segs_ok]
+    merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
+
     stairs = []
     for comp, st in _components(icon == STAIRS, 4 * T * T):
         x, y, w, h = [int(v) for v in st[:4]]
@@ -285,12 +425,10 @@ def vectorise(room, icon):
                        "ox": x, "oy": y, "mask": comp[y:y + h, x:x + w].copy()})
     struct = np.zeros(full.shape, np.uint8)
     for sg in segs:
-        h0, h1 = int(round(sg["c"] - sg["t"] / 2)), int(round(sg["c"] + sg["t"] / 2))
-        a0, a1 = int(round(sg["a0"])), int(round(sg["a1"]))
-        if sg["o"] == "h":
-            cv2.rectangle(struct, (a0, h0), (a1, h1), 1, -1)
-        else:
-            cv2.rectangle(struct, (h0, a0), (h1, a1), 1, -1)
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+        n = np.array([-d[1], d[0]]) * sg["t"] / 2
+        cv2.fillPoly(struct, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n])).astype(np.int32)], 1)
     # how much of the model's wall prediction made it into the vector walls
     covered = cv2.dilate(struct, np.ones((max(3, int(T)),) * 2, np.uint8)) > 0
     missed = model_wall & ~covered

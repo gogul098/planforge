@@ -13,7 +13,32 @@ def ocr_tokens(img_rgb, ocr=None):
         ocr = RapidOCR()
     res, _ = ocr(img_rgb[:, :, ::-1].copy())
     toks = []
-    for box, txt, conf in res or []:
+    res = list(res or [])
+    used = set()
+    joined = []
+    for i, (box, txt, conf) in enumerate(res):                  # 'W x' on one line, 'D' on the next
+        if i in used:
+            continue
+        if re.search(r"\d\s*(?:m|mm|cm)?\s*[xX×]\s*$", txt.strip()):
+            b = np.array(box, float)
+            h = b[:, 1].max() - b[:, 1].min()
+            cx = b[:, 0].mean()
+            best = None
+            for j, (box2, txt2, conf2) in enumerate(res):
+                if j == i or j in used or not re.match(r"^\s*\d", txt2):
+                    continue
+                b2 = np.array(box2, float)
+                dy = b2[:, 1].min() - b[:, 1].max()
+                if -0.3 * h <= dy <= 1.5 * h and abs(b2[:, 0].mean() - cx) <= 2.5 * h:
+                    if best is None or dy < best[0]:
+                        best = (dy, j, b2, txt2, conf2)
+            if best:
+                _, j, b2, txt2, conf2 = best
+                used.add(j)
+                joined.append((np.vstack([b, b2]).tolist(), txt.strip() + " " + txt2.strip(), min(conf, conf2)))
+                continue
+        joined.append((box, txt, conf))
+    for box, txt, conf in joined:
         b = np.array(box, float)
         x0, x1, y0, y1 = b[:, 0].min(), b[:, 0].max(), b[:, 1].min(), b[:, 1].max()
         vertical_text = (y1 - y0) > 1.6 * (x1 - x0) and len(txt) > 2
@@ -56,12 +81,19 @@ def parse_length(side):
     return v if v < 40 else (v / 100 if v < 1000 else v / 1000)
 
 
+UNIT_WORDS = re.compile(r"(?<=\d)\s*(?:mm|cm|mtrs?|m)(?=\s*[xX×]|\b)\.?", re.I)
+
+
 def parse_size(text):
-    """'W x D' room-size label -> (a_m, b_m) or None."""
+    """'W x D' room-size label -> (a_m, b_m) or None.  '3.66 m x 4.88 m', '12'0\" x 10'6\"', '3600 X 4200'."""
+    unit = re.search(r"\d\s*(mm|cm)\b", text, re.I)
+    text = UNIT_WORDS.sub("", text)
     parts = re.split(r"\s*[xX×]\s*", text.strip())
     if len(parts) != 2 or sum(ch.isalpha() for ch in text if ch not in "xX") > 0:
         return None
     a, b = parse_length(parts[0]), parse_length(parts[1])
+    if unit and a and b and unit.group(1).lower() == "cm" and a > 40:
+        a, b = a / 100.0, b / 100.0
     if a and b and 0.6 <= a <= 40 and 0.6 <= b <= 40:
         return (a, b)
     return None

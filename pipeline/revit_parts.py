@@ -53,16 +53,7 @@ def build_plan(v, sol, toks, room):
     walls = []
     for sg in segs:
         t = _snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if WALL_THICKNESSES else _round(sg["t"] * s, 0.005)
-        if sg["o"] == "h":
-            y = MY(sg["c"])
-            x0 = MX(sg["j0"][0]) if "j0" in sg else MX(sg["a0"])
-            x1 = MX(sg["j1"][0]) if "j1" in sg else MX(sg["a1"])
-            a, b = [x0, y], [x1, y]
-        else:
-            x = MX(sg["c"])
-            y0 = MY(sg["j0"][0]) if "j0" in sg else MY(sg["a0"])
-            y1 = MY(sg["j1"][0]) if "j1" in sg else MY(sg["a1"])
-            a, b = [x, y0], [x, y1]
+        a, b = [MX(sg["p0"][0]), MY(sg["p0"][1])], [MX(sg["p1"][0]), MY(sg["p1"][1])]
         walls.append({"start": [round(c, 4) for c in a], "end": [round(c, 4) for c in b], "thickness": t,
                       "height": WALL_HEIGHT, "joined": ["j0" in sg, "j1" in sg]})
     # extensions so solids close the corner (half the joined wall's thickness)
@@ -104,14 +95,12 @@ def build_plan(v, sol, toks, room):
     openings = []
     for o in v["openings"]:
         sg, w = segs[o["wall"]], walls[o["wall"]]
-        if sg["o"] == "h":
-            u0, u1 = MX(o["u0"]), MX(o["u1"])
-            centre = [(u0 + u1) / 2, w["start"][1]]
-            along = centre[0] - w["start"][0]
-        else:
-            u0, u1 = MY(o["u0"]), MY(o["u1"])
-            centre = [w["start"][0], (u0 + u1) / 2]
-            along = centre[1] - w["start"][1]
+        q0 = np.array([MX(o["q0"][0]), MY(o["q0"][1])])
+        q1 = np.array([MX(o["q1"][0]), MY(o["q1"][1])])
+        a_, d_, _, _ = wall_frame(w)
+        along = float(((q0 + q1) / 2 - a_) @ d_)
+        centre = list(a_ + d_ * along)                     # exactly on the wall centre-line
+        u0, u1 = 0.0, float(np.linalg.norm(q1 - q0))
         width = abs(u1 - u0)
         if width < (0.5 if o["kind"] == "door" else 0.3):
             continue
@@ -149,9 +138,16 @@ def build_plan(v, sol, toks, room):
     labels = [t for t in toks if t["kind"] == "label"]
     room_labels = [t for t in labels if t["text"].strip().upper() not in NOT_ROOMS]
     rooms = []
-    for hole in main.interiors:
+    # close door-sized gaps so rooms are closed regions; sizes relative to the wall thickness, so a
+    # wrong first scale (fixed afterwards by the room-size check) does not drop every room
+    tm = v["T"] * s
+    gap = 2.2 * tm
+    shut = union.buffer(gap, join_style=2).buffer(-gap, join_style=2)
+    spolys = [shut] if shut.geom_type == "Polygon" else list(shut.geoms)
+    holes = [h for pg in spolys for h in pg.interiors]
+    for hole in holes:
         poly = Polygon(hole)
-        if poly.area < 1.0:
+        if poly.area < 40 * tm * tm:
             continue
         inside = [t for t in room_labels if poly.contains(Point(MX(t["x"]), MY(t["y"])))
                   and not _is_note(t["text"])]
@@ -558,9 +554,10 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
             else:
                 ax.axhline(px, color="m", lw=0.5, ls="--")
     for sg in v["walls"]:
-        x0, x1 = (sg["a0"], sg["a1"]) if sg["o"] == "h" else (sg["c"] - sg["t"] / 2, sg["c"] + sg["t"] / 2)
-        y0, y1 = (sg["c"] - sg["t"] / 2, sg["c"] + sg["t"] / 2) if sg["o"] == "h" else (sg["a0"], sg["a1"])
-        ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+        n = np.array([-d[1], d[0]]) * sg["t"] / 2
+        ax.add_patch(plt.Polygon([p0 - n, p1 - n, p1 + n, p0 + n], fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
     miss = np.zeros(v["missed"].shape + (4,))
     miss[v["missed"]] = (1.0, 0.85, 0.0, 1.0)
     ax.imshow(miss)
@@ -632,6 +629,78 @@ def ocr_full_res(img, original=None):
     return toks
 
 
+def uniform_sol(v, s, source, report=()):
+    """One scale for the whole sheet (no per-grid corrections)."""
+    gx = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "v"}) or [0.0, 1.0]
+    gy = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "h"}) or [0.0, 1.0]
+    rep = [dict(r, status="rejected: conflicts with room sizes") if r.get("status") == "ok" else r for r in report]
+    return {"scale_m_per_px": s, "source": source, "report": rep,
+            "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
+                     "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}}}
+
+
+def room_mask_scale(room, icon, toks, s):
+    """Written room sizes vs the floor-plan model's own room regions (clear area, any angle, no closed walls
+    needed). Returns (factor, rooms used) or (None, n)."""
+    block = np.isin(icon, (DOOR, WIN)) | np.isin(room, (0, 1, WALL))
+    labs = {}
+    for c in np.unique(room):
+        if c in (0, 1, WALL):
+            continue
+        n, lab = cv2.connectedComponents(((room == c) & ~block).astype(np.uint8), connectivity=4)
+        labs[c] = (lab, np.bincount(lab.ravel()))
+    H, W = room.shape
+    ks = []
+    for t in toks:
+        if t["kind"] != "size":
+            continue
+        x, y = int(np.clip(round(t["x"]), 0, W - 1)), int(np.clip(round(t["y"]), 0, H - 1))
+        win = room[max(0, y - 6):y + 7, max(0, x - 6):x + 7].ravel()
+        win = win[~np.isin(win, (0, 1, WALL))]
+        if not win.size:
+            continue
+        c = int(np.bincount(win).argmax())
+        lab, cnt = labs[c]
+        ys, xs = np.nonzero(lab[max(0, y - 6):y + 7, max(0, x - 6):x + 7])
+        if not len(ys):
+            continue
+        k_id = int(np.bincount(lab[max(0, y - 6):y + 7, max(0, x - 6):x + 7][ys, xs]).argmax())
+        area_m2 = cnt[k_id] * s * s
+        a, b = t["value"]
+        if area_m2 > 0:
+            ks.append(np.sqrt(a * b / area_m2))
+    if len(ks) < 2:
+        return None, len(ks)
+    k = float(np.median(ks))
+    agree = np.mean([abs(x_ / k - 1) < 0.12 for x_ in ks])
+    return (k, int(sum(abs(x_ / k - 1) < 0.12 for x_ in ks))) if agree >= 0.5 else (None, len(ks))
+
+
+def room_size_scale(plan, toks):
+    """Written room sizes ('3.66 m x 4.88 m') vs the drawn room areas -> scale correction factor.
+    Works for rooms at any angle. Returns (factor, rooms used) or (None, n) when they don't agree."""
+    from shapely.geometry import Point, Polygon
+    mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    th = float(np.median([w["thickness"] for w in plan["walls"]])) if plan["walls"] else 0.2
+    rooms = [(Polygon(r["polygon"]).buffer(0), r) for r in plan["rooms"]]
+    ks = []
+    for t in toks:
+        if t["kind"] != "size":
+            continue
+        pt = Point(float(mx(t["x"])), float(my(t["y"])))
+        inside = [(p.area, p) for p, r in rooms if p.area > 0 and p.contains(pt)]
+        if not inside:
+            continue
+        area = min(inside, key=lambda q: q[0])[0]
+        a, b = t["value"]
+        ks.append(np.sqrt((a + th) * (b + th) / area))      # room polygons follow wall centre-lines
+    if len(ks) < 2:
+        return None, len(ks)
+    k = float(np.median(ks))
+    agree = np.mean([abs(x / k - 1) < 0.1 for x in ks])
+    return (k, len(ks)) if agree >= 0.6 else (None, len(ks))
+
+
 def main(img=None, room=None, icon=None, original=None):
     os.makedirs(OUT_DIR, exist_ok=True)
     if room is None:
@@ -654,6 +723,21 @@ def main(img=None, room=None, icon=None, original=None):
                                              "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
                "report": [], "fallback": True}
     plan = build_plan(v, sol, toks, room)
+    # written room sizes vs drawn room areas: if they disagree with the scale the dimensions gave (e.g. only a
+    # couple of small dimensions were read and matched to the wrong walls), trust the rooms (two passes,
+    # because wall-thickness snapping depends on the scale)
+    for _ in range(2):
+        k, n_rooms = room_mask_scale(room, icon, toks, plan["mapping"]["scale_m_per_px"])
+        if k is None:
+            k, n_rooms = room_size_scale(plan, toks)
+        if k is None or abs(k - 1) <= 0.03 or METERS_PER_PIXEL or BUILDING_WIDTH_M:
+            break
+        s_new = plan["mapping"]["scale_m_per_px"] * k
+        print("  scale check: {} room-size labels say the scale is off by {:+.0f}% -> corrected".format(
+            n_rooms, 100 * (k - 1)))
+        sol = uniform_sol(v, s_new, "room sizes written on the plan ({} rooms)".format(n_rooms),
+                          (sol or {}).get("report", []))
+        plan = build_plan(v, sol, toks, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:

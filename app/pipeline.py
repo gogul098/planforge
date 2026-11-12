@@ -168,29 +168,9 @@ def _band_runs(c, b0, b1, L, G):
     return out
 
 
-def vectorise(room, icon):
-    wall = room == WALL
-    openings_any = np.isin(icon, [WIN, DOOR])
-    # typical wall thickness T (px) from the medial axis
-    dist = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
-    sk = skeletonize(wall)
-    T = float(np.clip(2 * np.median(dist[sk]) if sk.any() else 6, 3, 60))
-    model_wall = wall.copy()
-    # the model's wall mask is trusted: only 1-2 px specks are removed (no thickness filtering,
-    # so thin partitions and walls detached from the main structure are kept)
-    # (no morphological opening: it erases thin double-line window walls the model got right;
-    #  specks are removed by size below)
-    comps = _components(wall, max(10, int(1.5 * T * T)))
-    if not comps:
-        raise RuntimeError("No walls detected.")
-    wall = np.any([m for m, s in comps], axis=0)
-    # add whole door/window blobs that touch a wall (they fill the gaps in the wall lines)
-    near = cv2.dilate(wall.astype(np.uint8), np.ones((int(2 * T),) * 2)) > 0
-    lab, n = ndimage.label(openings_any)
-    keep = np.unique(lab[near & (lab > 0)])
-    full = wall | np.isin(lab, keep[keep > 0])
-    full = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
-
+def _frame_walls(full, openings_any, icon, T):
+    """Horizontal / vertical walls + their openings in one frame (the image, or the image rotated so a
+    family of angled walls runs horizontally)."""
     # straight segments: horizontal / vertical runs longer than ~2.5 T
     L = max(int(2.5 * T), 12)
     segs = []
@@ -255,8 +235,6 @@ def vectorise(room, icon):
                     sg["a1"] = p["c"] + p["t"] / 2
                     sg["j1"] = (p["c"], p["t"])
     segs = [sg for sg in segs if sg["a1"] - sg["a0"] >= 2 * T]
-    if not segs:
-        raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
 
     # openings -> intervals on their host wall
     openings = []
@@ -292,6 +270,168 @@ def vectorise(room, icon):
                 continue
         merged.append(dict(o))
 
+    return segs, merged
+
+
+def _wall_angles(full, T):
+    """Dominant wall directions (degrees, mod 90) other than the image axes, e.g. 30 / 60 for a hexagonal plan."""
+    edges = cv2.Canny(full.astype(np.uint8) * 255, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=max(20, int(3 * T)),
+                            minLineLength=max(int(4 * T), 20), maxLineGap=int(T))
+    if lines is None:
+        return []
+    hist = np.zeros(90)
+    for x0, y0, x1, y1 in lines.reshape(-1, 4):
+        ang = np.degrees(np.arctan2(y1 - y0, x1 - x0)) % 90
+        hist[int(round(ang)) % 90] += np.hypot(x1 - x0, y1 - y0)
+    sm = np.array([hist[[(i + k) % 90 for k in (-2, -1, 0, 1, 2)]].sum() for i in range(90)])
+    out = []
+    total = sm.sum()
+    for i in np.argsort(-sm):
+        if sm[i] < 0.06 * total:
+            break
+        if min(i, 90 - i) <= 6 or any(min(abs(i - j), 90 - abs(i - j)) <= 8 for j in out):
+            continue                        # the image axes, or next to an angle already taken
+        # refine to a weighted mean inside the peak
+        ks = [(i + k) % 90 for k in range(-3, 4)]
+        w = hist[ks]
+        ang = (i + np.dot(w, np.arange(-3, 4)) / max(w.sum(), 1e-9)) % 90
+        out.append(float(ang))
+    return out
+
+
+def _rot_frame(shape, ang):
+    """Affine that rotates the image by -ang (degrees) into an enlarged canvas, and its inverse."""
+    H, W = shape
+    M = cv2.getRotationMatrix2D((W / 2, H / 2), ang, 1.0)       # positive ang = counter-clockwise on screen
+    c, s_ = abs(M[0, 0]), abs(M[0, 1])
+    nW, nH = int(H * s_ + W * c) + 2, int(H * c + W * s_) + 2
+    M[0, 2] += nW / 2 - W / 2
+    M[1, 2] += nH / 2 - H / 2
+    Mi = cv2.invertAffineTransform(M)
+    return M, Mi, (nW, nH)
+
+
+def _hv_point(o, c, u):
+    return (u, c) if o == "h" else (c, u)
+
+
+def _join_across(segs, T):
+    """Ends of walls that meet at an angle (not both h / v in the same frame): extend / trim each end to the
+    intersection of the two centre-lines and remember the other wall's thickness (corner solids close)."""
+    def line(sg):
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        L = max(np.linalg.norm(p1 - p0), 1e-9)
+        return p0, (p1 - p0) / L, L
+    for _ in range(2):
+        for sg in segs:
+            p0, d, L = line(sg)
+            for end, key in ((0, "j0"), (1, "j1")):
+                if sg.get(key + "_hv"):
+                    continue                                   # already joined to a perpendicular wall in its frame
+                pe = np.array(sg["p0"] if end == 0 else sg["p1"])
+                best = None
+                for q in segs:
+                    if q is sg:
+                        continue
+                    q0, e, M = line(q)
+                    cr = d[0] * e[1] - d[1] * e[0]
+                    if abs(cr) < np.sin(np.radians(12)):      # parallel-ish: not a corner
+                        continue
+                    # intersection of the two centre-lines
+                    tq = ((pe[0] - q0[0]) * d[1] - (pe[1] - q0[1]) * d[0]) / (e[0] * d[1] - e[1] * d[0])
+                    X = q0 + e * tq
+                    reach_q = q["t"] / 2 + 2 * T
+                    if not (-reach_q <= tq <= M + reach_q):
+                        continue
+                    dist = np.linalg.norm(X - pe)
+                    if dist > q["t"] / (2 * abs(cr)) + 2 * T:
+                        continue
+                    # do not cut a wall in half: the new end must stay on the same side of the old one
+                    u = (X - p0) @ d
+                    if (end == 0 and u > 0.6 * L) or (end == 1 and u < 0.4 * L):
+                        continue
+                    if best is None or dist < best[0]:
+                        best = (dist, X, q["t"])
+                if best is not None:
+                    if end == 0:
+                        sg["p0"] = [float(best[1][0]), float(best[1][1])]
+                    else:
+                        sg["p1"] = [float(best[1][0]), float(best[1][1])]
+                    sg[key] = (None, best[2])
+    return segs
+
+
+def vectorise(room, icon):
+    wall = room == WALL
+    openings_any = np.isin(icon, [WIN, DOOR])
+    # typical wall thickness T (px) from the medial axis
+    dist = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
+    sk = skeletonize(wall)
+    T = float(np.clip(2 * np.median(dist[sk]) if sk.any() else 6, 3, 60))
+    model_wall = wall.copy()
+    # the model's wall mask is trusted: only 1-2 px specks are removed (no thickness filtering,
+    # so thin partitions and walls detached from the main structure are kept)
+    # (no morphological opening: it erases thin double-line window walls the model got right;
+    #  specks are removed by size below)
+    comps = _components(wall, max(10, int(1.5 * T * T)))
+    if not comps:
+        raise RuntimeError("No walls detected.")
+    wall = np.any([m for m, s in comps], axis=0)
+    # add whole door/window blobs that touch a wall (they fill the gaps in the wall lines)
+    near = cv2.dilate(wall.astype(np.uint8), np.ones((int(2 * T),) * 2)) > 0
+    lab, n = ndimage.label(openings_any)
+    keep = np.unique(lab[near & (lab > 0)])
+    full = wall | np.isin(lab, keep[keep > 0])
+    full = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+
+    segs, merged = _frame_walls(full, openings_any, icon, T)
+    for sg in segs:                                            # every wall also as two end points (image px)
+        sg["frame"] = 0
+        e0 = sg["j0"][0] if "j0" in sg else sg["a0"]
+        e1 = sg["j1"][0] if "j1" in sg else sg["a1"]
+        sg["p0"], sg["p1"] = list(_hv_point(sg["o"], sg["c"], e0)), list(_hv_point(sg["o"], sg["c"], e1))
+        sg["j0_hv"], sg["j1_hv"] = "j0" in sg, "j1" in sg
+    for o in merged:
+        sg = segs[o["wall"]]
+        o["q0"], o["q1"] = list(_hv_point(sg["o"], sg["c"], o["u0"])), list(_hv_point(sg["o"], sg["c"], o["u1"]))
+    # angled walls (30 / 45 / 60 degree wings ...): rotate the image so they run straight, extract, rotate back
+    claimed = np.zeros(full.shape, np.uint8)
+    for sg in segs:
+        cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                 1, max(1, int(round(sg["t"] + T))))
+    angles = _wall_angles(full & ~(claimed > 0), T)
+    for ang in angles:
+        M, Mi, size = _rot_frame(full.shape, ang)
+        rest = (full & ~(claimed > 0)).astype(np.uint8)
+        rf = cv2.warpAffine(rest, M, size, flags=cv2.INTER_NEAREST) > 0
+        ro = cv2.warpAffine(openings_any.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST) > 0
+        ri = cv2.warpAffine(icon.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST)
+        fsegs, fops = _frame_walls(rf, ro, ri, T)
+        back = lambda pt: [float(Mi[0, 0] * pt[0] + Mi[0, 1] * pt[1] + Mi[0, 2]),
+                           float(Mi[1, 0] * pt[0] + Mi[1, 1] * pt[1] + Mi[1, 2])]
+        base = len(segs)
+        for o in fops:                                         # openings: frame coordinates -> image px
+            fs = fsegs[o["wall"]]
+            merged.append(dict(o, wall=base + o["wall"], q0=back(_hv_point(fs["o"], fs["c"], o["u0"])),
+                               q1=back(_hv_point(fs["o"], fs["c"], o["u1"]))))
+        for sg in fsegs:
+            e0 = sg["j0"][0] if "j0" in sg else sg["a0"]
+            e1 = sg["j1"][0] if "j1" in sg else sg["a1"]
+            sg.update({"frame": ang, "p0": back(_hv_point(sg["o"], sg["c"], e0)),
+                       "p1": back(_hv_point(sg["o"], sg["c"], e1)), "o": "a",
+                       "j0_hv": "j0" in sg, "j1_hv": "j1" in sg})
+            segs.append(sg)
+            cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                     1, max(1, int(round(sg["t"] + T))))
+    segs = _join_across(segs, T)
+    segs_ok = [i for i, sg in enumerate(segs) if np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1]) >= 2 * T]
+    if not segs_ok:
+        raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
+    remap = {i: k for k, i in enumerate(segs_ok)}
+    segs = [segs[i] for i in segs_ok]
+    merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
+
     stairs = []
     for comp, st in _components(icon == STAIRS, 4 * T * T):
         x, y, w, h = [int(v) for v in st[:4]]
@@ -299,12 +439,10 @@ def vectorise(room, icon):
                        "ox": x, "oy": y, "mask": comp[y:y + h, x:x + w].copy()})
     struct = np.zeros(full.shape, np.uint8)
     for sg in segs:
-        h0, h1 = int(round(sg["c"] - sg["t"] / 2)), int(round(sg["c"] + sg["t"] / 2))
-        a0, a1 = int(round(sg["a0"])), int(round(sg["a1"]))
-        if sg["o"] == "h":
-            cv2.rectangle(struct, (a0, h0), (a1, h1), 1, -1)
-        else:
-            cv2.rectangle(struct, (h0, a0), (h1, a1), 1, -1)
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+        n = np.array([-d[1], d[0]]) * sg["t"] / 2
+        cv2.fillPoly(struct, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n])).astype(np.int32)], 1)
     # how much of the model's wall prediction made it into the vector walls
     covered = cv2.dilate(struct, np.ones((max(3, int(T)),) * 2, np.uint8)) > 0
     missed = model_wall & ~covered
@@ -325,7 +463,32 @@ def ocr_tokens(img_rgb, ocr=None):
         ocr = RapidOCR()
     res, _ = ocr(img_rgb[:, :, ::-1].copy())
     toks = []
-    for box, txt, conf in res or []:
+    res = list(res or [])
+    used = set()
+    joined = []
+    for i, (box, txt, conf) in enumerate(res):                  # 'W x' on one line, 'D' on the next
+        if i in used:
+            continue
+        if re.search(r"\d\s*(?:m|mm|cm)?\s*[xX×]\s*$", txt.strip()):
+            b = np.array(box, float)
+            h = b[:, 1].max() - b[:, 1].min()
+            cx = b[:, 0].mean()
+            best = None
+            for j, (box2, txt2, conf2) in enumerate(res):
+                if j == i or j in used or not re.match(r"^\s*\d", txt2):
+                    continue
+                b2 = np.array(box2, float)
+                dy = b2[:, 1].min() - b[:, 1].max()
+                if -0.3 * h <= dy <= 1.5 * h and abs(b2[:, 0].mean() - cx) <= 2.5 * h:
+                    if best is None or dy < best[0]:
+                        best = (dy, j, b2, txt2, conf2)
+            if best:
+                _, j, b2, txt2, conf2 = best
+                used.add(j)
+                joined.append((np.vstack([b, b2]).tolist(), txt.strip() + " " + txt2.strip(), min(conf, conf2)))
+                continue
+        joined.append((box, txt, conf))
+    for box, txt, conf in joined:
         b = np.array(box, float)
         x0, x1, y0, y1 = b[:, 0].min(), b[:, 0].max(), b[:, 1].min(), b[:, 1].max()
         vertical_text = (y1 - y0) > 1.6 * (x1 - x0) and len(txt) > 2
@@ -368,12 +531,19 @@ def parse_length(side):
     return v if v < 40 else (v / 100 if v < 1000 else v / 1000)
 
 
+UNIT_WORDS = re.compile(r"(?<=\d)\s*(?:mm|cm|mtrs?|m)(?=\s*[xX×]|\b)\.?", re.I)
+
+
 def parse_size(text):
-    """'W x D' room-size label -> (a_m, b_m) or None."""
+    """'W x D' room-size label -> (a_m, b_m) or None.  '3.66 m x 4.88 m', '12'0\" x 10'6\"', '3600 X 4200'."""
+    unit = re.search(r"\d\s*(mm|cm)\b", text, re.I)
+    text = UNIT_WORDS.sub("", text)
     parts = re.split(r"\s*[xX×]\s*", text.strip())
     if len(parts) != 2 or sum(ch.isalpha() for ch in text if ch not in "xX") > 0:
         return None
     a, b = parse_length(parts[0]), parse_length(parts[1])
+    if unit and a and b and unit.group(1).lower() == "cm" and a > 40:
+        a, b = a / 100.0, b / 100.0
     if a and b and 0.6 <= a <= 40 and 0.6 <= b <= 40:
         return (a, b)
     return None
@@ -1432,16 +1602,7 @@ def build_plan(v, sol, toks, room):
     walls = []
     for sg in segs:
         t = _snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if WALL_THICKNESSES else _round(sg["t"] * s, 0.005)
-        if sg["o"] == "h":
-            y = MY(sg["c"])
-            x0 = MX(sg["j0"][0]) if "j0" in sg else MX(sg["a0"])
-            x1 = MX(sg["j1"][0]) if "j1" in sg else MX(sg["a1"])
-            a, b = [x0, y], [x1, y]
-        else:
-            x = MX(sg["c"])
-            y0 = MY(sg["j0"][0]) if "j0" in sg else MY(sg["a0"])
-            y1 = MY(sg["j1"][0]) if "j1" in sg else MY(sg["a1"])
-            a, b = [x, y0], [x, y1]
+        a, b = [MX(sg["p0"][0]), MY(sg["p0"][1])], [MX(sg["p1"][0]), MY(sg["p1"][1])]
         walls.append({"start": [round(c, 4) for c in a], "end": [round(c, 4) for c in b], "thickness": t,
                       "height": WALL_HEIGHT, "joined": ["j0" in sg, "j1" in sg]})
     # extensions so solids close the corner (half the joined wall's thickness)
@@ -1483,14 +1644,12 @@ def build_plan(v, sol, toks, room):
     openings = []
     for o in v["openings"]:
         sg, w = segs[o["wall"]], walls[o["wall"]]
-        if sg["o"] == "h":
-            u0, u1 = MX(o["u0"]), MX(o["u1"])
-            centre = [(u0 + u1) / 2, w["start"][1]]
-            along = centre[0] - w["start"][0]
-        else:
-            u0, u1 = MY(o["u0"]), MY(o["u1"])
-            centre = [w["start"][0], (u0 + u1) / 2]
-            along = centre[1] - w["start"][1]
+        q0 = np.array([MX(o["q0"][0]), MY(o["q0"][1])])
+        q1 = np.array([MX(o["q1"][0]), MY(o["q1"][1])])
+        a_, d_, _, _ = wall_frame(w)
+        along = float(((q0 + q1) / 2 - a_) @ d_)
+        centre = list(a_ + d_ * along)                     # exactly on the wall centre-line
+        u0, u1 = 0.0, float(np.linalg.norm(q1 - q0))
         width = abs(u1 - u0)
         if width < (0.5 if o["kind"] == "door" else 0.3):
             continue
@@ -1528,9 +1687,16 @@ def build_plan(v, sol, toks, room):
     labels = [t for t in toks if t["kind"] == "label"]
     room_labels = [t for t in labels if t["text"].strip().upper() not in NOT_ROOMS]
     rooms = []
-    for hole in main.interiors:
+    # close door-sized gaps so rooms are closed regions; sizes relative to the wall thickness, so a
+    # wrong first scale (fixed afterwards by the room-size check) does not drop every room
+    tm = v["T"] * s
+    gap = 2.2 * tm
+    shut = union.buffer(gap, join_style=2).buffer(-gap, join_style=2)
+    spolys = [shut] if shut.geom_type == "Polygon" else list(shut.geoms)
+    holes = [h for pg in spolys for h in pg.interiors]
+    for hole in holes:
         poly = Polygon(hole)
-        if poly.area < 1.0:
+        if poly.area < 40 * tm * tm:
             continue
         inside = [t for t in room_labels if poly.contains(Point(MX(t["x"]), MY(t["y"])))
                   and not _is_note(t["text"])]
@@ -1937,9 +2103,10 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
             else:
                 ax.axhline(px, color="m", lw=0.5, ls="--")
     for sg in v["walls"]:
-        x0, x1 = (sg["a0"], sg["a1"]) if sg["o"] == "h" else (sg["c"] - sg["t"] / 2, sg["c"] + sg["t"] / 2)
-        y0, y1 = (sg["c"] - sg["t"] / 2, sg["c"] + sg["t"] / 2) if sg["o"] == "h" else (sg["a0"], sg["a1"])
-        ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+        n = np.array([-d[1], d[0]]) * sg["t"] / 2
+        ax.add_patch(plt.Polygon([p0 - n, p1 - n, p1 + n, p0 + n], fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
     miss = np.zeros(v["missed"].shape + (4,))
     miss[v["missed"]] = (1.0, 0.85, 0.0, 1.0)
     ax.imshow(miss)
@@ -2011,6 +2178,78 @@ def ocr_full_res(img, original=None):
     return toks
 
 
+def uniform_sol(v, s, source, report=()):
+    """One scale for the whole sheet (no per-grid corrections)."""
+    gx = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "v"}) or [0.0, 1.0]
+    gy = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "h"}) or [0.0, 1.0]
+    rep = [dict(r, status="rejected: conflicts with room sizes") if r.get("status") == "ok" else r for r in report]
+    return {"scale_m_per_px": s, "source": source, "report": rep,
+            "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
+                     "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}}}
+
+
+def room_mask_scale(room, icon, toks, s):
+    """Written room sizes vs the floor-plan model's own room regions (clear area, any angle, no closed walls
+    needed). Returns (factor, rooms used) or (None, n)."""
+    block = np.isin(icon, (DOOR, WIN)) | np.isin(room, (0, 1, WALL))
+    labs = {}
+    for c in np.unique(room):
+        if c in (0, 1, WALL):
+            continue
+        n, lab = cv2.connectedComponents(((room == c) & ~block).astype(np.uint8), connectivity=4)
+        labs[c] = (lab, np.bincount(lab.ravel()))
+    H, W = room.shape
+    ks = []
+    for t in toks:
+        if t["kind"] != "size":
+            continue
+        x, y = int(np.clip(round(t["x"]), 0, W - 1)), int(np.clip(round(t["y"]), 0, H - 1))
+        win = room[max(0, y - 6):y + 7, max(0, x - 6):x + 7].ravel()
+        win = win[~np.isin(win, (0, 1, WALL))]
+        if not win.size:
+            continue
+        c = int(np.bincount(win).argmax())
+        lab, cnt = labs[c]
+        ys, xs = np.nonzero(lab[max(0, y - 6):y + 7, max(0, x - 6):x + 7])
+        if not len(ys):
+            continue
+        k_id = int(np.bincount(lab[max(0, y - 6):y + 7, max(0, x - 6):x + 7][ys, xs]).argmax())
+        area_m2 = cnt[k_id] * s * s
+        a, b = t["value"]
+        if area_m2 > 0:
+            ks.append(np.sqrt(a * b / area_m2))
+    if len(ks) < 2:
+        return None, len(ks)
+    k = float(np.median(ks))
+    agree = np.mean([abs(x_ / k - 1) < 0.12 for x_ in ks])
+    return (k, int(sum(abs(x_ / k - 1) < 0.12 for x_ in ks))) if agree >= 0.5 else (None, len(ks))
+
+
+def room_size_scale(plan, toks):
+    """Written room sizes ('3.66 m x 4.88 m') vs the drawn room areas -> scale correction factor.
+    Works for rooms at any angle. Returns (factor, rooms used) or (None, n) when they don't agree."""
+    from shapely.geometry import Point, Polygon
+    mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    th = float(np.median([w["thickness"] for w in plan["walls"]])) if plan["walls"] else 0.2
+    rooms = [(Polygon(r["polygon"]).buffer(0), r) for r in plan["rooms"]]
+    ks = []
+    for t in toks:
+        if t["kind"] != "size":
+            continue
+        pt = Point(float(mx(t["x"])), float(my(t["y"])))
+        inside = [(p.area, p) for p, r in rooms if p.area > 0 and p.contains(pt)]
+        if not inside:
+            continue
+        area = min(inside, key=lambda q: q[0])[0]
+        a, b = t["value"]
+        ks.append(np.sqrt((a + th) * (b + th) / area))      # room polygons follow wall centre-lines
+    if len(ks) < 2:
+        return None, len(ks)
+    k = float(np.median(ks))
+    agree = np.mean([abs(x / k - 1) < 0.1 for x in ks])
+    return (k, len(ks)) if agree >= 0.6 else (None, len(ks))
+
+
 def main(img=None, room=None, icon=None, original=None):
     os.makedirs(OUT_DIR, exist_ok=True)
     if room is None:
@@ -2033,6 +2272,21 @@ def main(img=None, room=None, icon=None, original=None):
                                              "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
                "report": [], "fallback": True}
     plan = build_plan(v, sol, toks, room)
+    # written room sizes vs drawn room areas: if they disagree with the scale the dimensions gave (e.g. only a
+    # couple of small dimensions were read and matched to the wrong walls), trust the rooms (two passes,
+    # because wall-thickness snapping depends on the scale)
+    for _ in range(2):
+        k, n_rooms = room_mask_scale(room, icon, toks, plan["mapping"]["scale_m_per_px"])
+        if k is None:
+            k, n_rooms = room_size_scale(plan, toks)
+        if k is None or abs(k - 1) <= 0.03 or METERS_PER_PIXEL or BUILDING_WIDTH_M:
+            break
+        s_new = plan["mapping"]["scale_m_per_px"] * k
+        print("  scale check: {} room-size labels say the scale is off by {:+.0f}% -> corrected".format(
+            n_rooms, 100 * (k - 1)))
+        sol = uniform_sol(v, s_new, "room sizes written on the plan ({} rooms)".format(n_rooms),
+                          (sol or {}).get("report", []))
+        plan = build_plan(v, sol, toks, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
