@@ -472,6 +472,20 @@ def vectorise(room, icon):
             bm = bands.setdefault(sg["frame"], np.zeros(full.shape, np.uint8))
             cv2.line(bm, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"] + T))))
+    # every wall must run ON wall pixels for most of its length: a thick wall seen from a slightly different
+    # angle leaves a short diagonal "wall" that only crosses the real band (and sticks out of it)
+    Hh, Ww = full.shape
+    for sg in segs:
+        if sg.get("drop"):
+            continue
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        n_ = max(2, int(np.hypot(*(p1 - p0))))
+        ts = np.linspace(0, 1, n_)
+        xs = np.clip(np.round(p0[0] + (p1[0] - p0[0]) * ts).astype(int), 0, Ww - 1)
+        ys = np.clip(np.round(p0[1] + (p1[1] - p0[1]) * ts).astype(int), 0, Hh - 1)
+        on = cv2.dilate(full.astype(np.uint8), np.ones((3, 3), np.uint8))[ys, xs].mean()
+        if on < 0.6:
+            sg["drop"] = True
     keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
     kmap = {i: k for k, i in enumerate(keep_idx)}
     merged = [dict(o, wall=kmap[o["wall"]]) for o in merged if o["wall"] in kmap]
