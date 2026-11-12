@@ -1290,7 +1290,12 @@ def detector_furniture(img, mpp):
         return []
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
-    from ultralytics import YOLO
+    os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/yolo")
+    from ultralytics import YOLO, settings as _ysettings
+    try:                                           # never write into the app folder (read-only for the app user)
+        _ysettings.update({"runs_dir": os.path.join(os.environ.get("YOLO_CONFIG_DIR", "/tmp/yolo"), "runs")})
+    except Exception:
+        pass
     if _YOLO.get("w") != w:                       # load once, reload only when a new release arrives
         _YOLO.update(w=w, net=YOLO(w))
     dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
