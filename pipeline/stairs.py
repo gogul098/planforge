@@ -116,6 +116,13 @@ def _count_treads(comp, box, D_model, original, s, m_per_opx):
         comps.append((float(np.median(d)), float(np.percentile(d, 20)), float(np.percentile(d, 80)), i))
     if len(comps) < 2:
         return None
+    # a strip along the side (inside the model's stair area, outside the drawn stair) joins many treads:
+    # far too long in the climbing direction to be one tread -> not a tread
+    spans = np.array([c[2] - c[1] for c in comps])
+    typical = float(np.median(spans))
+    comps = [c for c, sp in zip(comps, spans) if sp <= 2.5 * max(typical, 1.0)]
+    if len(comps) < 2:
+        return None
     comps.sort()
     # pieces of one tread split by the walking line / arrow sit at the same distance from the top -> one tread
     groups = [[comps[0]]]
@@ -128,8 +135,24 @@ def _count_treads(comp, box, D_model, original, s, m_per_opx):
         else:
             groups.append([c])
     k = len(groups)
+    # count by pitch over the whole run, so treads merged or lost in the middle do not shrink the count
+    if k >= 3:
+        cen = np.array([np.median([c[0] for c in g]) for g in groups])
+        pitch = float(np.median(np.diff(cen)))
+        dr = D[region]
+        span = float(np.percentile(dr, 99) - np.percentile(dr, 1)) if dr.size else 0.0
+        if pitch > 0:
+            k_pitch = int(round(span / pitch))
+            if k_pitch > k:
+                k_full = k_pitch
+            else:
+                k_full = k
+        else:
+            k_full = k
+    else:
+        k_full = k
     covered = sum(st[c[3], cv2.CC_STAT_AREA] for g in groups for c in g)
-    if not (2 <= k <= 40) or covered < 0.35 * region.sum():
+    if not (2 <= k_full <= 40) or covered < 0.25 * region.sum():
         return None
     out = np.zeros(lab.shape, np.int32)
     for j, g in enumerate(groups):                                   # groups: high (near anchor) -> low
@@ -139,7 +162,7 @@ def _count_treads(comp, box, D_model, original, s, m_per_opx):
     _, idx = ndimage.distance_transform_edt(out == 0, return_indices=True)
     filled = out[idx[0], idx[1]]
     filled[~(region | (out > 0))] = 0
-    return k, filled, (X0, Y0)
+    return k_full, filled, (X0, Y0)
 
 
 def _label_polys(labels, X0, Y0, s, mx, my, m_per_opx):
@@ -183,6 +206,55 @@ def _slice(poly, centre, d, L, k):
 
 def _poly_list(p):
     return [[round(float(x), 4), round(float(y), 4)] for x, y in list(p.exterior.coords)[:-1]]
+
+
+def _chain_flights(infos):
+    """Interior flights that touch each other (a split / dog-leg stair: main flight -> landing -> flights)
+    share one storey height: the longest flight goes from the floor to the landing, the others from the
+    landing up. Each flight is turned so it climbs away from the one below."""
+    inter = [i for i in infos if i["kind"] == "interior"]
+    seen = set()
+    for a in range(len(inter)):
+        if a in seen:
+            continue
+        group, todo = [], [a]
+        while todo:
+            k = todo.pop()
+            if k in seen:
+                continue
+            seen.add(k)
+            group.append(k)
+            todo += [j for j in range(len(inter)) if j not in seen and inter[k]["hull"].distance(inter[j]["hull"]) < 0.4]
+        if len(group) < 2:
+            continue
+        fl = [inter[k] for k in group]
+        for f_ in fl:                                     # unknown counts: from the run (about 280 mm treads)
+            if not f_["n"]:
+                f_["n"] = max(2, int(round(f_["run"] / 0.28)) + 1)
+                f_["sources"]["risers"] = "estimated from the run length"
+                f_["warnings"].append("risers not written or readable: estimated from the run")
+        main = max(fl, key=lambda f_: f_["run"])
+        uppers = [f_ for f_ in fl if f_ is not main]
+        ucentre = np.mean([u["centre"] for u in uppers], 0)
+        ends = lambda f_: (f_["centre"] - f_["d"] * f_["run"] / 2, f_["centre"] + f_["d"] * f_["run"] / 2)
+        lo, hi = ends(main)
+        if np.linalg.norm(lo - ucentre) < np.linalg.norm(hi - ucentre):  # main climbs towards the landing
+            main["d"] = -main["d"]
+        main["direction"] = "towards the landing and the upper flights"
+        top_main = main["centre"] + main["d"] * main["run"] / 2
+        for u in uppers:
+            lo, hi = ends(u)
+            if np.linalg.norm(hi - top_main) < np.linalg.norm(lo - top_main):
+                u["d"] = -u["d"]                          # upper flights start at the landing
+            u["direction"] = "from the landing up"
+        n_up = max(u["n"] for u in uppers)                # parallel flights (split stair) climb together
+        r = WALL_HEIGHT / (main["n"] + n_up)
+        main.update(chain_base=0.0, chain_total=r * main["n"], chain_size=len(fl))
+        for u in uppers:
+            u.update(chain_base=r * main["n"], chain_total=WALL_HEIGHT - r * main["n"], chain_size=len(fl))
+            u["n"] = n_up
+        for f_ in fl:
+            f_["warnings"] = [w_ for w_ in f_["warnings"] if not w_.startswith("direction not marked")]
 
 
 def build_stairs(v, toks, room, plan, original=None):
@@ -347,6 +419,7 @@ def build_stairs(v, toks, room, plan, original=None):
             n_cnt += 1                                              # drawn treads + the riser onto the upper floor
         i["n"], i["sources"]["risers"] = ((n_note, "written on the plan") if n_note else
                                           (n_cnt, "counted from the drawn treads") if n_cnt else (None, None))
+    _chain_flights(infos)
     if PLINTH_HEIGHT:
         plinth, psrc = float(PLINTH_HEIGHT), "your setting"
     elif lvl:
@@ -370,6 +443,9 @@ def build_stairs(v, toks, room, plan, original=None):
                 w.append("number of steps not written or readable: estimated")
             if psrc.startswith("assumed"):
                 w.append("plinth height not written: set 'Plinth height' to make the steps exact")
+        elif kind == "interior" and "chain_base" in i:
+            base, total = i["chain_base"], i["chain_total"]
+            rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
             if not i["n"]:

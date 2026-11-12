@@ -108,7 +108,16 @@ def build_plan(v, sol, toks, room):
         centre = list(a_ + d_ * along)                     # exactly on the wall centre-line
         u0, u1 = 0.0, float(np.linalg.norm(q1 - q0))
         width = abs(u1 - u0)
-        if width < (0.5 if o["kind"] == "door" else 0.3):
+        if o["kind"] == "door" and width < 0.5:
+            # the model found a door but marked only part of it (e.g. the hinge / arc): use a standard width
+            # centred on the mark, as long as it fits on the wall
+            L_w = float(np.linalg.norm(np.array(w["end"]) - np.array(w["start"])))
+            std = DOOR_WIDTHS[len(DOOR_WIDTHS) // 2] if DOOR_WIDTHS else 0.9
+            room_ = min(along, L_w - along) * 2 - 0.1
+            if room_ < 0.6:
+                continue
+            width = min(std, room_)
+        elif width < (0.5 if o["kind"] == "door" else 0.3):
             continue
         if o["kind"] == "door":
             width = _snap(width, DOOR_WIDTHS, 0.09)
@@ -866,6 +875,15 @@ def main(img=None, room=None, icon=None, original=None):
         if dropped:
             print("  furniture: {} detections rejected by room check (wrong room for the object)".format(dropped))
         plan["furniture"] = build_furniture(items, plan)
+        from shapely.geometry import Point as _Pt, Polygon as _Pg
+        fp_ = _Pg(plan["floor"]["polygon"]).buffer(0.3)
+        inside_ = [fu for fu in plan["furniture"] if fp_.contains(_Pt(*fu["center"]))]
+        if len(inside_) < len(plan["furniture"]):
+            print("  furniture: {} items outside the building dropped (title block / legend / notes)".format(
+                len(plan["furniture"]) - len(inside_)))
+        plan["furniture"] = inside_
+        for k_, fu in enumerate(plan["furniture"]):
+            fu["id"] = k_
     else:
         plan["furniture"] = []
     jp = os.path.join(OUT_DIR, "plan.json")

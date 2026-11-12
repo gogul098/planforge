@@ -395,7 +395,7 @@ def vectorise(room, icon):
         ang = angles[0]
         done_angles.append(ang)
         M, Mi, size = _rot_frame(full.shape, ang)
-        rest = (full & ~(claimed > 0)).astype(np.uint8)
+        rest = full.astype(np.uint8)          # whole mask: frame 0 may have chopped this wall into stubs
         rf = cv2.warpAffine(rest, M, size, flags=cv2.INTER_NEAREST) > 0
         ro = cv2.warpAffine(openings_any.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST) > 0
         ri = cv2.warpAffine(icon.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST)
@@ -416,24 +416,27 @@ def vectorise(room, icon):
             segs.append(sg)
             cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"] + T))))
-    # short h / v pieces that lie inside an angled wall are its staircase fragments, not walls of their own
+    # the same wall found in two frames (a straight angled wall + staircase stubs of it, or two close angles):
+    # longest first; a piece mostly inside an already accepted wall of another frame is a duplicate
     if done_angles:
-        band = np.zeros(full.shape, np.uint8)
-        for sg in segs:
-            if sg["frame"] != 0:
-                cv2.line(band, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
-                         1, max(1, int(round(sg["t"] + T))))
-        for sg in segs:
-            if sg["frame"] != 0:
-                continue
-            L = np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
-            if L >= 8 * T:
-                continue
+        seg_len = lambda sg: np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
+        bands = {}
+        for sg in sorted(segs, key=lambda sg: -seg_len(sg)):
             m = np.zeros(full.shape, np.uint8)
             cv2.line(m, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"]))))
-            if m.sum() and (m & band).sum() / m.sum() > 0.5:
+            area = m.sum()
+            other = np.zeros(full.shape, np.uint8)
+            for fr, bm in bands.items():
+                if fr != sg["frame"]:
+                    other |= bm
+            ov = (m & other).sum() / area if area else 1.0
+            if ov > 0.8 or (ov > 0.5 and seg_len(sg) < 8 * T):
                 sg["drop"] = True
+                continue
+            bm = bands.setdefault(sg["frame"], np.zeros(full.shape, np.uint8))
+            cv2.line(bm, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                     1, max(1, int(round(sg["t"] + T))))
     keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
     kmap = {i: k for k, i in enumerate(keep_idx)}
     merged = [dict(o, wall=kmap[o["wall"]]) for o in merged if o["wall"] in kmap]

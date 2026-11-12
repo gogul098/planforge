@@ -409,7 +409,7 @@ def vectorise(room, icon):
         ang = angles[0]
         done_angles.append(ang)
         M, Mi, size = _rot_frame(full.shape, ang)
-        rest = (full & ~(claimed > 0)).astype(np.uint8)
+        rest = full.astype(np.uint8)          # whole mask: frame 0 may have chopped this wall into stubs
         rf = cv2.warpAffine(rest, M, size, flags=cv2.INTER_NEAREST) > 0
         ro = cv2.warpAffine(openings_any.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST) > 0
         ri = cv2.warpAffine(icon.astype(np.uint8), M, size, flags=cv2.INTER_NEAREST)
@@ -430,24 +430,27 @@ def vectorise(room, icon):
             segs.append(sg)
             cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"] + T))))
-    # short h / v pieces that lie inside an angled wall are its staircase fragments, not walls of their own
+    # the same wall found in two frames (a straight angled wall + staircase stubs of it, or two close angles):
+    # longest first; a piece mostly inside an already accepted wall of another frame is a duplicate
     if done_angles:
-        band = np.zeros(full.shape, np.uint8)
-        for sg in segs:
-            if sg["frame"] != 0:
-                cv2.line(band, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
-                         1, max(1, int(round(sg["t"] + T))))
-        for sg in segs:
-            if sg["frame"] != 0:
-                continue
-            L = np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
-            if L >= 8 * T:
-                continue
+        seg_len = lambda sg: np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
+        bands = {}
+        for sg in sorted(segs, key=lambda sg: -seg_len(sg)):
             m = np.zeros(full.shape, np.uint8)
             cv2.line(m, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"]))))
-            if m.sum() and (m & band).sum() / m.sum() > 0.5:
+            area = m.sum()
+            other = np.zeros(full.shape, np.uint8)
+            for fr, bm in bands.items():
+                if fr != sg["frame"]:
+                    other |= bm
+            ov = (m & other).sum() / area if area else 1.0
+            if ov > 0.8 or (ov > 0.5 and seg_len(sg) < 8 * T):
                 sg["drop"] = True
+                continue
+            bm = bands.setdefault(sg["frame"], np.zeros(full.shape, np.uint8))
+            cv2.line(bm, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                     1, max(1, int(round(sg["t"] + T))))
     keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
     kmap = {i: k for k, i in enumerate(keep_idx)}
     merged = [dict(o, wall=kmap[o["wall"]]) for o in merged if o["wall"] in kmap]
@@ -1252,6 +1255,13 @@ def _count_treads(comp, box, D_model, original, s, m_per_opx):
         comps.append((float(np.median(d)), float(np.percentile(d, 20)), float(np.percentile(d, 80)), i))
     if len(comps) < 2:
         return None
+    # a strip along the side (inside the model's stair area, outside the drawn stair) joins many treads:
+    # far too long in the climbing direction to be one tread -> not a tread
+    spans = np.array([c[2] - c[1] for c in comps])
+    typical = float(np.median(spans))
+    comps = [c for c, sp in zip(comps, spans) if sp <= 2.5 * max(typical, 1.0)]
+    if len(comps) < 2:
+        return None
     comps.sort()
     # pieces of one tread split by the walking line / arrow sit at the same distance from the top -> one tread
     groups = [[comps[0]]]
@@ -1264,8 +1274,24 @@ def _count_treads(comp, box, D_model, original, s, m_per_opx):
         else:
             groups.append([c])
     k = len(groups)
+    # count by pitch over the whole run, so treads merged or lost in the middle do not shrink the count
+    if k >= 3:
+        cen = np.array([np.median([c[0] for c in g]) for g in groups])
+        pitch = float(np.median(np.diff(cen)))
+        dr = D[region]
+        span = float(np.percentile(dr, 99) - np.percentile(dr, 1)) if dr.size else 0.0
+        if pitch > 0:
+            k_pitch = int(round(span / pitch))
+            if k_pitch > k:
+                k_full = k_pitch
+            else:
+                k_full = k
+        else:
+            k_full = k
+    else:
+        k_full = k
     covered = sum(st[c[3], cv2.CC_STAT_AREA] for g in groups for c in g)
-    if not (2 <= k <= 40) or covered < 0.35 * region.sum():
+    if not (2 <= k_full <= 40) or covered < 0.25 * region.sum():
         return None
     out = np.zeros(lab.shape, np.int32)
     for j, g in enumerate(groups):                                   # groups: high (near anchor) -> low
@@ -1275,7 +1301,7 @@ def _count_treads(comp, box, D_model, original, s, m_per_opx):
     _, idx = ndimage.distance_transform_edt(out == 0, return_indices=True)
     filled = out[idx[0], idx[1]]
     filled[~(region | (out > 0))] = 0
-    return k, filled, (X0, Y0)
+    return k_full, filled, (X0, Y0)
 
 
 def _label_polys(labels, X0, Y0, s, mx, my, m_per_opx):
@@ -1319,6 +1345,55 @@ def _slice(poly, centre, d, L, k):
 
 def _poly_list(p):
     return [[round(float(x), 4), round(float(y), 4)] for x, y in list(p.exterior.coords)[:-1]]
+
+
+def _chain_flights(infos):
+    """Interior flights that touch each other (a split / dog-leg stair: main flight -> landing -> flights)
+    share one storey height: the longest flight goes from the floor to the landing, the others from the
+    landing up. Each flight is turned so it climbs away from the one below."""
+    inter = [i for i in infos if i["kind"] == "interior"]
+    seen = set()
+    for a in range(len(inter)):
+        if a in seen:
+            continue
+        group, todo = [], [a]
+        while todo:
+            k = todo.pop()
+            if k in seen:
+                continue
+            seen.add(k)
+            group.append(k)
+            todo += [j for j in range(len(inter)) if j not in seen and inter[k]["hull"].distance(inter[j]["hull"]) < 0.4]
+        if len(group) < 2:
+            continue
+        fl = [inter[k] for k in group]
+        for f_ in fl:                                     # unknown counts: from the run (about 280 mm treads)
+            if not f_["n"]:
+                f_["n"] = max(2, int(round(f_["run"] / 0.28)) + 1)
+                f_["sources"]["risers"] = "estimated from the run length"
+                f_["warnings"].append("risers not written or readable: estimated from the run")
+        main = max(fl, key=lambda f_: f_["run"])
+        uppers = [f_ for f_ in fl if f_ is not main]
+        ucentre = np.mean([u["centre"] for u in uppers], 0)
+        ends = lambda f_: (f_["centre"] - f_["d"] * f_["run"] / 2, f_["centre"] + f_["d"] * f_["run"] / 2)
+        lo, hi = ends(main)
+        if np.linalg.norm(lo - ucentre) < np.linalg.norm(hi - ucentre):  # main climbs towards the landing
+            main["d"] = -main["d"]
+        main["direction"] = "towards the landing and the upper flights"
+        top_main = main["centre"] + main["d"] * main["run"] / 2
+        for u in uppers:
+            lo, hi = ends(u)
+            if np.linalg.norm(hi - top_main) < np.linalg.norm(lo - top_main):
+                u["d"] = -u["d"]                          # upper flights start at the landing
+            u["direction"] = "from the landing up"
+        n_up = max(u["n"] for u in uppers)                # parallel flights (split stair) climb together
+        r = WALL_HEIGHT / (main["n"] + n_up)
+        main.update(chain_base=0.0, chain_total=r * main["n"], chain_size=len(fl))
+        for u in uppers:
+            u.update(chain_base=r * main["n"], chain_total=WALL_HEIGHT - r * main["n"], chain_size=len(fl))
+            u["n"] = n_up
+        for f_ in fl:
+            f_["warnings"] = [w_ for w_ in f_["warnings"] if not w_.startswith("direction not marked")]
 
 
 def build_stairs(v, toks, room, plan, original=None):
@@ -1483,6 +1558,7 @@ def build_stairs(v, toks, room, plan, original=None):
             n_cnt += 1                                              # drawn treads + the riser onto the upper floor
         i["n"], i["sources"]["risers"] = ((n_note, "written on the plan") if n_note else
                                           (n_cnt, "counted from the drawn treads") if n_cnt else (None, None))
+    _chain_flights(infos)
     if PLINTH_HEIGHT:
         plinth, psrc = float(PLINTH_HEIGHT), "your setting"
     elif lvl:
@@ -1506,6 +1582,9 @@ def build_stairs(v, toks, room, plan, original=None):
                 w.append("number of steps not written or readable: estimated")
             if psrc.startswith("assumed"):
                 w.append("plinth height not written: set 'Plinth height' to make the steps exact")
+        elif kind == "interior" and "chain_base" in i:
+            base, total = i["chain_base"], i["chain_total"]
+            rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
             if not i["n"]:
@@ -1695,7 +1774,16 @@ def build_plan(v, sol, toks, room):
         centre = list(a_ + d_ * along)                     # exactly on the wall centre-line
         u0, u1 = 0.0, float(np.linalg.norm(q1 - q0))
         width = abs(u1 - u0)
-        if width < (0.5 if o["kind"] == "door" else 0.3):
+        if o["kind"] == "door" and width < 0.5:
+            # the model found a door but marked only part of it (e.g. the hinge / arc): use a standard width
+            # centred on the mark, as long as it fits on the wall
+            L_w = float(np.linalg.norm(np.array(w["end"]) - np.array(w["start"])))
+            std = DOOR_WIDTHS[len(DOOR_WIDTHS) // 2] if DOOR_WIDTHS else 0.9
+            room_ = min(along, L_w - along) * 2 - 0.1
+            if room_ < 0.6:
+                continue
+            width = min(std, room_)
+        elif width < (0.5 if o["kind"] == "door" else 0.3):
             continue
         if o["kind"] == "door":
             width = _snap(width, DOOR_WIDTHS, 0.09)
@@ -2453,6 +2541,15 @@ def main(img=None, room=None, icon=None, original=None):
         if dropped:
             print("  furniture: {} detections rejected by room check (wrong room for the object)".format(dropped))
         plan["furniture"] = build_furniture(items, plan)
+        from shapely.geometry import Point as _Pt, Polygon as _Pg
+        fp_ = _Pg(plan["floor"]["polygon"]).buffer(0.3)
+        inside_ = [fu for fu in plan["furniture"] if fp_.contains(_Pt(*fu["center"]))]
+        if len(inside_) < len(plan["furniture"]):
+            print("  furniture: {} items outside the building dropped (title block / legend / notes)".format(
+                len(plan["furniture"]) - len(inside_)))
+        plan["furniture"] = inside_
+        for k_, fu in enumerate(plan["furniture"]):
+            fu["id"] = k_
     else:
         plan["furniture"] = []
     jp = os.path.join(OUT_DIR, "plan.json")
