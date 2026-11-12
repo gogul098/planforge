@@ -141,12 +141,14 @@ def run_job(job, src, ext, opt):
             P.EXTERNAL_WALL_M = float(opt["ext_wall"]) / 1000 if opt.get("ext_wall") else None
             P.INTERNAL_WALL_M = float(opt["int_wall"]) / 1000 if opt.get("int_wall") else None
             P.MAKE_FURNITURE = opt.get("furniture", "copy") == "copy"
+            P.PLINTH_HEIGHT = float(opt["plinth"]) if opt.get("plinth") not in (None, "") else None
             with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                 _set(job, progress=0.15, msg="Detecting walls, doors, windows, rooms")
                 if os.environ.get("P3D_TEST_MASKS"):                 # offline test hook
                     d = os.environ["P3D_TEST_MASKS"]
                     img, room, icon = (np.load(os.path.join(d, n + ".npy")) for n in ("img", "room", "icon"))
-                    P.LAST_ORIGINAL = img
+                    op = os.path.join(d, "orig.npy")
+                    P.LAST_ORIGINAL = np.load(op) if os.path.exists(op) else img
                 else:
                     img, room, icon = P.predict(png)
                 if mpp_src:                                          # DXF: exact scale from the drawing units

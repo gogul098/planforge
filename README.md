@@ -31,6 +31,26 @@ Architects then only add elevations and detailing, which cuts most of the manual
   "need furniture placement" switch, and a furniture editor (add, move, rotate, swap, delete, undo) that
   re-exports every file.
 
+## Stairs, entrance steps and stepped areas
+
+Each detected stair is classified and gets exact numbers. Every value records where it came from, best source first:
+**written on the plan** → **counted from the drawing** → **your setting** → **standard assumption** (flagged to check).
+
+| | Entrance steps | Interior stair | Stepped area (seating / terraced floor) |
+|---|---|---|---|
+| How it's recognised | outside the building footprint | inside, straight flight | inside, L / U shaped |
+| Rises | from the ground up to the floor (plinth) | floor to floor (wall height) | in tiers towards the walls |
+| Step count | written ("12R", "7 steps") or counted from the tread lines | same; plus the riser onto the upper floor | counted tiers |
+| Height | plinth: your setting, or a level mark ("+0.45", "PLINTH LVL"), or counted steps × 150 mm | storey height ÷ risers | written riser, else 150 mm (flagged) |
+| Width / run | written dimension next to it, else measured | same | measured |
+| Shape | straight or **flared** (wider at the ground) | straight | any outline |
+| Direction | towards the building | from the "UP" / "DN" label (re-read zoomed if missed), else flagged | towards the walls (flagged) |
+| Revit | native stair (straight) or exact stepped solid (flared), from a new **Ground** level | native Revit stair to an upper level | exact stepped solid |
+
+The building sits on a plinth block, with a ground surface below it so entrance steps land on something, in the
+viewer, `model.glb`, `model.ifc` and Revit. Riser and tread values outside normal ranges are flagged in the report
+and in the viewer (click a stair).
+
 ## How it works
 
 ```

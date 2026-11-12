@@ -7,6 +7,7 @@ parts = open("revit_parts.py").read()
 fc = open("furn_common.py").read()
 fc = fc[fc.index("# FloorPlanCAD classes"):]
 fparts = open("furn_parts.py").read()
+stp = open("stairs.py").read()
 header = '''# ===================== FLOOR PLAN -> EXACT 3D FOR REVIT =====================
 # Reads the plan with your model + OCR, solves wall positions from the WRITTEN dimensions,
 # and writes plan.json (for build_in_revit.py), model.ifc (Revit: Open/Link IFC) and model.glb (preview).
@@ -27,6 +28,9 @@ DOOR_WIDTHS = [0.75, 0.8, 0.9, 1.0, 1.2]
 WALL_HEIGHT, DOOR_HEIGHT = 3.0, 2.1
 WINDOW_SILL, WINDOW_HEAD = 0.9, 2.1
 SLAB, STAIR_RISE = 0.15, 0.175
+# --- stairs / entrance steps: written values on the plan always win; these fill the gaps
+PLINTH_HEIGHT = None          # floor level above ground (m), e.g. 0.45; None = from the plan
+STAIR_RISE_EXT = 0.15         # riser assumed for outside steps / stepped areas when nothing is written
 OUT_DIR = "/kaggle/working/plan_revit"
 
 # --- furniture: fixtures from the floor-plan model + your trained furniture detector (if available)
@@ -52,4 +56,4 @@ LAST_ORIGINAL = None
 dim_hdr = "# ----------------------------------------------------------------------------- 2b. dimension solving (OCR)\n"
 open("plan_to_revit.py", "w").write(header + core + dim_hdr + dim + "\n\n" +
      "# ----------------------------------------------------------------------------- furniture detector helpers\n" +
-     fc + "\n\n" + fparts + "\n\n" + parts)
+     fc + "\n\n" + fparts + "\n\n" + stp + "\n\n" + parts)

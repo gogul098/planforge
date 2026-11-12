@@ -3,8 +3,9 @@
 
 Creates: grids, walls (own wall types per thickness, centre-line, auto-joined), doors and windows
 (your loaded families, sized exactly; plain wall openings if no family is loaded), a floor,
-named rooms, the stair outline, and furniture / fixtures copied from the drawing (loaded families
-turned to face the room, or exactly sized boxes).
+named rooms, stairs (native Revit stairs for straight flights; exact stepped solids for flared entrance
+steps and stepped seating areas; a "Ground" level below the plinth for entrance steps), and furniture /
+fixtures copied from the drawing (loaded families turned to face the room, or exactly sized boxes).
 
 Run it in Revit 2022 or newer with pyRevit or RevitPythonShell. Start from a new project
 (Architectural template), so the default door/window families are loaded.
@@ -23,6 +24,13 @@ from Autodesk.Revit.DB import (BuiltInCategory, BuiltInParameter, CompoundStruct
                                SketchPlane, Transaction, UV, Wall, WallKind, WallType, XYZ)
 from Autodesk.Revit.DB.Structure import StructuralType
 from System.Collections.Generic import List
+try:
+    from Autodesk.Revit.DB import (FailureProcessingResult, FailureSeverity, IFailuresPreprocessor,
+                                   StairsEditScope)
+    from Autodesk.Revit.DB.Architecture import StairsRun, StairsRunJustification
+    HAVE_STAIRS_API = True
+except Exception:
+    HAVE_STAIRS_API = False
 
 # ----------------------------------------------------------------------------- settings
 JSON_PATH = None          # leave None to pick the file in a dialog
@@ -30,6 +38,8 @@ MAKE_GRIDS = True
 MAKE_ROOMS = True
 MAKE_FLOOR = True
 MAKE_FURNITURE = True
+MAKE_STAIRS = True
+NATIVE_STAIRS = True       # straight flights as real Revit stairs (else exact stepped solids)
 FURNITURE_AS_BOXES = False  # True = always sized boxes (no family matching)
 FT = 1.0 / 0.3048         # metres -> Revit internal feet
 
@@ -252,12 +262,147 @@ def place_furniture(f, lvl, z0):
     return "box"
 
 
+# ----------------------------------------------------------------------------- stairs
+def level_at(z_ft, name):
+    """Existing level at this elevation, or a new one (call inside a transaction)."""
+    for l in collect(Level):
+        if abs(l.Elevation - z_ft) < 0.01:
+            return l, False
+    l = Level.Create(doc, z_ft)
+    try:
+        l.Name = name
+    except Exception:
+        pass
+    return l, True
+
+
+def clean_loop(pts):
+    out = []
+    for q in pts:
+        if not out or abs(q[0] - out[-1][0]) + abs(q[1] - out[-1][1]) > 0.005:
+            out.append(q)
+    if len(out) > 1 and abs(out[0][0] - out[-1][0]) + abs(out[0][1] - out[-1][1]) <= 0.005:
+        out.pop()
+    return out
+
+
+def steps_shape(s, z0):
+    """Exact stepped solid, one block per tread (flared steps, stepped areas, or when native stairs fail)."""
+    shapes = List[GeometryObject]()
+    for tr in s.get("treads", []):
+        pts = clean_loop(tr["polygon"])
+        if len(pts) < 3 or tr["z1"] - tr["z0"] < 0.005:
+            continue
+        loop = CurveLoop()
+        for i in range(len(pts)):
+            loop.Append(Line.CreateBound(P(pts[i], z0 + tr["z0"]), P(pts[(i + 1) % len(pts)], z0 + tr["z0"])))
+        loops = List[CurveLoop]()
+        loops.Add(loop)
+        shapes.Add(GeometryCreationUtilities.CreateExtrusionGeometry(loops, XYZ.BasisZ, (tr["z1"] - tr["z0"]) * FT))
+    cat = ElementId(BuiltInCategory.OST_Stairs)
+    if not DirectShape.IsValidCategoryId(cat, doc):
+        cat = ElementId(BuiltInCategory.OST_GenericModel)
+    ds = DirectShape.CreateElement(doc, cat)
+    ds.SetShape(shapes)
+    try:
+        ds.Name = "{} steps: {} x {:.0f} mm risers, {:.0f} mm treads".format(
+            s["kind"].title(), s["risers"], s["riser"] * 1000, s["tread"] * 1000)
+    except Exception:
+        pass
+    return ds
+
+
+if HAVE_STAIRS_API:
+    class _QuietWarnings(IFailuresPreprocessor):
+        def PreprocessFailures(self, fa):
+            for m in fa.GetFailureMessages():
+                if m.GetSeverity() == FailureSeverity.Warning:
+                    fa.DeleteWarning(m)
+            return FailureProcessingResult.Continue
+
+
+def native_stair(s, base_lvl, top_lvl, z0):
+    """Real Revit stair: one straight run with the drawn width, risers from plan.json."""
+    scope = StairsEditScope(doc, "Plan to Revit stair")
+    sid = scope.Start(base_lvl.Id, top_lvl.Id)
+    t = Transaction(doc, "Plan to Revit: stair run")
+    t.Start()
+    try:
+        st = doc.GetElement(sid)
+        try:
+            st.DesiredRisersNumber = int(s["risers"])
+        except Exception:
+            pass
+        zb = z0 + s["base_z"]
+        run = StairsRun.CreateStraightRun(doc, sid, Line.CreateBound(P(s["start"], zb), P(s["end"], zb)),
+                                          StairsRunJustification.Center)
+        run.ActualRunWidth = s["width"] * FT
+        t.Commit()
+    except Exception:
+        t.RollBack()
+        scope.Cancel()
+        raise
+    scope.Commit(_QuietWarnings())
+    return sid
+
+
+def build_stairs(plan, lvl, z0, stats, errors):
+    stairs = plan.get("stairs", [])
+    if not stairs:
+        return
+    t = Transaction(doc, "Plan to Revit: levels for stairs")
+    t.Start()
+    levels = {}
+    for s in stairs:
+        for z in (s["base_z"], s["top_z"]):
+            key = round(z, 3)
+            if key in levels or abs(z) < 1e-4:
+                continue
+            name = "Ground (plinth {:.2f} m)".format(-z) if z < 0 else "Upper floor (+{:.2f} m)".format(z)
+            try:
+                levels[key], new = level_at((z0 + z) * FT, name)
+                stats["levels_added"] += int(new)
+            except Exception as e:
+                errors.append("level {:+.2f} m: {}".format(z, e))
+    t.Commit()
+    lv = lambda z: lvl if abs(z) < 1e-4 else levels.get(round(z, 3))
+    for s in stairs:
+        done = False
+        if NATIVE_STAIRS and HAVE_STAIRS_API and s.get("shape") == "straight" and s["kind"] != "terrace":
+            b, tp = lv(s["base_z"]), lv(s["top_z"])
+            if b is not None and tp is not None:
+                try:
+                    native_stair(s, b, tp, z0)
+                    stats["stairs_native"] += 1
+                    done = True
+                except Exception as e:
+                    errors.append("stair {} as native Revit stair: {} (drawn as exact steps instead)".format(s["id"], e))
+        t = Transaction(doc, "Plan to Revit: steps")
+        t.Start()
+        try:
+            if not done:
+                steps_shape(s, z0)
+                stats["stairs_shapes"] += 1
+            zb = z0 + s["base_z"]
+            sp = SketchPlane.Create(doc, Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ(0, 0, zb * FT)))
+            o = clean_loop(s["outline"])
+            for i in range(len(o)):
+                doc.Create.NewModelCurve(Line.CreateBound(P(o[i], zb), P(o[(i + 1) % len(o)], zb)), sp)
+            doc.Create.NewModelCurve(Line.CreateBound(P(s["start"], zb), P(s["end"], zb)), sp)
+            stats["stair_outlines"] += 1
+            t.Commit()
+        except Exception as e:
+            t.RollBack()
+            errors.append("stair {}: {}".format(s["id"], e))
+
+
 # ----------------------------------------------------------------------------- build
 def build(plan):
     lvl = base_level()
     z0 = lvl.Elevation / FT        # metres
     stats = {"grids": 0, "walls": 0, "doors": 0, "windows": 0, "plain_openings": 0, "rooms": 0,
-             "floor": 0, "stair_outlines": 0, "furniture_families": 0, "furniture_boxes": 0}
+             "floor": 0, "stair_outlines": 0, "stairs_native": 0, "stairs_shapes": 0, "levels_added": 0,
+             "furniture_families": 0, "furniture_boxes": 0}
     errors = []
 
     t = Transaction(doc, "Plan to Revit: grids + walls")
@@ -321,7 +466,7 @@ def build(plan):
             errors.append("{} {}: {}".format(o["type"], o["id"], e))
     t.Commit()
 
-    t = Transaction(doc, "Plan to Revit: floor, rooms, stairs")
+    t = Transaction(doc, "Plan to Revit: floor, rooms")
     t.Start()
     if MAKE_FLOOR and plan.get("floor"):
         try:
@@ -349,18 +494,10 @@ def build(plan):
                 stats["rooms"] += 1
             except Exception as e:
                 errors.append("room {}: {}".format(r["name"], e))
-    if plan.get("stairs"):
-        sp = SketchPlane.Create(doc, Plane.CreateByNormalAndOrigin(XYZ.BasisZ, XYZ(0, 0, lvl.Elevation)))
-        for s in plan["stairs"]:
-            try:
-                o = s["outline"]
-                for i in range(4):
-                    doc.Create.NewModelCurve(Line.CreateBound(P(o[i], z0), P(o[(i + 1) % 4], z0)), sp)
-                doc.Create.NewModelCurve(Line.CreateBound(P(s["start"], z0), P(s["end"], z0)), sp)
-                stats["stair_outlines"] += 1
-            except Exception as e:
-                errors.append("stair outline: {}".format(e))
     t.Commit()
+
+    if MAKE_STAIRS:
+        build_stairs(plan, lvl, z0, stats, errors)
 
     if MAKE_FURNITURE and plan.get("furniture"):
         t = Transaction(doc, "Plan to Revit: furniture")
@@ -387,13 +524,19 @@ def main():
     print("Plan to Revit finished")
     print("  scale from: {} ({}/{} written dimensions exact)".format(
         pr.get("scale_source"), pr.get("dimensions_exact"), pr.get("dimensions_read")))
-    for k in ("grids", "walls", "doors", "windows", "plain_openings", "floor", "rooms", "stair_outlines",
-              "furniture_families", "furniture_boxes"):
+    for k in ("grids", "walls", "doors", "windows", "plain_openings", "floor", "rooms", "stairs_native",
+              "stairs_shapes", "stair_outlines", "levels_added", "furniture_families", "furniture_boxes"):
         print("  {:<15} {}".format(k, stats[k]))
     if stats["plain_openings"]:
         print("  (no door/window family loaded -> exact wall openings cut instead; load families and rerun)")
-    if plan.get("stairs"):
-        print("  stairs: outline + walking line drawn on the floor; place them with Architecture > Stair")
+    lvls = plan.get("levels", {})
+    if lvls.get("plinth"):
+        print("  plinth {:.3f} m above ground ({})".format(lvls["plinth"], lvls.get("plinth_source", "")))
+    for st in plan.get("stairs", []):
+        print("  {} stair {}: {} risers x {:.0f} mm, tread {:.0f} mm, width {:.2f} m".format(
+            st["kind"], st["id"], st["risers"], st["riser"] * 1000, st["tread"] * 1000, st["width"]))
+        for w in st.get("warnings", []):
+            print("      check: " + w)
     if stats["furniture_boxes"]:
         print("  furniture boxes are exact size/position; load matching families and rerun to swap them in")
     if errors:

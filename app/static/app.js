@@ -18,7 +18,7 @@ const S = {
   hist: [], fut: [], beforeEdit: null, dirty: false,
 };
 const CAT_COL = { furniture: 0xb0845c, plumbing: 0xeef0f4, appliance: 0x969ba2 };
-const LAYER_COL = { wall: 0xe9e4dc, door: 0x8a5a3b, glass: 0x8fc3e8, floor: 0xc9b9a2, stairs: 0xbfb3a3 };
+const LAYER_COL = { wall: 0xe9e4dc, door: 0x8a5a3b, glass: 0x8fc3e8, floor: 0xc9b9a2, stairs: 0xbfb3a3, plinth: 0xa8a096, ground: 0x93a58c };
 const DEFAULT_SIZE = {
   bed: [2.0, 1.6], sofa: [2.0, 0.9], chair: [0.5, 0.5], table: [1.4, 0.9], wardrobe: [1.8, 0.6],
   tv_cabinet: [1.6, 0.45], toilet: [0.7, 0.4], sink: [0.6, 0.45], bath_tub: [1.7, 0.75],
@@ -105,7 +105,7 @@ async function loadBuilding(url, faithful = false) {
   building.add(gltf.scene);
   bbox = new THREE.Box3().setFromObject(building);
   const c = bbox.getCenter(new THREE.Vector3()), sz = bbox.getSize(new THREE.Vector3());
-  grid.position.set(c.x, -0.16, c.z);
+  grid.position.set(c.x, bbox.min.y - 0.01, c.z);
   sun.position.set(c.x + sz.x, 30, c.z + sz.z * 0.7); sun.target.position.copy(c);
   const d = Math.max(sz.x, sz.z) * 0.7;
   Object.assign(sun.shadow.camera, { left: -d, right: d, top: d, bottom: -d, near: 0.5, far: 120 });
@@ -328,7 +328,7 @@ function applyEdges() {
     if (e) e.visible = S.edges;
   });
 }
-const LAYERS = { wall: true, door: true, glass: true, floor: true, stairs: true, furniture: true, grids: false };
+const LAYERS = { wall: true, door: true, glass: true, floor: true, stairs: true, plinth: true, ground: true, furniture: true, grids: false };
 function applyLayers() {
   building.traverse((o) => { if (o.isMesh && o.userData.layer && !/furniture|plumbing|appliance/.test(o.name)) o.visible = LAYERS[o.userData.layer] !== false; });
   furnG.visible = LAYERS.furniture && S.tab !== "raw";
@@ -439,6 +439,10 @@ function select(sel) {
     wallHi.scale.set(L + w.thickness, w.height + 0.02, w.thickness + 0.02);
     wallHi.position.set((w.start[0] + w.end[0]) / 2, w.height / 2, (w.start[1] + w.end[1]) / 2);
     wallHi.rotation.set(0, -Math.atan2(dy, dx), 0); wallHi.visible = true;
+  } else if (sel?.kind === "stair") {
+    const sh = new THREE.Shape(sel.s.outline.map(([x, y]) => new THREE.Vector2(x, -y)));
+    roomHi.geometry.dispose(); roomHi.geometry = new THREE.ShapeGeometry(sh);
+    roomHi.rotation.set(-Math.PI / 2, 0, 0); roomHi.position.y = sel.s.top_z + 0.03; roomHi.visible = true;
   } else if (sel?.kind === "room") {
     const sh = new THREE.Shape(sel.r.polygon.map(([x, y]) => new THREE.Vector2(x, -y)));
     roomHi.geometry.dispose(); roomHi.geometry = new THREE.ShapeGeometry(sh);
@@ -499,6 +503,10 @@ function click(e) {
   const hb = pick(e, [building]);
   if (!hb) { select(null); return; }
   const p = [hb.point.x, hb.point.z];
+  const st = (S.plan.stairs || []).find((s) => inPoly(p, s.outline));
+  if (st) {
+    select({ kind: "stair", s: st }); return;
+  }
   const nw = nearestWall(p);
   if (hb.object.userData.layer !== "floor" && nw && nw.d < nw.w.thickness + 0.25) select({ kind: "wall", w: nw.w });
   else { const r = roomAt(p); select(r ? { kind: "room", r } : null); }
@@ -549,6 +557,19 @@ function renderProps() {
       prop("Thickness", Math.round(w.thickness * 1000) + " mm") + prop("Height", fmt(w.height) + " m") +
       prop("Doors / windows", `${ops.filter((o) => o.type === "door").length} / ${ops.filter((o) => o.type !== "door").length}`) +
       prop("Room", roomAt([(w.start[0] + w.end[0]) / 2 + 0.3, (w.start[1] + w.end[1]) / 2 + 0.3])?.name || "—") + prop("Wall id", w.id);
+    return;
+  }
+  if (sel.kind === "stair") {
+    const s = sel.s, src = s.sources || {};
+    const kindName = { entrance: "Entrance steps", interior: "Stair", terrace: "Stepped area" }[s.kind] || "Stair";
+    $("#selTitle").textContent = "Selection · " + kindName;
+    P.innerHTML = prop("Shape", s.shape) + prop("Steps (risers)", s.risers) + prop("Riser", Math.round(s.riser * 1000) + " mm") +
+      prop("Tread", Math.round(s.tread * 1000) + " mm") +
+      prop("Width", s.shape === "flared" ? `${fmt(s.width_low, 2)} → ${fmt(s.width_high, 2)} m` : fmt(s.width, 2) + " m") +
+      prop("Run", fmt(s.run, 2) + " m") + prop("Levels", `${s.base_z >= 0 ? "+" : ""}${fmt(s.base_z, 2)} → ${s.top_z >= 0 ? "+" : ""}${fmt(s.top_z, 2)} m`) +
+      prop("Direction", s.direction || "—") +
+      Object.entries(src).map(([k, v]) => prop("From · " + k, `<span class="muted">${v}</span>`)).join("") +
+      (s.warnings || []).map((w) => `<p class="small" style="color:#ffb86b">Check: ${w}</p>`).join("");
     return;
   }
   if (sel.kind === "room") {
@@ -608,7 +629,9 @@ function renderStats(st) {
   $("#s_dim").textContent = pr.dimensions_read ? `${pr.dimensions_exact}/${pr.dimensions_read}` : "0";
   $("#s_rooms").textContent = (p.rooms || []).length;
   $("#s_furn").textContent = S.furn.length;
-  $("#s_scale").textContent = st?.exact_scale ? "Scale: exact, from the DXF drawing units." : "Scale: " + (pr.scale_source || p.mapping?.source || "");
+  $("#s_scale").textContent = (st?.exact_scale ? "Scale: exact, from the DXF drawing units." : "Scale: " + (pr.scale_source || p.mapping?.source || "")) +
+    (p.levels?.plinth ? ` · Plinth ${p.levels.plinth.toFixed(2)} m (${p.levels.plinth_source})` : "") +
+    ((p.stairs || []).some((s) => (s.warnings || []).length) ? " · some stairs need a check: click them" : "");
 }
 
 // ------------------------------------------------------------------ history
@@ -708,7 +731,7 @@ $("#btnConvert").onclick = async () => {
   const opt = {
     furniture: furnState.need ? furnState.mode : "none", building_width: val("#o_bw"), wall_height: val("#o_wh") ?? 3,
     ext_wall: val("#o_ew"), int_wall: val("#o_iw"), door_height: val("#o_dh") ?? 2.1, head: val("#o_dh") ?? 2.1,
-    sill: val("#o_ws") ?? 0.9, dxf_units: $("#o_units").value || null,
+    sill: val("#o_ws") ?? 0.9, dxf_units: $("#o_units").value || null, plinth: val("#o_pl"),
   };
   const fd = new FormData(); fd.append("file", S.file); fd.append("options", JSON.stringify(opt));
   $("#btnConvert").disabled = true; $("#prog").classList.remove("hidden"); progress(0.02, "Uploading");
@@ -744,7 +767,8 @@ async function loadJob(job, st) {
   $("#btnEdit").disabled = false; $("#empty").classList.add("hidden");
   $("#saveState").textContent = "";
   setTab("3d"); setTool("orbit"); fit(); select(null);
-  window.__planforge = { ready: true, walls: S.plan.walls.length, furniture: S.furn.length };
+  window.__planforge = { ready: true, walls: S.plan.walls.length, furniture: S.furn.length,
+    stairs: (S.plan.stairs || []).length, selectStair: (i) => select({ kind: "stair", s: S.plan.stairs[i] }), fit };
 }
 
 function toast(m, err = false) {

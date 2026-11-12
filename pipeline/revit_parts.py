@@ -168,33 +168,7 @@ def build_plan(v, sol, toks, room):
                       "point": [round(p.x, 4), round(p.y, 4)],
                       "polygon": [[round(x, 4), round(y, 4)] for x, y in list(poly.exterior.coords)[:-1]]})
 
-    # stairs: run along the long side, starting at the end nearest the "UP" label
-    stairs = []
-    up = [t for t in labels if t["text"].strip().upper() in ("UP", "UP.")]
-    for st in v["stairs"]:
-        x0, y0, x1, y1 = MX(st["x0"]), MY(st["y0"]), MX(st["x1"]), MY(st["y1"])
-        short, long_ = sorted([x1 - x0, y1 - y0])
-        if short < 0.7 or long_ < 1.5 or short * long_ < 1.5:
-            continue                                     # too small to be a real stair -> false positive
-        along_x = (x1 - x0) >= (y1 - y0)
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        if along_x:
-            p0, p1, width = [x0, cy], [x1, cy], y1 - y0
-        else:
-            p0, p1, width = [cx, y0], [cx, y1], x1 - x0
-        if up:
-            ux, uy = MX(up[0]["x"]), MY(up[0]["y"])
-            if np.hypot(ux - p1[0], uy - p1[1]) < np.hypot(ux - p0[0], uy - p0[1]):
-                p0, p1 = p1, p0
-        n = int(np.clip(round(WALL_HEIGHT / STAIR_RISE), 3, 30))
-        run = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
-        stairs.append({"start": [round(c, 4) for c in p0], "end": [round(c, 4) for c in p1],
-                       "width": round(width, 4), "risers": n, "riser": round(WALL_HEIGHT / n, 4),
-                       "tread": round(run / max(n - 1, 1), 4),
-                       "straight_run_fits": bool(run / max(n - 1, 1) >= 0.22),
-                       "outline": [[round(x0, 4), round(y0, 4)], [round(x1, 4), round(y0, 4)],
-                                   [round(x1, 4), round(y1, 4)], [round(x0, 4), round(y1, 4)]],
-                       "direction_from_UP_label": bool(up)})
+    stairs = []                                          # filled by build_stairs() in main()
 
     # structural grids (labelled 1..n across, A.. down)
     letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -277,24 +251,31 @@ def pieces(plan):
         if cur < L + w["ext"][1]:
             yield "wall", rect(cur, L + w["ext"][1], t), 0.0, w["height"]
     for s in plan["stairs"]:
-        a, b = np.array(s["start"]), np.array(s["end"])
-        L = float(np.linalg.norm(b - a))
-        d = (b - a) / max(L, 1e-9)
-        n = np.array([-d[1], d[0]])
-        h = s["width"] / 2
-        for i in range(s["risers"]):
-            u0, u1 = L * i / s["risers"], L * (i + 1) / s["risers"]
-            q = [a + d * u0 - n * h, a + d * u1 - n * h, a + d * u1 + n * h, a + d * u0 + n * h]
-            yield "stairs", q, 0.0, s["riser"] * (i + 1)
+        for t in s.get("treads", []):
+            yield "stairs", t["polygon"], t["z0"], t["z1"]
 
 
 def prism(corners, z0, z1):
-    c = [np.asarray(p, float) for p in corners]
+    """Vertical prism over a simple polygon (3+ corners, convex or not), y-up mesh coordinates."""
+    c = np.asarray(corners, float)[:, :2]
+    if len(c) > 3 and np.allclose(c[0], c[-1]):
+        c = c[:-1]
+    m = len(c)
     v = np.array([[p[0], z0, p[1]] for p in c] + [[p[0], z1, p[1]] for p in c])
-    f = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6]]
-    for i in range(4):
-        j = (i + 1) % 4
-        f += [[i, 4 + i, j], [j, 4 + i, 4 + j]]
+    if m == 4:
+        tri = [[0, 1, 2], [0, 2, 3]]
+    else:
+        import mapbox_earcut as earcut
+        idx = earcut.triangulate_float64(c, np.array([m], dtype=np.uint32)).reshape(-1, 3)
+        area = 0.5 * np.sum(c[:, 0] * np.roll(c[:, 1], -1) - np.roll(c[:, 0], -1) * c[:, 1])
+        tri = []
+        for a_, b_, c_ in idx:                       # same winding as the outline
+            t2 = 0.5 * ((c[b_, 0] - c[a_, 0]) * (c[c_, 1] - c[a_, 1]) - (c[c_, 0] - c[a_, 0]) * (c[b_, 1] - c[a_, 1]))
+            tri.append([a_, b_, c_] if (t2 > 0) == (area > 0) else [a_, c_, b_])
+    f = [list(t) for t in tri] + [[m + t[0], m + t[2], m + t[1]] for t in tri]
+    for i in range(m):
+        j = (i + 1) % m
+        f += [[i, m + i, j], [j, m + i, m + j]]
     f = np.array(f)
     t = v[f]
     if np.einsum("ij,ij->i", t[:, 0], np.cross(t[:, 1], t[:, 2])).sum() < 0:
@@ -304,6 +285,7 @@ def prism(corners, z0, z1):
 
 COLORS = {"wall": [235, 232, 225, 255], "door": [150, 95, 55, 255], "glass": [140, 190, 235, 140],
           "stairs": [190, 190, 190, 255], "floor": [205, 185, 150, 255],
+          "plinth": [168, 160, 150, 255], "ground": [150, 165, 140, 255],
           "furniture": [176, 132, 92, 255], "plumbing": [240, 242, 246, 255], "appliance": [150, 155, 162, 255]}
 
 
@@ -318,6 +300,19 @@ def build_glb(plan, path, extra=None):
     fl.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
     fl.apply_translation([0, -SLAB, 0])
     parts["floor"] = [fl]
+    pl = float(plan.get("levels", {}).get("plinth", 0.0))
+    if pl > 0.01:                       # building raised on a plinth, entrance steps come down to the ground
+        fp = Polygon([(x, -y) for x, y in plan["floor"]["polygon"]]).buffer(0)
+        if pl > SLAB + 0.01:
+            pb = trimesh.creation.extrude_polygon(fp, pl - SLAB)
+            pb.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
+            pb.apply_translation([0, -pl, 0])
+            parts["plinth"] = [pb]
+        xs = [p[0] for p in plan["floor"]["polygon"]] + [q[0] for st in plan["stairs"] for q in st["outline"]]
+        ys = [p[1] for p in plan["floor"]["polygon"]] + [q[1] for st in plan["stairs"] for q in st["outline"]]
+        g = [[min(xs) - 3, min(ys) - 3], [max(xs) + 3, min(ys) - 3], [max(xs) + 3, max(ys) + 3], [min(xs) - 3, max(ys) + 3]]
+        vv, ff = prism(g, -pl - 0.05, -pl)
+        parts["ground"] = [trimesh.Trimesh(vv, ff, process=False)]
     scene = trimesh.Scene()
     for cat, ms in parts.items():
         m = trimesh.util.concatenate(ms)
@@ -604,6 +599,16 @@ def print_report(plan):
         for fu in plan["furniture"]:
             cnt[fu["type"]] = cnt.get(fu["type"], 0) + 1
         print("  furniture/fixtures:", ", ".join("{} {}".format(v, k) for k, v in sorted(cnt.items())))
+    lv = plan.get("levels", {})
+    if plan["stairs"] or lv.get("plinth"):
+        print("  plinth (floor above ground): {:.3f} m  [{}]".format(lv.get("plinth", 0), lv.get("plinth_source", "")))
+    for st in plan["stairs"]:
+        print("  {} stair {} ({}): {} risers x {:.0f} mm, tread {:.0f} mm, width {:.2f} m, run {:.2f} m, "
+              "{:+.2f} -> {:+.2f} m".format(st["kind"], st["id"], st["shape"], st["risers"], st["riser"] * 1000,
+                                           st["tread"] * 1000, st["width"], st["run"], st["base_z"], st["top_z"]))
+        print("      from: " + "; ".join("{} {}".format(k, v) for k, v in st["sources"].items()))
+        for wn in st["warnings"]:
+            print("      CHECK: " + wn)
     th = sorted({w["thickness"] for w in plan["walls"]})
     print("  wall thicknesses (m):", th)
 
@@ -649,6 +654,7 @@ def main(img=None, room=None, icon=None, original=None):
                                              "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
                "report": [], "fallback": True}
     plan = build_plan(v, sol, toks, room)
+    plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])

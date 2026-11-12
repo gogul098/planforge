@@ -280,8 +280,9 @@ def vectorise(room, icon):
 
     stairs = []
     for comp, st in _components(icon == STAIRS, 4 * T * T):
-        x, y, w, h = [float(v) for v in st[:4]]
-        stairs.append({"x0": x, "y0": y, "x1": x + w, "y1": y + h})
+        x, y, w, h = [int(v) for v in st[:4]]
+        stairs.append({"x0": float(x), "y0": float(y), "x1": float(x + w), "y1": float(y + h),
+                       "ox": x, "oy": y, "mask": comp[y:y + h, x:x + w].copy()})
     struct = np.zeros(full.shape, np.uint8)
     for sg in segs:
         h0, h1 = int(round(sg["c"] - sg["t"] / 2)), int(round(sg["c"] + sg["t"] / 2))

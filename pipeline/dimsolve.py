@@ -23,16 +23,16 @@ def ocr_tokens(img_rgb, ocr=None):
         size = parse_size(txt)
         if size:
             toks.append({"kind": "size", "value": size, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
-                         "text": txt.strip(), "conf": float(conf)})
+                         "text": txt.strip(), "raw": txt, "conf": float(conf)})
         elif nums and letters <= 1 and not re.search(r"[xX×]", txt):
             for m in nums:
                 f = (m.start() + m.end()) / 2 / n
                 cx, cy = (x0 + f * (x1 - x0), (y0 + y1) / 2) if not vertical_text else \
                          ((x0 + x1) / 2, y1 - f * (y1 - y0))
                 toks.append({"kind": "num", "value": float(m.group().replace(",", ".")), "x": cx, "y": cy,
-                             "text": m.group(), "conf": float(conf)})
+                             "text": m.group(), "raw": txt, "conf": float(conf)})
         elif letters >= 2:
-            toks.append({"kind": "label", "text": txt, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
+            toks.append({"kind": "label", "text": txt, "raw": txt, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
                          "h": float(min(y1 - y0, x1 - x0) if vertical_text else (y1 - y0)), "conf": float(conf)})
     return toks
 
@@ -226,7 +226,9 @@ def solve(grid_x, grid_y, bbox, toks, struct=None, segs=None, T=6.0):
             A, b, W = np.array(rows), np.array(rhs), np.array(w)
             sol = np.linalg.lstsq(A * W[:, None], b * W, rcond=None)[0] if n else np.array([])
             res = [(abs(sol[eqs[k][1]] - sol[eqs[k][0]] - eqs[k][2]), k) for k in active]
-            worst = max(res) if res else (0, None)
+            if not res:                                                  # no written dimension on this axis
+                break
+            worst = max(res)
             if worst[0] > max(0.02, 0.01 * eqs[worst[1]][2]):
                 active.remove(worst[1]); rejected.append(worst[1])   # conflicts with the others
             else:
