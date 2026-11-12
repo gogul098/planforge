@@ -2606,12 +2606,58 @@ def build_ifc(plan, path):
         feature.add_filling(f, opening=op, element=fill)
         spatial.assign_container(f, products=[fill], relating_structure=storey)
 
-    slab = root.create_entity(f, ifc_class="IfcSlab", name="Ground floor slab", predefined_type="FLOOR")
-    geometry.assign_representation(f, product=slab, representation=geometry.add_slab_representation(
-        f, context=body, depth=SLAB, polyline=[(x, -y) for x, y in plan["floor"]["polygon"]]))
-    mm = np.eye(4); mm[2, 3] = -SLAB
-    geometry.edit_object_placement(f, product=slab, matrix=mm)
-    spatial.assign_container(f, products=[slab], relating_structure=storey)
+    # ---- floor: structural slab + finish flooring on top, both open where steps go down to the ground
+    from ifcopenshell.api import style as ifcstyle
+    from shapely.geometry import Polygon as _Pg, LineString as _Ls
+    from shapely.ops import split as _split, unary_union as _uu
+    fpoly = _Pg(plan["floor"]["polygon"]).buffer(0)
+    for h in plan["floor"].get("holes", []):
+        fpoly = fpoly.difference(_Pg(h).buffer(0))
+
+    def no_voids(g):                                 # IFC slab outlines here are single loops: cut through each void
+        out, todo = [], list(getattr(g, "geoms", [g]))
+        while todo:
+            q = todo.pop()
+            if q.geom_type != "Polygon" or q.area < 0.05:
+                continue
+            if not q.interiors:
+                out.append(q)
+                continue
+            cx = _Pg(q.interiors[0]).centroid.x
+            y0, y1 = q.bounds[1] - 1, q.bounds[3] + 1
+            todo += list(_split(q, _Ls([(cx, y0), (cx, y1)])).geoms)
+        return out
+
+    concrete = material.add_material(f, name="Concrete slab", category="concrete")
+    tiles = material.add_material(f, name="Vitrified floor tiles 600 x 600", category="tile")
+
+    def colour(mat, rgb, name):
+        st = ifcstyle.add_style(f, name=name)
+        ifcstyle.add_surface_style(f, style=st, ifc_class="IfcSurfaceStyleShading",
+                                   attributes={"SurfaceColour": {"Name": None, "Red": rgb[0], "Green": rgb[1], "Blue": rgb[2]}})
+        ifcstyle.assign_material_style(f, material=mat, style=st, context=body)
+    colour(concrete, (0.62, 0.62, 0.6), "Concrete")
+    colour(tiles, (0.86, 0.78, 0.64), "Floor tiles")
+    FINISH = 0.02
+    pieces_ = no_voids(fpoly)
+    for k, q in enumerate(pieces_):
+        poly = [(x, -y) for x, y in list(q.exterior.coords)[:-1]]
+        slab = root.create_entity(f, ifc_class="IfcSlab", name="Ground floor slab" + (" {}".format(k + 1) if len(pieces_) > 1 else ""),
+                                  predefined_type="FLOOR")
+        geometry.assign_representation(f, product=slab, representation=geometry.add_slab_representation(
+            f, context=body, depth=SLAB - FINISH, polyline=poly))
+        mm = np.eye(4); mm[2, 3] = -SLAB
+        geometry.edit_object_placement(f, product=slab, matrix=mm)
+        material.assign_material(f, products=[slab], material=concrete)
+        spatial.assign_container(f, products=[slab], relating_structure=storey)
+        fin = root.create_entity(f, ifc_class="IfcCovering", name="Flooring - vitrified tiles" + (" {}".format(k + 1) if len(pieces_) > 1 else ""),
+                                 predefined_type="FLOORING")
+        geometry.assign_representation(f, product=fin, representation=geometry.add_slab_representation(
+            f, context=body, depth=FINISH, polyline=poly))
+        mm = np.eye(4); mm[2, 3] = -FINISH
+        geometry.edit_object_placement(f, product=fin, matrix=mm)
+        material.assign_material(f, products=[fin], material=tiles)
+        spatial.assign_container(f, products=[fin], relating_structure=storey)
     for r in plan["rooms"]:
         sp = root.create_entity(f, ifc_class="IfcSpace", name=r["name"])
         sp.LongName = "{} ({} m2)".format(r["name"], r["area_m2"])
