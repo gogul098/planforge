@@ -19,7 +19,7 @@ if "DBG_INPUT" in globals():                  # (offline testing hook)
 else:
     img, room, icon = predict(IMAGE)
     original = LAST_ORIGINAL
-v = vectorise(room, icon)
+v = vectorise(room, icon, original)
 toks = ocr_full_res(img, original)
 plan = main(img, room, icon, original=original)
 f = img.shape[1] / original.shape[1]          # inference px per original px

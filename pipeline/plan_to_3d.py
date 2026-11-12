@@ -383,7 +383,85 @@ def _join_across(segs, T):
     return segs
 
 
-def vectorise(room, icon):
+def _drawn_windows(segs, merged, image, T, model_shape):
+    """Windows the model did not mark, read from the drawing: a gap between two collinear walls with 2+ thin
+    lines running along the wall inside its thickness. The two walls become one wall with a window in it.
+    Gaps without such lines (doors, passages) are left alone."""
+    if image is None:
+        return segs, merged, 0
+    g = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    k = g.shape[1] / model_shape[1]                     # drawing px per model px
+    Hg, Wg = g.shape
+    found = 0
+    changed = True
+    while changed:
+        changed = False
+        for i, a in enumerate(segs):
+            pa0, pa1 = np.array(a["p0"]), np.array(a["p1"])
+            La = np.linalg.norm(pa1 - pa0)
+            if La < 1e-6:
+                continue
+            d = (pa1 - pa0) / La
+            n = np.array([-d[1], d[0]])
+            for j, b in enumerate(segs):
+                if j == i:
+                    continue
+                pb0, pb1 = np.array(b["p0"]), np.array(b["p1"])
+                Lb = np.linalg.norm(pb1 - pb0)
+                if Lb < 1e-6:
+                    continue
+                db = (pb1 - pb0) / Lb
+                if abs(d[0] * db[1] - d[1] * db[0]) > 0.035:
+                    continue                                   # not parallel
+                # b must start (one of its ends) just after a ends, on the same line
+                ends_b = sorted([pb0, pb1], key=lambda q: (q - pa0) @ d)
+                near, far = ends_b
+                gap = (near - pa1) @ d
+                if not (1.5 * T <= gap <= 14 * T) or abs((near - pa1) @ n) > 0.6 * T or abs((far - pa0) @ n) > 0.6 * T:
+                    continue
+                t = max(a["t"], b["t"])
+                # perpendicular profiles across the wall thickness, along the gap (drawing resolution)
+                hits, samples = 0, 0
+                for f in np.linspace(0.15, 0.85, 12):
+                    c = (pa1 + d * gap * f) * k
+                    prof = []
+                    for o in np.linspace(-(t / 2 + 1.5) * k, (t / 2 + 1.5) * k, max(9, int(3 * t * k))):
+                        x, y = int(round(c[0] + n[0] * o)), int(round(c[1] + n[1] * o))
+                        prof.append(g[y, x] < 140 if 0 <= x < Wg and 0 <= y < Hg else False)
+                    runs = int(np.sum(np.diff(np.concatenate([[0], np.array(prof, int), [0]])) == 1))
+                    samples += 1
+                    hits += 2 <= runs <= 5
+                if hits < 0.7 * samples:
+                    continue
+                # merge b into a, window in the gap
+                new_end = far
+                a["p1"] = [float(new_end[0]), float(new_end[1])]
+                src = "j1" if far is pb1 else "j0"              # b's far end keeps its corner join
+                for suffix in ("", "_hv"):
+                    if src + suffix in b:
+                        a["j1" + suffix] = b[src + suffix]
+                    else:
+                        a.pop("j1" + suffix, None)
+                a["t"] = (a["t"] * La + b["t"] * Lb) / (La + Lb)
+                for o in merged:
+                    if o["wall"] == j:
+                        o["wall"] = i
+                merged.append({"kind": "window", "wall": i, "u0": 0.0, "u1": 0.0,
+                               "q0": [float(pa1[0]), float(pa1[1])], "q1": [float(near[0]), float(near[1])],
+                               "source": "drawing"})
+                segs.pop(j)
+                for o in merged:
+                    if o["wall"] > j:
+                        o["wall"] -= 1
+                found += 1
+                changed = True
+                break
+            if changed:
+                break
+    return segs, merged, found
+
+
+def vectorise(room, icon, image=None):
     wall = room == WALL
     openings_any = np.isin(icon, [WIN, DOOR])
     # typical wall thickness T (px) from the medial axis
@@ -497,6 +575,9 @@ def vectorise(room, icon):
     remap = {i: k for k, i in enumerate(segs_ok)}
     segs = [segs[i] for i in segs_ok]
     merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
+    segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
+    if n_win:
+        print("  windows read from the drawing (not marked by the model): {}".format(n_win))
 
     stairs = []
     for comp, st in _components(icon == STAIRS, 4 * T * T):

@@ -811,7 +811,7 @@ def main(img=None, room=None, icon=None, original=None):
         assert IMAGE, "Set IMAGE at the top of the cell to a floor-plan URL or file path"
         img, room, icon = predict(IMAGE)
         original = LAST_ORIGINAL
-    v = vectorise(room, icon)
+    v = vectorise(room, icon, original if original is not None else img)
     toks = ocr_full_res(img, original)
     print("OCR: {} dimension numbers, {} room sizes, {} labels".format(
         sum(t["kind"] == "num" for t in toks), sum(t["kind"] == "size" for t in toks),
