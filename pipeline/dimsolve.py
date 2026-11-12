@@ -49,13 +49,17 @@ def ocr_tokens(img_rgb, ocr=None):
         if size:
             toks.append({"kind": "size", "value": size, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
                          "text": txt.strip(), "raw": txt, "conf": float(conf)})
+        elif re.fullmatch(r"\s*\(\s*\d{1,3}\s*\)\s*", txt):       # room numbers '(10)' are not dimensions
+            toks.append({"kind": "label", "text": txt, "raw": txt, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
+                         "h": float(y1 - y0), "conf": float(conf)})
         elif nums and letters <= 1 and not re.search(r"[xX×]", txt):
             for m in nums:
                 f = (m.start() + m.end()) / 2 / n
                 cx, cy = (x0 + f * (x1 - x0), (y0 + y1) / 2) if not vertical_text else \
                          ((x0 + x1) / 2, y1 - f * (y1 - y0))
                 toks.append({"kind": "num", "value": float(m.group().replace(",", ".")), "x": cx, "y": cy,
-                             "text": m.group(), "raw": txt, "conf": float(conf)})
+                             "text": m.group(), "raw": txt, "conf": float(conf),
+                             "h": float(min(y1 - y0, x1 - x0) if vertical_text else (y1 - y0))})
         elif letters >= 2:
             toks.append({"kind": "label", "text": txt, "raw": txt, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
                          "h": float(min(y1 - y0, x1 - x0) if vertical_text else (y1 - y0)), "conf": float(conf)})

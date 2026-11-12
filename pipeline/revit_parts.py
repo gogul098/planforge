@@ -527,6 +527,8 @@ def _render3d(ax3, scene, title):
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     tris, cols = [], []
     for name, g in scene.geometry.items():
+        if name == "ground" or name not in COLORS:
+            continue                      # a flat sheet hides the walls in this simple renderer
         t = g.vertices[g.faces][:, :, [0, 2, 1]] * [1, -1, 1]
         tris.append(t); cols.append(np.tile(np.array(COLORS[name]) / 255.0, (len(t), 1)))
     tris, cols = np.vstack(tris), np.vstack(cols)
@@ -629,6 +631,93 @@ def ocr_full_res(img, original=None):
     return toks
 
 
+def dimension_line_scale(toks, original, img_w):
+    """Each written dimension sits next to its dimension line: measure that line on the drawing, at any angle
+    (21.34 along the top, 18.29 along a slanted side ...). The lengths vote for one scale.
+    Returns (metres per inference px, number agreeing, details) or (None, 0, details)."""
+    if original is None:
+        return None, 0, []
+    f = img_w / original.shape[1]                     # inference px per original px
+    g = original if original.ndim == 2 else cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    ink = (g < 140).astype(np.uint8)
+    thick = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((4, 4), np.uint8))
+    thin = (ink & (1 - cv2.dilate(thick, np.ones((3, 3), np.uint8)))) * 255   # dimension lines are thin
+    segs = cv2.HoughLinesP(thin, 1, np.pi / 720, threshold=30, minLineLength=25, maxLineGap=4)
+    if segs is None:
+        return None, 0, []
+    segs = segs.reshape(-1, 4).astype(float)
+    nums = [t for t in toks if t["kind"] == "num"]
+    if not nums:
+        return None, 0, []
+    unit = _unit_factor([t["value"] for t in nums])
+    cands = []
+    for t in nums:
+        val = t["value"] * unit
+        if not (0.3 <= val <= 200) or re.match(r"^\s*[.,]", t.get("raw", "")):
+            continue                                       # '.29m' = a dimension OCR cut in half
+        cx, cy = t["x"] / f, t["y"] / f
+        h = max(t.get("h", 10.0) / f, 6.0)
+        best = None
+        for x0, y0, x1, y1 in segs:
+            d = np.array([x1 - x0, y1 - y0]); L = np.linalg.norm(d)
+            if L < 3 * h:
+                continue
+            d /= L
+            nrm = np.array([-d[1], d[0]])
+            rel = np.array([cx - x0, cy - y0])
+            perp = abs(rel @ nrm)
+            if perp > 2.5 * h:
+                continue
+            # the whole straight line through this piece: merge collinear pieces (text often breaks the line)
+            ang = np.arctan2(d[1], d[0])
+            same = []
+            for q in segs:
+                e = np.array([q[2] - q[0], q[3] - q[1]]); M = np.linalg.norm(e)
+                if M < 1e-6:
+                    continue
+                if abs(np.sin(np.arctan2(e[1], e[0]) - ang)) > 0.02:
+                    continue
+                if abs(np.array([q[0] - x0, q[1] - y0]) @ nrm) > 2.5 or abs(np.array([q[2] - x0, q[3] - y0]) @ nrm) > 2.5:
+                    continue
+                same.append(q)
+            iv = sorted(tuple(sorted((np.array([q[0] - x0, q[1] - y0]) @ d, np.array([q[2] - x0, q[3] - y0]) @ d)))
+                        for q in same)
+            # merge overlapping pieces; gaps up to the text size are the text breaking the line
+            tc = rel @ d
+            lo = hi = None
+            runs = [list(iv[0])]
+            for u0, u1 in iv[1:]:
+                if u0 <= runs[-1][1] + 4 * h:
+                    runs[-1][1] = max(runs[-1][1], u1)
+                else:
+                    runs.append([u0, u1])
+            for r0, r1 in runs:
+                if r0 - h <= tc <= r1 + h:
+                    lo, hi = r0, r1
+            if lo is None:
+                continue
+            length = hi - lo
+            if length < 3 * h or not (lo + 0.15 * length <= tc <= hi - 0.15 * length):
+                continue                                   # the number is written at the middle of its line
+            if best is None or perp < best[0]:
+                best = (perp, length)
+        if best:
+            cands.append((val / best[1] / f, t.get("raw", t["text"]), val, best[1]))
+    if len(cands) < 3:
+        return None, 0, cands
+    sc = np.array([c[0] for c in cands])
+    if len(cands) >= 3:
+        med = np.median(sc)
+        cands = [c for c in cands if 1 / 1.6 <= c[0] / med <= 1.6]   # drop misreads (wrong number for a line)
+        sc = np.array([c[0] for c in cands])
+    agree = [(np.abs(sc / x - 1) < 0.04).sum() for x in sc]
+    i = int(np.argmax(agree))
+    group = sc[np.abs(sc / sc[i] - 1) < 0.04]
+    if len(group) < 3:
+        return None, len(group), cands
+    return float(np.median(group)), len(group), cands
+
+
 def uniform_sol(v, s, source, report=()):
     """One scale for the whole sheet (no per-grid corrections)."""
     gx = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "v"}) or [0.0, 1.0]
@@ -723,10 +812,35 @@ def main(img=None, room=None, icon=None, original=None):
                                              "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
                "report": [], "fallback": True}
     plan = build_plan(v, sol, toks, room)
+    # every dimension measured on its own dimension line (any angle): if they agree with each other but not
+    # with the solved scale, the solver matched dimensions to the wrong walls -> use theirs
+    sv, n_dl, dl = dimension_line_scale(toks, original, img.shape[1])
+    dl_ok = sv is not None
+    if dl_ok and abs(plan["mapping"]["scale_m_per_px"] / sv - 1) > 0.04 and not METERS_PER_PIXEL and not BUILDING_WIDTH_M:
+        print("  scale check: {} dimension lines agree on a scale {:+.0f}% from the solved one -> corrected".format(
+            n_dl, 100 * (sv / plan["mapping"]["scale_m_per_px"] - 1)))
+        sol = uniform_sol(v, sv, "dimension lines measured on the drawing ({} agree)".format(n_dl),
+                          (sol or {}).get("report", []))
+        plan = build_plan(v, sol, toks, room)
+    elif not dl_ok and dl:
+        # the drawing is not to scale (its dimensions contradict each other). Keep the solved scale only if it
+        # is believable; otherwise use the longest overall dimension, which fixes the building size
+        sc = [c[0] for c in dl]
+        spread = 100 * (max(sc) / min(sc) - 1)
+        tm = float(np.median([sg["t"] for sg in v["walls"]])) * plan["mapping"]["scale_m_per_px"]
+        n_solved = plan["precision"]["dimensions_exact"]
+        print("  scale check: the plan's dimensions disagree by up to {:.0f}% - the drawing is not to scale".format(spread))
+        if (tm < 0.08 or tm > 0.6 or n_solved < 3) and not METERS_PER_PIXEL and not BUILDING_WIDTH_M:
+            longest = max(dl, key=lambda c: c[2])
+            print("  scale check: using the longest dimension ({} m) for the building size".format(longest[2]))
+            sol = uniform_sol(v, longest[0], "longest written dimension {} m (dimensions disagree by up to {:.0f}%)".format(
+                longest[2], spread), (sol or {}).get("report", []))
+            plan = build_plan(v, sol, toks, room)
+        dl_ok = True                                       # do not let room sizes override this
     # written room sizes vs drawn room areas: if they disagree with the scale the dimensions gave (e.g. only a
     # couple of small dimensions were read and matched to the wrong walls), trust the rooms (two passes,
     # because wall-thickness snapping depends on the scale)
-    for _ in range(2):
+    for _ in range(0 if dl_ok else 2):
         k, n_rooms = room_mask_scale(room, icon, toks, plan["mapping"]["scale_m_per_px"])
         if k is None:
             k, n_rooms = room_size_scale(plan, toks)

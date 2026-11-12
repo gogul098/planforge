@@ -274,9 +274,9 @@ def _wall_angles(full, T):
     out = []
     total = sm.sum()
     for i in np.argsort(-sm):
-        if sm[i] < 0.06 * total:
+        if sm[i] < 0.04 * total:
             break
-        if min(i, 90 - i) <= 6 or any(min(abs(i - j), 90 - abs(i - j)) <= 8 for j in out):
+        if min(i, 90 - i) <= 3 or any(min(abs(i - j), 90 - abs(i - j)) <= 3 for j in out):
             continue                        # the image axes, or next to an angle already taken
         # refine to a weighted mean inside the peak
         ks = [(i + k) % 90 for k in range(-3, 4)]
@@ -386,8 +386,14 @@ def vectorise(room, icon):
     for sg in segs:
         cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                  1, max(1, int(round(sg["t"] + T))))
-    angles = _wall_angles(full & ~(claimed > 0), T)
-    for ang in angles:
+    done_angles = []
+    for _round_ in range(6):                                   # find angles in what is still unexplained
+        angles = [a_ for a_ in _wall_angles(full & ~(claimed > 0), T)
+                  if all(min(abs(a_ - b_), 90 - abs(a_ - b_)) > 2 for b_ in done_angles)]
+        if not angles:
+            break
+        ang = angles[0]
+        done_angles.append(ang)
         M, Mi, size = _rot_frame(full.shape, ang)
         rest = (full & ~(claimed > 0)).astype(np.uint8)
         rf = cv2.warpAffine(rest, M, size, flags=cv2.INTER_NEAREST) > 0
@@ -410,8 +416,30 @@ def vectorise(room, icon):
             segs.append(sg)
             cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"] + T))))
-    segs = _join_across(segs, T)
-    segs_ok = [i for i, sg in enumerate(segs) if np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1]) >= 2 * T]
+    # short h / v pieces that lie inside an angled wall are its staircase fragments, not walls of their own
+    if done_angles:
+        band = np.zeros(full.shape, np.uint8)
+        for sg in segs:
+            if sg["frame"] != 0:
+                cv2.line(band, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                         1, max(1, int(round(sg["t"] + T))))
+        for sg in segs:
+            if sg["frame"] != 0:
+                continue
+            L = np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
+            if L >= 8 * T:
+                continue
+            m = np.zeros(full.shape, np.uint8)
+            cv2.line(m, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
+                     1, max(1, int(round(sg["t"]))))
+            if m.sum() and (m & band).sum() / m.sum() > 0.5:
+                sg["drop"] = True
+    keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
+    kmap = {i: k for k, i in enumerate(keep_idx)}
+    merged = [dict(o, wall=kmap[o["wall"]]) for o in merged if o["wall"] in kmap]
+    segs = _join_across([segs[i] for i in keep_idx], T)
+    segs_ok = [i for i, sg in enumerate(segs) if not sg.get("drop") and
+               np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1]) >= 2 * T]
     if not segs_ok:
         raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
     remap = {i: k for k, i in enumerate(segs_ok)}
