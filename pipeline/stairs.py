@@ -243,10 +243,17 @@ def _chain_flights(infos):
         main["direction"] = "towards the landing and the upper flights"
         top_main = main["centre"] + main["d"] * main["run"] / 2
         for u in uppers:
-            lo, hi = ends(u)
-            if np.linalg.norm(hi - top_main) < np.linalg.norm(lo - top_main):
+            # an upper flight climbs AWAY from the landing: on a split stair the wings turn sideways,
+            # left one to the left, right one to the right
+            off = u["centre"] - top_main
+            nrm = np.array([-u["d"][1], u["d"][0]])
+            if abs(np.dot(nrm, off)) > abs(np.dot(u["d"], off)) and len(uppers) > 1:
+                u["d"] = nrm                               # the flight runs across what was taken as its width
+                u["run"], u["width"] = u["width"], u["run"]
+                u["width_low"] = u["width_high"] = u["width"]
+            if np.dot(u["d"], off) < 0:
                 u["d"] = -u["d"]                          # upper flights start at the landing
-            u["direction"] = "from the landing up"
+            u["direction"] = "from the landing up, away from the main flight"
         n_up = max(u["n"] for u in uppers)                # parallel flights (split stair) climb together
         r = WALL_HEIGHT / (main["n"] + n_up)
         main.update(chain_base=0.0, chain_total=r * main["n"], chain_size=len(fl))
