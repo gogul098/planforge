@@ -14,6 +14,7 @@ header = '''# ===================== FLOOR PLAN -> EXACT 3D FOR REVIT ===========
 IMAGE = ""                    # floor-plan image URL or file path (clean scan/export, dimensions visible)
 HF_REPO = "floorplan-multitask-effb3-768"
 MAX_SIDE = 1280               # inference size (try 1536 for big/dense sheets)
+ROTATE_TTA = True             # also read the plan rotated so angled walls / doors lie flat (slower, x(1+angles))
 
 # --- scale: written dimensions are used automatically. Only if the plan has NO dimensions:
 METERS_PER_PIXEL = None
