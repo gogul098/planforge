@@ -12,3 +12,4 @@ plan_revit/
 *.safetensors
 *.ckpt
 checkpoints/
+pipeline/plan_to_revit.py
