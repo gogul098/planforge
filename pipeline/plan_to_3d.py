@@ -96,7 +96,8 @@ def load_model(force_check=False):
     net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
                    decoder_attention_type="scse")
     net.load_state_dict(ck["ema"]); net.to(dev).eval()
-    _MODEL.update(net=net, dev=dev, rev=rev)
+    info = "epoch {}, val score {:.3f}".format(ck.get("epoch", -1) + 1, ck.get("metrics", {}).get("score", float("nan")))
+    _MODEL.update(net=net, dev=dev, rev=rev, info=info)
     print("model loaded: revision", rev)
     return net, dev
 
@@ -151,7 +152,7 @@ def predict(image_src):
     icon = icon_p.argmax(0).astype(np.uint8)
     global LAST_ICON_PROB
     LAST_ICON_PROB = (icon_p / np.maximum(icon_p.sum(0, keepdims=True), 1e-6)).astype(np.float16)
-    print(f"model: epoch {ck['epoch'] + 1}, val score {ck['metrics']['score']:.3f}, image {w}x{h}, {dev}")
+    print(f"model: {_MODEL.get('info', '')}, image {w}x{h}, {dev}")
     return img, room, icon
 
 
