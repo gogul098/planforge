@@ -231,7 +231,13 @@ def build_stairs(v, toks, room, plan, original=None):
             continue                                                # too small for a stair -> false positive
         # kind: outside the building = entrance steps; L / U shaped stepped area inside = terrace
         out_frac = float(np.isin(room[oy:oy + h, ox:ox + w][comp], (0, 1)).mean())
-        outside = out_frac >= 0.4 or (footprint is not None and not footprint.contains(Point(*centre)))
+        # the building outline decides; the model's "outdoor" pixels only count right at the outline
+        # (an open lobby the model does not label as a room is still inside the building)
+        if footprint is not None:
+            pc = Point(*centre)
+            outside = (not footprint.contains(pc)) or (out_frac >= 0.6 and footprint.exterior.distance(pc) < 1.0)
+        else:
+            outside = out_frac >= 0.4
         kind = "entrance" if outside else ("terrace" if shape == "irregular" else "interior")
         # distance (model px) to the HIGH side of the stair
         wx0, wy0, wx1, wy1 = _window(room.shape, ox, oy, ox + w, oy + h, pad)

@@ -81,9 +81,15 @@ def build_plan(v, sol, toks, room):
     polys = [union] if union.geom_type == "Polygon" else list(union.geoms)
     main = max(polys, key=lambda p: p.area)
     # outline: close door/window-sized gaps (<= 2 m) between wall groups, keep the biggest piece
-    closed = union.buffer(1.0, join_style=2).buffer(-1.0, join_style=2)
-    cpolys = [closed] if closed.geom_type == "Polygon" else list(closed.geoms)
-    footprint = Polygon(max(cpolys, key=lambda p: p.area).exterior)
+    # close entrance / door gaps until one outline covers most of the building (open plans with big
+    # missing walls need a larger radius than a house with every door detected)
+    hull = union.convex_hull
+    for r in (1.0, 1.5, 2.0, 3.0):
+        closed = union.buffer(r, join_style=2).buffer(-r, join_style=2)
+        cpolys = [closed] if closed.geom_type == "Polygon" else list(closed.geoms)
+        footprint = Polygon(max(cpolys, key=lambda p: p.area).exterior)
+        if footprint.area >= 0.6 * hull.area:
+            break
     ring = footprint.exterior
     for w in walls:
         w["external"] = bool(LineString([w["start"], w["end"]]).distance(ring) <= w["thickness"] * 0.75)
@@ -141,7 +147,7 @@ def build_plan(v, sol, toks, room):
     # close door-sized gaps so rooms are closed regions; sizes relative to the wall thickness, so a
     # wrong first scale (fixed afterwards by the room-size check) does not drop every room
     tm = v["T"] * s
-    gap = 2.2 * tm
+    gap = 3.2 * tm                       # closes gaps up to ~1.5 m (single and double doors the model missed)
     shut = union.buffer(gap, join_style=2).buffer(-gap, join_style=2)
     spolys = [shut] if shut.geom_type == "Polygon" else list(shut.geoms)
     holes = [h for pg in spolys for h in pg.interiors]
