@@ -2224,6 +2224,101 @@ COLORS = {"wall": [235, 232, 225, 255], "door": [150, 95, 55, 255], "glass": [14
           "furniture": [176, 132, 92, 255], "plumbing": [240, 242, 246, 255], "appliance": [150, 155, 162, 255]}
 
 
+def fill_floor_gaps(plan, v, room):
+    """Checks the converted plan against the model before anything is built.
+    1. floor: every area the model calls room or wall is inside the building -> no empty patches
+       where a room is (the outline from the walls alone misses corners whose outer wall was lost).
+    2. a broken outer wall is carried on to the next wall, and rooms / notches it closes get floor."""
+    from shapely.geometry import Polygon, LineString, Point
+    from shapely.ops import unary_union
+    T = v["T"]
+    mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    # ---- 1. floor
+    bld = ((room >= 2) & (room <= 11)).astype(np.uint8)
+    k = int(2 * T) | 1
+    bld = cv2.morphologyEx(bld, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    n, lab, stt, _ = cv2.connectedComponentsWithStats(bld, 8)
+    floor = Polygon(plan["floor"]["polygon"]).buffer(0)
+    if n > 1:
+        big = 1 + int(np.argmax(stt[1:, cv2.CC_STAT_AREA]))
+        cs, _ = cv2.findContours((lab == big).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c = max(cs, key=cv2.contourArea)[:, 0, :].astype(float)
+        mpoly = Polygon([(float(mx(x)), float(my(y))) for x, y in c]).buffer(0).simplify(0.05)
+        gaps = mpoly.buffer(0).difference(floor).buffer(-0.3).buffer(0.3)     # thin slivers along walls are not gaps
+        gaps = [g for g in getattr(gaps, "geoms", [gaps]) if g.area > 1.0 and g.buffer(0.05).intersects(floor)]
+        new = unary_union([floor] + [g.buffer(0.05) for g in gaps])
+        if new.geom_type != "Polygon":
+            new = max(new.geoms, key=lambda g: g.area)
+        new = Polygon(new.exterior).simplify(0.03)
+        added = new.area - floor.area
+        if added > 0.5:
+            print("  floor check: floor filled where the model sees rooms but the wall outline left a gap (+{:.1f} m2)".format(added))
+            plan["floor"]["polygon"] = [[round(float(x), 4), round(float(y), 4)] for x, y in list(new.exterior.coords)[:-1]]
+            floor = new
+    # a broken outer wall: a wall end that stops in the open, with another wall ahead on the same line
+    # and the gap OUTSIDE the floor (so it is not a doorway) -> carry the wall on until it meets that wall
+    lines0 = [LineString([w["start"], w["end"]]) for w in plan["walls"]]
+    closed = 0
+    for i, w in enumerate(plan["walls"]):
+        a, b = np.array(w["start"], float), np.array(w["end"], float)
+        L = np.linalg.norm(b - a)
+        if L < 0.3:
+            continue
+        d = (b - a) / L
+        for end, sgn in (("end", 1), ("start", -1)):
+            p = b if sgn > 0 else a
+            if any(lines0[j].distance(Point(p)) < 0.3 for j in range(len(lines0)) if j != i):
+                continue                                          # already meets a wall
+            ray = LineString([p, p + d * sgn * 4.0])
+            hits = [(ray.intersection(lines0[j]), j) for j in range(len(lines0)) if j != i and ray.intersects(lines0[j])]
+            hits = [(Point(p).distance(h), h) for h, j in hits if h.geom_type == "Point"]
+            if not hits:
+                continue
+            dist_, h = min(hits, key=lambda t: t[0])
+            gap = LineString([p, (h.x, h.y)])
+            if dist_ > 0.3 and gap.difference(floor.buffer(-0.15)).length > 0.8 * gap.length:
+                w[end] = [round(h.x, 4), round(h.y, 4)]
+                lines0[i] = LineString([w["start"], w["end"]])
+                a, b = np.array(w["start"], float), np.array(w["end"], float)
+                closed += 1
+    if closed:
+        print("  floor check: {} broken outer wall(s) carried on to the next wall".format(closed))
+    # rooms closed by walls (door gaps bridged) belong to the building too
+    wl = unary_union([LineString([w["start"], w["end"]]).buffer(w["thickness"] / 2 + 0.5, cap_style=2, join_style=2) for w in plan["walls"]])
+    cells = [Polygon(r).buffer(0.45, join_style=2) for g in getattr(wl, "geoms", [wl]) for r in g.interiors]
+    cells = [c for c in cells if c.area > 1.0 and c.difference(floor).area > 0.5]
+    if cells:
+        new = unary_union([floor] + cells)
+        if new.geom_type != "Polygon":
+            new = max(new.geoms, key=lambda g: g.area)
+        new = Polygon(new.exterior).simplify(0.03)
+        print("  floor check: {} room(s) closed by walls were outside the floor -> floor added (+{:.1f} m2)".format(
+            len(cells), new.area - floor.area))
+        plan["floor"]["polygon"] = [[round(float(x), 4), round(float(y), 4)] for x, y in list(new.exterior.coords)[:-1]]
+        floor = new
+
+
+    # notches in the outline whose open side is closed by a wall are rooms too
+    wl2 = unary_union([LineString([w["start"], w["end"]]).buffer(w["thickness"] / 2 + 0.5) for w in plan["walls"]])
+    notch = floor.convex_hull.difference(floor.buffer(0.02))
+    added = []
+    for g in getattr(notch, "geoms", [notch]):
+        if g.area < 1.0:
+            continue
+        mouth = g.exterior.difference(floor.buffer(0.1))
+        if mouth.length > 0.3 and mouth.intersection(wl2).length > 0.7 * mouth.length:
+            added.append(g.buffer(0.03, join_style=2))
+    if added:
+        new = unary_union([floor] + added)
+        if new.geom_type != "Polygon":
+            new = max(new.geoms, key=lambda g: g.area)
+        new = Polygon(new.exterior).simplify(0.03)
+        print("  floor check: {} notch(es) closed off by walls were left empty -> floor added (+{:.1f} m2)".format(
+            len(added), new.area - floor.area))
+        plan["floor"]["polygon"] = [[round(float(x), 4), round(float(y), 4)] for x, y in list(new.exterior.coords)[:-1]]
+        floor = new
+
+
 def open_ground(plan):
     """Steps that go down lead to an open space at ground level.
     For each group of down-steps: find the side that faces the nearest walls (that is the low side),
@@ -2886,6 +2981,7 @@ def main(img=None, room=None, icon=None, original=None):
         sol = uniform_sol(v, s_new, "room sizes written on the plan ({} rooms)".format(n_rooms),
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
+    fill_floor_gaps(plan, v, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
