@@ -1,9 +1,9 @@
-name: Engine -> Azure Container Apps
+name: Engine -> Azure Web App
 
-# On every push to main: build the engine image, push it to GitHub's registry, and switch the
-# Azure container app to it (a new revision). Login is passwordless: a user-assigned managed identity
-# with a federated credential for this repo's main branch (secrets AZURE_CLIENT_ID / AZURE_TENANT_ID /
-# AZURE_SUBSCRIPTION_ID - IDs only, nothing secret). Model weights are never in the image.
+# On every push to main: build the engine image, push it to GitHub's registry, and deploy that exact
+# image to the Azure Web App. Deploy uses the Web App's publish profile (secret AZURE_WEBAPP_PUBLISH_PROFILE)
+# and the app name (variable AZURE_WEBAPP_NAME). Without them the image is only built.
+# Model weights are never in the image: the app loads them from Azure Blob Storage (copied from HF on release).
 on:
   push:
     branches: [main]
@@ -12,9 +12,7 @@ on:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/planforge-engine
-  RG: planforge-rg
-  APP: planforge
-  HAS_AZ: ${{ secrets.AZURE_CLIENT_ID != '' }}
+  HAS_AZ: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE != '' }}
 
 jobs:
   build-deploy:
@@ -22,7 +20,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
       - name: Guard - no model weights in the image
@@ -40,21 +37,13 @@ jobs:
           push: true
           provenance: false
           tags: ${{ env.IMAGE }}:latest,${{ env.IMAGE }}:${{ github.sha }}
-      - name: Azure login (managed identity, no password)
+      - name: Deploy to the Web App
         if: env.HAS_AZ == 'true'
-        uses: azure/login@v2
+        uses: azure/webapps-deploy@v3
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: Deploy new revision
-        if: env.HAS_AZ == 'true'
-        run: |
-          az extension add --name containerapp --upgrade -y >/dev/null 2>&1
-          az containerapp update -n $APP -g $RG \
-            --image $IMAGE:${{ github.sha }} \
-            --revision-suffix r${GITHUB_SHA::7} -o none
-          echo "Deployed $IMAGE:${{ github.sha }} to https://$(az containerapp show -n $APP -g $RG --query properties.configuration.ingress.fqdn -o tsv)"
-      - name: Not deployed (Azure IDs not set yet)
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          images: ${{ env.IMAGE }}:${{ github.sha }}
+      - name: Not deployed (publish profile not set yet)
         if: env.HAS_AZ != 'true'
-        run: echo "Image built and pushed. Add AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID secrets to deploy automatically."
+        run: echo "Image built and pushed. Add the AZURE_WEBAPP_PUBLISH_PROFILE secret and AZURE_WEBAPP_NAME variable to deploy automatically."

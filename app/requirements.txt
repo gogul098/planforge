@@ -16,3 +16,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 ezdxf
+azure-storage-blob

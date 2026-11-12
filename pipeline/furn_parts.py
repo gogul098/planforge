@@ -87,19 +87,17 @@ def filter_by_room(items, room, T):
     return keep, dropped
 
 
+_YOLO = {}
+
+
 def detector_furniture(img, mpp):
     """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
     if not FURNITURE_REPO:
         return []
     try:
-        from huggingface_hub import HfApi, hf_hub_download
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            from kaggle_secrets import UserSecretsClient
-            token = UserSecretsClient().get_secret("HF_TOKEN")
-        repo = "{}/{}".format(HfApi(token=token).whoami()["name"], FURNITURE_REPO)
-        w = hf_hub_download(repo, "checkpoints/best.pt", token=token)
-        meta = json.load(open(hf_hub_download(repo, "furniture_meta.json", token=token)))
+        _, fp = model_files(FURNITURE_REPO, ["checkpoints/best.pt", "furniture_meta.json"])
+        w = fp["checkpoints/best.pt"]
+        meta = json.load(open(fp["furniture_meta.json"]))
     except Exception as e:
         print("furniture detector not available yet ({}): using fixtures from the floor-plan model only".format(
             type(e).__name__))
@@ -107,7 +105,9 @@ def detector_furniture(img, mpp):
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
     from ultralytics import YOLO
-    dets = detect_furniture(YOLO(w), img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
+    if _YOLO.get("w") != w:                       # load once, reload only when a new release arrives
+        _YOLO.update(w=w, net=YOLO(w))
+    dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
                             conf=FURNITURE_LOW_CONF)          # weak hits are checked against the rooms later
     return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
             for d in dets if d["cls"] in FURN_SPEC]

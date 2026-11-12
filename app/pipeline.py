@@ -62,9 +62,16 @@ def _net_probs(net, dev, img):
             torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float32))
 
 
-_MODEL = {"net": None, "dev": None, "rev": None, "checked": 0.0}
-MODEL_REVISION = os.environ.get("PLANFORGE_MODEL_REV", "prod")   # HF tag/branch that is live; falls back to main
-MODEL_CHECK_S = 600                                               # look for a new release at most every 10 min
+# ----------------------------------------------------------------------------- model store
+# Where the weights come from:
+#  * Kaggle: a local checkpoint, or Hugging Face directly.
+#  * Server (AZURE_STORAGE_CONNECTION_STRING set): Azure Blob Storage is the copy the app loads from.
+#    On every cold start the app asks Hugging Face which version the release tag points at; if Blob holds an
+#    older one, the new files are copied HF -> Blob once, then loaded from Blob. If Hugging Face cannot be
+#    reached, the version already in Blob is used. Within a running instance the files stay on local disk.
+MODEL_CONTAINER = os.environ.get("PLANFORGE_MODEL_CONTAINER", "models")
+MODEL_CACHE = os.environ.get("PLANFORGE_MODEL_CACHE", "/tmp/planforge-models")
+_STORE_SEEN = {}                                   # repo -> (version, {file: local path}) for this process
 
 
 def _hf_token():
@@ -75,14 +82,77 @@ def _hf_token():
     return token
 
 
+def model_files(repo_name, files, revision=None, recheck=False):
+    """Return (version, {file: local path}) for the given files of a Hugging Face model repo."""
+    if repo_name in _STORE_SEEN and not recheck:
+        return _STORE_SEEN[repo_name]
+    from huggingface_hub import HfApi, hf_hub_download
+    rev = revision or MODEL_REVISION
+    conn = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    sha, repo, token = None, None, None
+    try:                                           # which version is released on Hugging Face?
+        token = _hf_token()
+        api = HfApi(token=token)
+        repo = "{}/{}".format(api.whoami()["name"], repo_name)
+        try:
+            sha = api.model_info(repo, revision=rev).sha
+        except Exception:
+            sha = api.model_info(repo, revision="main").sha
+    except Exception as e:
+        print("Hugging Face not reachable ({}): using the stored model".format(type(e).__name__))
+    if not conn:                                   # no Blob configured: plain Hugging Face (Kaggle, local)
+        if sha is None:
+            raise RuntimeError("model unavailable: Hugging Face unreachable and no Blob store configured")
+        out = (sha, {f: hf_hub_download(repo, f, revision=sha, token=token) for f in files})
+        _STORE_SEEN[repo_name] = out
+        return out
+    from azure.storage.blob import BlobServiceClient
+    cont = BlobServiceClient.from_connection_string(conn).get_container_client(MODEL_CONTAINER)
+    try:
+        cont.create_container()
+    except Exception:
+        pass
+    vblob = cont.get_blob_client("{}/VERSION".format(repo_name))
+    try:
+        stored = vblob.download_blob().readall().decode().strip()
+    except Exception:
+        stored = None
+    if sha and sha != stored:                      # new release: copy it into Blob once
+        print("new model release {} for {} (Blob had {}): copying to Blob".format(sha[:8], repo_name, (stored or "none")[:8]))
+        for f in files:
+            src = hf_hub_download(repo, f, revision=sha, token=token)
+            with open(src, "rb") as fh:
+                cont.get_blob_client("{}/{}/{}".format(repo_name, sha, f)).upload_blob(fh, overwrite=True)
+        vblob.upload_blob(sha.encode(), overwrite=True)
+        stored = sha
+    if stored is None:
+        raise RuntimeError("model unavailable: nothing in Blob and Hugging Face unreachable")
+    local = {}
+    for f in files:                                # Blob -> local disk (same region: seconds)
+        dst = os.path.join(MODEL_CACHE, repo_name, stored, f)
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst + ".part", "wb") as fh:
+                cont.get_blob_client("{}/{}/{}".format(repo_name, stored, f)).download_blob().readinto(fh)
+            os.replace(dst + ".part", dst)
+        local[f] = dst
+    out = (stored, local)
+    _STORE_SEEN[repo_name] = out
+    return out
+
+
+_MODEL = {"net": None, "dev": None, "rev": None, "checked": 0.0}
+MODEL_REVISION = os.environ.get("PLANFORGE_MODEL_REV", "prod")   # HF tag/branch that is live; falls back to main
+MODEL_CHECK_S = float(os.environ.get("PLANFORGE_MODEL_CHECK_S", "0"))  # 0 = check for a new release only at (cold) start
+
+
 def load_model(force_check=False):
     """The model is loaded once and kept in memory. Every MODEL_CHECK_S seconds (between plans) the
     Hugging Face release tag is checked; only if it moved is the new checkpoint downloaded and swapped in.
     If Hugging Face cannot be reached, the model already loaded keeps working."""
     import time, torch, segmentation_models_pytorch as smp
-    from huggingface_hub import HfApi, hf_hub_download
     now = time.time()
-    if _MODEL["net"] is not None and not force_check and now - _MODEL["checked"] < MODEL_CHECK_S:
+    if _MODEL["net"] is not None and not force_check and (MODEL_CHECK_S <= 0 or now - _MODEL["checked"] < MODEL_CHECK_S):
         return _MODEL["net"], _MODEL["dev"]
     _MODEL["checked"] = now
     local = "/kaggle/working/checkpoints/best.pt"
@@ -90,24 +160,15 @@ def load_model(force_check=False):
         ckpt, rev = local, "local"
     else:
         try:
-            token = _hf_token()
-            api = HfApi(token=token)
-            repo = f"{api.whoami()['name']}/{HF_REPO}"
-            rev = MODEL_REVISION
-            try:
-                sha = api.model_info(repo, revision=rev).sha
-            except Exception:
-                rev = "main"
-                sha = api.model_info(repo, revision=rev).sha
-            if _MODEL["net"] is not None and sha == _MODEL["rev"]:
-                return _MODEL["net"], _MODEL["dev"]               # no new release
-            ckpt = hf_hub_download(repo, "checkpoints/best.pt", revision=sha, token=token)
-            rev = sha
+            rev, paths = model_files(HF_REPO, ["checkpoints/best.pt"], recheck=_MODEL["net"] is not None)
         except Exception as e:
             if _MODEL["net"] is not None:
                 print("model update check failed ({}); keeping the loaded model".format(e))
                 return _MODEL["net"], _MODEL["dev"]
             raise
+        if _MODEL["net"] is not None and rev == _MODEL["rev"]:
+            return _MODEL["net"], _MODEL["dev"]
+        ckpt = paths["checkpoints/best.pt"]
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
@@ -1196,19 +1257,17 @@ def filter_by_room(items, room, T):
     return keep, dropped
 
 
+_YOLO = {}
+
+
 def detector_furniture(img, mpp):
     """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
     if not FURNITURE_REPO:
         return []
     try:
-        from huggingface_hub import HfApi, hf_hub_download
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            from kaggle_secrets import UserSecretsClient
-            token = UserSecretsClient().get_secret("HF_TOKEN")
-        repo = "{}/{}".format(HfApi(token=token).whoami()["name"], FURNITURE_REPO)
-        w = hf_hub_download(repo, "checkpoints/best.pt", token=token)
-        meta = json.load(open(hf_hub_download(repo, "furniture_meta.json", token=token)))
+        _, fp = model_files(FURNITURE_REPO, ["checkpoints/best.pt", "furniture_meta.json"])
+        w = fp["checkpoints/best.pt"]
+        meta = json.load(open(fp["furniture_meta.json"]))
     except Exception as e:
         print("furniture detector not available yet ({}): using fixtures from the floor-plan model only".format(
             type(e).__name__))
@@ -1216,7 +1275,9 @@ def detector_furniture(img, mpp):
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
     from ultralytics import YOLO
-    dets = detect_furniture(YOLO(w), img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
+    if _YOLO.get("w") != w:                       # load once, reload only when a new release arrives
+        _YOLO.update(w=w, net=YOLO(w))
+    dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
                             conf=FURNITURE_LOW_CONF)          # weak hits are checked against the rooms later
     return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
             for d in dets if d["cls"] in FURN_SPEC]
