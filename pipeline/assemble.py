@@ -50,6 +50,7 @@ from skimage.morphology import skeletonize
 
 WALL, WIN, DOOR, STAIRS = 2, 1, 2, 11   # room-head wall id; icon-head ids
 LAST_ORIGINAL = None
+LAST_ICON_PROB = None
 
 
 '''

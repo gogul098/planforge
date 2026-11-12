@@ -41,6 +41,7 @@ from skimage.morphology import skeletonize
 
 WALL, WIN, DOOR, STAIRS = 2, 1, 2, 11   # room-head wall id; icon-head ids
 LAST_ORIGINAL = None
+LAST_ICON_PROB = None
 
 
 # ----------------------------------------------------------------------------- 1. model inference
@@ -87,6 +88,8 @@ def predict(image_src):
     out = out[0, :, :h, :w]
     room = out[:12].argmax(0).cpu().numpy().astype(np.uint8)
     icon = out[12:24].argmax(0).cpu().numpy().astype(np.uint8)
+    global LAST_ICON_PROB
+    LAST_ICON_PROB = torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float16)   # for diagnostics
     print(f"model: epoch {ck['epoch'] + 1}, val score {ck['metrics']['score']:.3f}, image {w}x{h}, {dev}")
     return img, room, icon
 
