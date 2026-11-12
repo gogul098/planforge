@@ -62,22 +62,65 @@ def _net_probs(net, dev, img):
             torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float32))
 
 
-def predict(image_src):
-    import urllib.request, torch, segmentation_models_pytorch as smp
+_MODEL = {"net": None, "dev": None, "rev": None, "checked": 0.0}
+MODEL_REVISION = os.environ.get("PLANFORGE_MODEL_REV", "prod")   # HF tag/branch that is live; falls back to main
+MODEL_CHECK_S = 600                                               # look for a new release at most every 10 min
+
+
+def _hf_token():
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        from kaggle_secrets import UserSecretsClient
+        token = UserSecretsClient().get_secret("HF_TOKEN")
+    return token
+
+
+def load_model(force_check=False):
+    """The model is loaded once and kept in memory. Every MODEL_CHECK_S seconds (between plans) the
+    Hugging Face release tag is checked; only if it moved is the new checkpoint downloaded and swapped in.
+    If Hugging Face cannot be reached, the model already loaded keeps working."""
+    import time, torch, segmentation_models_pytorch as smp
     from huggingface_hub import HfApi, hf_hub_download
-    ckpt = "/kaggle/working/checkpoints/best.pt"
-    if not os.path.exists(ckpt):
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            from kaggle_secrets import UserSecretsClient
-            token = UserSecretsClient().get_secret("HF_TOKEN")
-        repo = f"{HfApi(token=token).whoami()['name']}/{HF_REPO}"
-        ckpt = hf_hub_download(repo, "checkpoints/best.pt", token=token)
+    now = time.time()
+    if _MODEL["net"] is not None and not force_check and now - _MODEL["checked"] < MODEL_CHECK_S:
+        return _MODEL["net"], _MODEL["dev"]
+    _MODEL["checked"] = now
+    local = "/kaggle/working/checkpoints/best.pt"
+    if os.path.exists(local):
+        ckpt, rev = local, "local"
+    else:
+        try:
+            token = _hf_token()
+            api = HfApi(token=token)
+            repo = f"{api.whoami()['name']}/{HF_REPO}"
+            rev = MODEL_REVISION
+            try:
+                sha = api.model_info(repo, revision=rev).sha
+            except Exception:
+                rev = "main"
+                sha = api.model_info(repo, revision=rev).sha
+            if _MODEL["net"] is not None and sha == _MODEL["rev"]:
+                return _MODEL["net"], _MODEL["dev"]               # no new release
+            ckpt = hf_hub_download(repo, "checkpoints/best.pt", revision=sha, token=token)
+            rev = sha
+        except Exception as e:
+            if _MODEL["net"] is not None:
+                print("model update check failed ({}); keeping the loaded model".format(e))
+                return _MODEL["net"], _MODEL["dev"]
+            raise
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
                    decoder_attention_type="scse")
     net.load_state_dict(ck["ema"]); net.to(dev).eval()
+    _MODEL.update(net=net, dev=dev, rev=rev)
+    print("model loaded: revision", rev)
+    return net, dev
+
+
+def predict(image_src):
+    import urllib.request
+    net, dev = load_model()
     if image_src.startswith("http"):
         req = urllib.request.Request(image_src, headers={"User-Agent": "Mozilla/5.0"})
         img = cv2.imdecode(np.frombuffer(urllib.request.urlopen(req, timeout=60).read(), np.uint8),

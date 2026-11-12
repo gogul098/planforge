@@ -32,6 +32,17 @@ OUT_FILES = ("plan.json", "model.ifc", "model.glb", "model_faithful.glb", "previ
 
 app = FastAPI(title="PlanForge")
 
+
+@app.on_event("startup")
+def _warm():
+    """Load the model once when the container starts, so no request waits for the download."""
+    def go():
+        try:
+            P.load_model(force_check=True)
+        except Exception as e:
+            print("model preload failed (will retry on first plan):", e)
+    threading.Thread(target=go, daemon=True).start()
+
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402  the website may be hosted elsewhere
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
