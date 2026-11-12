@@ -257,6 +257,94 @@ def _chain_flights(infos):
             f_["warnings"] = [w_ for w_ in f_["warnings"] if not w_.startswith("direction not marked")]
 
 
+def drawn_step_regions(original, shape, have_px, wall_px, T):
+    """Steps the model did not mark, read from the drawing: 4+ parallel thin lines, evenly spaced about a tread
+    apart, overlapping each other (stepped seating, sunken areas, unmarked flights).
+    Returns stair entries like vectorise() makes, in model px."""
+    if original is None:
+        return []
+    g = original if original.ndim == 2 else cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
+    k = g.shape[1] / shape[1]                                  # drawing px per model px
+    ink = (g < 140).astype(np.uint8)
+    thick = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((4, 4), np.uint8))
+    thin = (ink & (1 - cv2.dilate(thick, np.ones((3, 3), np.uint8)))) * 255
+    segs = cv2.HoughLinesP(thin, 1, np.pi / 360, 25, minLineLength=int(max(20, 2.5 * T * k)), maxLineGap=3)
+    if segs is None:
+        return []
+    segs = segs.reshape(-1, 4).astype(float)
+    ang = np.degrees(np.arctan2(segs[:, 3] - segs[:, 1], segs[:, 2] - segs[:, 0])) % 180
+    out, used = [], np.zeros(len(segs), bool)
+    model_px = have_px.copy()                                 # stairs the model marked
+    found_px = np.zeros(shape, bool)                          # stepped areas found here
+    for a0 in np.unique(np.round(ang / 3) * 3):
+        idx = np.where((np.abs(((ang - a0) + 90) % 180 - 90) <= 3) & ~used)[0]
+        if len(idx) < 4:
+            continue
+        d = np.array([np.cos(np.radians(a0)), np.sin(np.radians(a0))])
+        n = np.array([-d[1], d[0]])
+        # one entry per drawn line: merge Hough duplicates (same offset, overlapping)
+        lines_ = []
+        for i in sorted(idx, key=lambda i: (segs[i, :2] @ n)):
+            off = float(((segs[i, :2] + segs[i, 2:]) / 2) @ n)
+            u0, u1 = sorted([float(segs[i, :2] @ d), float(segs[i, 2:] @ d)])
+            for L_ in lines_:
+                if abs(L_[0] - off) <= 2.5 and min(L_[2], u1) - max(L_[1], u0) > -3:
+                    L_[1], L_[2] = min(L_[1], u0), max(L_[2], u1)
+                    break
+            else:
+                lines_.append([off, u0, u1])
+        lines_.sort()
+        lo_s, hi_s = 0.6 * T * k, 2.6 * T * k
+        i = 0
+        while i < len(lines_) - 3:
+            run = [lines_[i]]
+            for L_ in lines_[i + 1:]:
+                gap = L_[0] - run[-1][0]
+                ov = min(L_[2], run[-1][2]) - max(L_[1], run[-1][1])
+                if gap < lo_s * 0.5:
+                    continue                                    # a double line, not the next tread
+                ok_ov = ov >= 0.5 * min(L_[2] - L_[1], run[-1][2] - run[-1][1])
+                med_len = float(np.median([q[2] - q[1] for q in run]))
+                ok_ov = ok_ov and 0.4 * med_len <= (L_[2] - L_[1]) <= 2.5 * med_len   # tread lines, not dimensions
+                if len(run) >= 2:
+                    med = float(np.median(np.diff([q[0] for q in run])))
+                    one = abs(gap - med) <= 0.35 * med
+                    two = abs(gap - 2 * med) <= 0.35 * med       # the line finder missed one tread line
+                    if ok_ov and (one or two):
+                        run.append(L_)
+                        continue
+                    if gap > 2.5 * med:
+                        break
+                    continue
+                if lo_s <= gap <= hi_s and ok_ov:
+                    run.append(L_)
+                elif gap > hi_s:
+                    break
+            if len(run) >= 4:
+                pts = []
+                for off, u0, u1 in run:
+                    pts += [d * u0 + n * off, d * u1 + n * off]
+                hull = cv2.convexHull(np.array(pts, np.float32) / k)[:, 0]
+                m = np.zeros(shape, np.uint8)
+                cv2.fillPoly(m, [np.round(hull).astype(np.int32)], 1)
+                m = m > 0
+                area = m.sum()
+                # skip what the model already marked, and duplicates of an arm already found (the other arm
+                # of an L overlaps it only at the corner)
+                if area and (m & model_px).sum() < 0.3 * area and (m & found_px).sum() < 0.8 * area \
+                        and (m & wall_px).sum() < 0.25 * area:
+                    ys, xs = np.nonzero(m)
+                    x0, y0 = xs.min(), ys.min()
+                    out.append({"x0": float(x0), "y0": float(y0), "x1": float(xs.max() + 1), "y1": float(ys.max() + 1),
+                                "ox": int(x0), "oy": int(y0), "mask": m[y0:ys.max() + 1, x0:xs.max() + 1].copy(),
+                                "drawn": True, "n_lines": len(run), "line_dir": (float(d[0]), float(d[1]))})
+                    found_px = found_px | m
+                i += len(run)
+            else:
+                i += 1
+    return out
+
+
 def build_stairs(v, toks, room, plan, original=None):
     """Detected stair regions -> exact stairs, entrance steps and stepped areas (plan.json 'stairs' + 'levels')."""
     from shapely.geometry import Point, Polygon
@@ -272,11 +360,17 @@ def build_stairs(v, toks, room, plan, original=None):
     for st in v["stairs"]:
         if "mask" in st:
             stair_px[st["oy"]:st["oy"] + st["mask"].shape[0], st["ox"]:st["ox"] + st["mask"].shape[1]] |= st["mask"]
-    indoor = ~np.isin(room, (0, 1)) & (room != WALL) & ~stair_px
     walls_px = room == WALL
+    extra = drawn_step_regions(original, room.shape, stair_px, walls_px, v["T"])
+    if extra:
+        print("  steps read from the drawing (not marked by the model): {} areas".format(len(extra)))
+        for st in extra:
+            stair_px[st["oy"]:st["oy"] + st["mask"].shape[0], st["ox"]:st["ox"] + st["mask"].shape[1]] |= st["mask"]
+    all_st = list(v["stairs"]) + extra
+    indoor = ~np.isin(room, (0, 1)) & (room != WALL) & ~stair_px
 
     infos = []
-    for st in v["stairs"]:
+    for st in all_st:
         if "mask" not in st:
             continue
         comp, ox, oy = st["mask"], st["ox"], st["oy"]
@@ -310,7 +404,7 @@ def build_stairs(v, toks, room, plan, original=None):
             outside = (not footprint.contains(pc)) or (out_frac >= 0.6 and footprint.exterior.distance(pc) < 1.0)
         else:
             outside = out_frac >= 0.4
-        kind = "entrance" if outside else ("terrace" if shape == "irregular" else "interior")
+        kind = "entrance" if outside else ("terrace" if (shape == "irregular" or st.get("drawn")) else "interior")
         # distance (model px) to the HIGH side of the stair
         wx0, wy0, wx1, wy1 = _window(room.shape, ox, oy, ox + w, oy + h, pad)
         cx_px, cy_px = float(xs.mean() + ox), float(ys.mean() + oy)
@@ -356,7 +450,13 @@ def build_stairs(v, toks, room, plan, original=None):
             Dw = ndimage.distance_transform_edt(a == 0)
         D_crop = Dw[oy - wy0:oy - wy0 + h, ox - wx0:ox - wx0 + w]
         Dat = lambda e: Dw[int(np.clip(e[1] - wy0, 0, Dw.shape[0] - 1)), int(np.clip(e[0] - wx0, 0, Dw.shape[1] - 1))]
-        if kind != "interior":
+        if st.get("line_dir"):
+            # read from the drawing: the steps climb across their lines
+            ld = np.array(st["line_dir"]); nd = np.array([-ld[1], ld[0]])
+            cpx = np.array([cx_px, cy_px])
+            ext = 0.5 * max(h, w)
+            ends_px = [cpx - nd * ext, cpx + nd * ext]
+        elif kind != "interior":
             # the run is the axis that climbs: the pair of opposite edges with the biggest height difference
             # (entrance steps are often wider than deep, so the long side is not always the run)
             pairs = [[(bx[0] + bx[1]) / 2, (bx[2] + bx[3]) / 2], [(bx[1] + bx[2]) / 2, (bx[3] + bx[0]) / 2]]
@@ -405,6 +505,8 @@ def build_stairs(v, toks, room, plan, original=None):
             run, sources["run"] = rr[0], "written {}".format(rr[1])
         else:
             sources["run"] = "measured"
+        if counted is None and st.get("n_lines"):
+            counted = (max(2, st["n_lines"] - 1), None, None)    # tiers between the lines read from the drawing
         infos.append(dict(kind=kind, shape=shape, hull=hull_m, centre=centre, d=d, run=run, width=width,
                           width_low=width_low, width_high=width_high,
                           notes=notes, counted=counted, sources=sources, warnings=warnings, direction=direction,
@@ -458,10 +560,13 @@ def build_stairs(v, toks, room, plan, original=None):
                 i["n"] = 3
                 i["sources"]["risers"] = "assumed"
                 w.append("tiers could not be counted: 3 assumed")
-            base, total = 0.0, r * i["n"]
+            total = r * i["n"]
+            base = -total if STEPPED_AREAS == "down" else 0.0
             rsrc = "riser note" if "riser" in i["notes"] else "assumed {:.0f} mm per tier".format(r * 1000)
-            w.append("stepped area (seating / terraced floor): tier height {}; check".format(
-                "written" if "riser" in i["notes"] else "assumed"))
+            i["direction"] = ("goes DOWN towards the walls (sunken area, floor cut out)" if STEPPED_AREAS == "down"
+                              else "rises towards the walls (raised seating)")
+            w.append("stepped area going {}: tier height {}; check".format(
+                STEPPED_AREAS, "written" if "riser" in i["notes"] else "assumed"))
         n = int(i["n"])
         riser = total / n if n else 0.0
         if kind != "terrace" and not (0.10 <= riser <= 0.22):
@@ -493,7 +598,11 @@ def build_stairs(v, toks, room, plan, original=None):
         for j, p in enumerate(polys):
             if p is None:
                 continue
-            treads.append({"polygon": _poly_list(p), "z0": round(base, 4), "z1": round(base + riser * (j + 1), 4)})
+            if kind == "terrace" and STEPPED_AREAS == "down":
+                top = -riser * (j + 1)                         # first tier (atrium side) one step down
+            else:
+                top = base + riser * (j + 1)
+            treads.append({"polygon": _poly_list(p), "z0": round(base, 4), "z1": round(top, 4)})
         tread = i["run"] / blocks
         if kind != "terrace" and not (0.22 <= tread <= 0.45):
             w.append("tread works out to {:.0f} mm: check".format(tread * 1000))
@@ -515,7 +624,8 @@ def build_stairs(v, toks, room, plan, original=None):
             "width": round(i["width"], 4), "width_low": round(i["width_low"], 4),
             "width_high": round(i["width_high"], 4), "run": round(L, 4),
             "risers": n, "riser": round(riser, 4), "tread": round(tread, 4),
-            "base_z": round(base, 4), "top_z": round(base + total, 4),
+            "base_z": round(base, 4), "top_z": round(0.0 if (kind == "terrace" and STEPPED_AREAS == "down") else base + total, 4),
+            "sunken": bool(kind == "terrace" and STEPPED_AREAS == "down"),
             "direction": i["direction"],
             "sources": dict(i["sources"], rise=rsrc),
             "treads": treads, "warnings": w,

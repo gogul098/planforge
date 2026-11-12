@@ -32,6 +32,7 @@ SLAB, STAIR_RISE = 0.15, 0.175
 # --- stairs / entrance steps: written values on the plan always win; these fill the gaps
 PLINTH_HEIGHT = None          # floor level above ground (m), e.g. 0.45; None = from the plan
 STAIR_RISE_EXT = 0.15         # riser assumed for outside steps / stepped areas when nothing is written
+STEPPED_AREAS = "down"        # stepped areas (L / U steps, seating): "down" = sunken (floor cut out), "up" = raised
 OUT_DIR = "/kaggle/working/plan_revit"
 
 # --- furniture: fixtures from the floor-plan model + your trained furniture detector (if available)

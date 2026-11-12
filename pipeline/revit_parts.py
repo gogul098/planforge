@@ -84,7 +84,10 @@ def build_plan(v, sol, toks, room):
     # close entrance / door gaps until one outline covers most of the building (open plans with big
     # missing walls need a larger radius than a house with every door detected)
     hull = union.convex_hull
-    for r in (1.0, 1.5, 2.0, 3.0):
+    for r in (1.0, 1.5, 2.0, 3.0, 4.5, 6.0, None):
+        if r is None:                     # walls too broken to close: the convex outline of all walls
+            footprint = Polygon(hull.exterior)
+            break
         closed = union.buffer(r, join_style=2).buffer(-r, join_style=2)
         cpolys = [closed] if closed.geom_type == "Polygon" else list(closed.geoms)
         footprint = Polygon(max(cpolys, key=lambda p: p.area).exterior)
@@ -307,7 +310,12 @@ def build_glb(plan, path, extra=None):
     for cat, quad, z0, z1 in pieces(plan):
         vv, ff = prism(quad, z0, z1)
         parts.setdefault(cat, []).append(trimesh.Trimesh(vv, ff, process=False))
-    fl = trimesh.creation.extrude_polygon(Polygon([(x, -y) for x, y in plan["floor"]["polygon"]]), SLAB)
+    fpoly = Polygon([(x, -y) for x, y in plan["floor"]["polygon"]]).buffer(0)
+    for st in plan.get("stairs", []):
+        if st.get("sunken"):                          # leave the space for steps going down
+            fpoly = fpoly.difference(Polygon([(x, -y) for x, y in st["outline"]]).buffer(0))
+    fpieces = [fpoly] if fpoly.geom_type == "Polygon" else [q for q in getattr(fpoly, "geoms", []) if q.area > 0.05]
+    fl = trimesh.util.concatenate([trimesh.creation.extrude_polygon(q, SLAB) for q in fpieces])
     fl.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
     fl.apply_translation([0, -SLAB, 0])
     parts["floor"] = [fl]
@@ -899,6 +907,7 @@ def main(img=None, room=None, icon=None, original=None):
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
+    plan["floor"]["holes"] = [st["outline"] for st in plan["stairs"] if st.get("sunken")]
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])

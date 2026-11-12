@@ -481,7 +481,18 @@ def build(plan):
                 ft_id = collect(FloorType)[0].Id
             loops = List[CurveLoop]()
             loops.Add(loop)
-            Floor.Create(doc, loops, ft_id, lvl.Id)
+            for hole in plan["floor"].get("holes", []):      # sunken stepped areas: opening in the slab
+                hl = CurveLoop()
+                for i in range(len(hole)):
+                    a, b = P(hole[i], z0), P(hole[(i + 1) % len(hole)], z0)
+                    if a.DistanceTo(b) > 0.01:
+                        hl.Append(Line.CreateBound(a, b))
+                loops.Add(hl)
+            try:
+                Floor.Create(doc, loops, ft_id, lvl.Id)
+            except Exception:
+                Floor.Create(doc, List[CurveLoop]([loop]), ft_id, lvl.Id)   # holes rejected: plain slab
+                errors.append("floor holes skipped (opening outline invalid)")
             stats["floor"] = 1
         except Exception as e:
             errors.append("floor: {} (Revit 2022+ needed for Floor.Create)".format(e))
