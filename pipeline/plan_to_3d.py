@@ -55,6 +55,8 @@ def _net_probs(net, dev, img):
 MODEL_CONTAINER = os.environ.get("PLANFORGE_MODEL_CONTAINER", "models")
 MODEL_CACHE = os.environ.get("PLANFORGE_MODEL_CACHE", "/tmp/planforge-models")
 _STORE_SEEN = {}                                   # repo -> (version, {file: local path}) for this process
+import threading as _threading
+_STORE_LOCK = _threading.Lock()                    # startup preload and a first request must not fetch at once
 
 
 def _hf_token():
@@ -67,6 +69,11 @@ def _hf_token():
 
 def model_files(repo_name, files, revision=None, recheck=False):
     """Return (version, {file: local path}) for the given files of a Hugging Face model repo."""
+    with _STORE_LOCK:
+        return _model_files(repo_name, files, revision, recheck)
+
+
+def _model_files(repo_name, files, revision=None, recheck=False):
     if repo_name in _STORE_SEEN and not recheck:
         return _STORE_SEEN[repo_name]
     from huggingface_hub import HfApi, hf_hub_download
@@ -115,9 +122,10 @@ def model_files(repo_name, files, revision=None, recheck=False):
         dst = os.path.join(MODEL_CACHE, repo_name, stored, f)
         if not os.path.exists(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst + ".part", "wb") as fh:
+            part = "{}.{}.part".format(dst, os.getpid())
+            with open(part, "wb") as fh:
                 cont.get_blob_client("{}/{}/{}".format(repo_name, stored, f)).download_blob().readinto(fh)
-            os.replace(dst + ".part", dst)
+            os.replace(part, dst)
         local[f] = dst
     out = (stored, local)
     _STORE_SEEN[repo_name] = out
@@ -129,7 +137,15 @@ MODEL_REVISION = os.environ.get("PLANFORGE_MODEL_REV", "prod")   # HF tag/branch
 MODEL_CHECK_S = float(os.environ.get("PLANFORGE_MODEL_CHECK_S", "0"))  # 0 = check for a new release only at (cold) start
 
 
+_LOAD_LOCK = _threading.Lock()
+
+
 def load_model(force_check=False):
+    with _LOAD_LOCK:
+        return _load_model(force_check)
+
+
+def _load_model(force_check=False):
     """The model is loaded once and kept in memory. Every MODEL_CHECK_S seconds (between plans) the
     Hugging Face release tag is checked; only if it moved is the new checkpoint downloaded and swapped in.
     If Hugging Face cannot be reached, the model already loaded keeps working."""
