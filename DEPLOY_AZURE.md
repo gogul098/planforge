@@ -34,3 +34,10 @@ After this, every push to `main` redeploys whichever piece changed.
 - The first conversion after an idle period takes ~30-60 s extra (container start + model download).
 - To stop all costs: delete the resource group `planforge-rg`.
 - Set a budget alert: Cost Management -> Budgets -> e.g. 1 USD on `planforge-rg`.
+
+## Run the engine locally with Docker
+```
+docker build -t planforge-engine .
+docker run -p 8080:8080 -e HF_TOKEN=<your token> planforge-engine
+```
+Open http://localhost:8080 (website + engine together). Health check: http://localhost:8080/api/health

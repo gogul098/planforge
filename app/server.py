@@ -251,6 +251,11 @@ def export(job: str, body: dict):
     return {"ok": True, "furniture": len(plan["furniture"])}
 
 
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
 @app.get("/api/catalog")
 def catalog():
     return {k: {"height": v[0], "category": v[1]} for k, v in P.FURN_SPEC.items()}

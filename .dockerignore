@@ -1,0 +1,15 @@
+.git
+.github
+**/__pycache__
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.safetensors
+checkpoints/
+kaggle/
+training/
+samples/
+docs/
+revit/
+pipeline/
+*.md
