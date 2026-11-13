@@ -185,6 +185,19 @@ def _model_files(repo_name, files, revision=None, recheck=False):
         stored = sha
     if stored is None:
         raise RuntimeError("model unavailable: nothing in Blob and Hugging Face unreachable")
+    # the version can already be in Blob without every file this engine needs (e.g. an earlier PyTorch build copied
+    # best.pt for this release, the ONNX build now needs model.onnx): copy just the missing files, same revision
+    for f in files:
+        bc = cont.get_blob_client("{}/{}/{}".format(repo_name, stored, f))
+        if bc.exists():
+            continue
+        if repo is None:
+            raise RuntimeError("model file {} of release {} is not in Blob and Hugging Face is unreachable".format(
+                f, stored[:8]))
+        print("{} of release {} missing in Blob: copying it from Hugging Face".format(f, stored[:8]))
+        src = hf_hub_download(repo, f, revision=stored, token=token)
+        with open(src, "rb") as fh:
+            bc.upload_blob(fh, overwrite=True)
     local = {}
     for f in files:                                # Blob -> local disk (same region: seconds)
         dst = os.path.join(MODEL_CACHE, repo_name, stored, f)
