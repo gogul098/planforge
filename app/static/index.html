@@ -3,135 +3,119 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PlanForge — floor plan to Revit</title>
-<link rel="stylesheet" href="app.css">
-<script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/":"./vendor/addons/"}}</script>
+<title>PlanForge — floor plan to 3D, for Revit</title>
+<meta name="description" content="Upload a 2D floor plan. PlanForge reads walls, openings, stairs and dimensions, and returns a model you can open in Revit.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="landing.css">
 </head>
 <body>
-<div id="app" class="mode-view">
-  <header class="top">
-    <div class="logo"><div class="mark"></div>PlanForge</div>
-    <span class="crumb" id="crumb">/ new plan</span>
-    <div class="sp"></div>
-    <span class="hint view-only" id="saveState"></span>
-    <button class="btn view-only" id="btnEdit" disabled>Edit furniture</button>
-    <a class="btn pri view-only disabled" id="btnExport">Export to Revit</a>
-    <button class="btn edit-only" id="btnCancel">Cancel</button>
-    <button class="btn pri edit-only" id="btnApply">Apply &amp; re-export</button>
-  </header>
 
-  <!-- ===== left: input & options (view mode) / furniture library (edit mode) ===== -->
-  <aside class="side left">
-    <section class="view-only">
-      <h4>Input</h4>
-      <label class="drop" id="drop">
-        <input type="file" id="file" accept=".dxf,.dwg,.pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp" hidden>
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
-        <b>Drop floor plan</b><span class="muted">or click to browse · max 50 MB</span>
-        <div class="chips"><span class="chip">DXF</span><span class="chip" title="Save as DXF first">DWG</span><span class="chip">PDF</span><span class="chip">PNG</span><span class="chip">JPG</span></div>
-      </label>
-      <div class="file hidden" id="fileCard"><div class="ft" id="fileExt">PDF</div><div class="grow"><b id="fileName"></b><div class="muted" id="fileMeta"></div></div><span class="ok" id="fileOk">✓</span></div>
-    </section>
+<header class="nav">
+  <a class="brand" href="#laterite">
+    <svg width="18" height="22" viewBox="0 0 26 30" fill="none" aria-hidden="true"><path d="M2 29V13C2 6.5 7 2 13 2s11 4.5 11 11v16"/><path d="M1 29h24"/></svg>
+    <span>PlanForge</span>
+  </a>
+  <span class="scene-no" id="sceneNo" aria-hidden="true">01 / 04 · LATERITE</span>
+  <a class="pill-line" href="app.html">Open workspace</a>
+</header>
 
-    <section class="view-only">
-      <h4>Furniture</h4>
-      <div class="row"><span>Need furniture placement</span><button class="tog on" id="togFurn" role="switch" aria-checked="true"></button></div>
-      <div class="seg" id="furnMode"><span class="on" data-v="copy">Copy from plan</span><span data-v="manual">Place manually</span></div>
-      <p class="muted small" id="furnHelp">Furniture drawn on the plan is copied exactly; edit it after conversion.</p>
-    </section>
-
-    <section class="view-only">
-      <h4>Scale &amp; heights</h4>
-      <div class="inp">
-        <label class="f"><small>Building width (m)</small><input id="o_bw" placeholder="Auto (dims)"></label>
-        <label class="f"><small>Wall height (m)</small><input id="o_wh" value="3.00"></label>
-        <label class="f"><small>Ext. wall (mm)</small><input id="o_ew" placeholder="Auto"></label>
-        <label class="f"><small>Int. wall (mm)</small><input id="o_iw" placeholder="Auto"></label>
-        <label class="f"><small>Door head (m)</small><input id="o_dh" value="2.10"></label>
-        <label class="f"><small>Sill (m)</small><input id="o_ws" value="0.90"></label>
-        <label class="f" title="Floor level above the ground. Entrance steps come down to the ground. Leave empty to read it from the plan (level mark or counted steps)."><small>Plinth height (m)</small><input id="o_pl" placeholder="From plan"></label>
-        <label class="f dxf-only hidden"><small>DXF units</small><select id="o_units"><option value="">From file</option><option value="4">mm</option><option value="5">cm</option><option value="6">m</option><option value="1">inch</option><option value="2">feet</option></select></label>
-      </div>
-    </section>
-
-    <div class="sp view-only"></div>
-    <div class="progress view-only hidden" id="prog"><div class="bar"><i id="progBar"></i></div><span id="progMsg"></span></div>
-    <button class="btn pri big view-only" id="btnConvert" disabled>Convert to 3D</button>
-
-    <section class="edit-only">
-      <h4>Add furniture</h4>
-      <div class="lib" id="lib"></div>
-      <p class="muted small">Click an item, then click in the plan to place it.</p>
-    </section>
-    <section class="edit-only grow-sec">
-      <h4>Placed (<span id="placedN">0</span>)</h4>
-      <div class="list" id="placed"></div>
-    </section>
-  </aside>
-
-  <!-- ===== centre: viewer ===== -->
-  <main class="view" id="view">
-    <canvas id="c3d"></canvas>
-    <img id="traceImg" class="trace hidden" alt="trace check">
-    <div class="tabs" id="tabs"><span class="on" data-t="3d">3D</span><span data-t="plan">Plan</span><span data-t="trace" class="view-only">Trace check</span><span data-t="raw" class="view-only">AI raw</span></div>
-    <canvas id="cube" width="168" height="168" title="View cube: click a face"></canvas>
-    <button class="home" id="btnHome" title="Home view">⌂</button>
-    <div class="empty" id="empty"><div class="emark"></div><b>Upload a floor plan to start</b><span class="muted">DXF gives exact scale · PDF / PNG / JPG use the written dimensions</span></div>
-    <div class="section-ui hidden" id="sectionUi"><small>Cut height</small><input type="range" id="cutH" min="0.1" max="3.2" step="0.05" value="1.2"><b id="cutV">1.20 m</b></div>
-    <div class="measure-out hidden" id="measOut"></div>
-    <div class="tip" id="tip"></div>
-
-    <div class="tb view-only" id="tbView">
-      <i data-tool="orbit" class="on" title="Orbit (O)">Orbit</i><i data-tool="pan" title="Pan (P)">Pan</i><i data-tool="zoom" title="Zoom (Z)">Zoom</i><i data-act="fit" title="Fit (F)">Fit</i>
-      <span class="sepv"></span>
-      <i data-tog="section" title="Section cut">Section</i><i data-tool="measure" title="Measure (M)">Measure</i><i data-tool="walk" title="Walk (W)">Walk</i>
-      <span class="sepv"></span>
-      <i data-act="layers" title="Layers">Layers</i><i data-tog="xray" title="X-ray">X-ray</i><i data-tog="edges" title="Edges">Edges</i>
+<main>
+  <!-- 01 laterite -->
+  <section class="scene laterite" id="laterite" data-label="01 / 04 · LATERITE">
+    <div class="stage" aria-hidden="true">
+      <svg class="arch" viewBox="0 0 600 760" fill="none"><path d="M60 760V330C60 170 170 60 300 30c130 30 240 140 240 300v430"/><path class="faint" d="M90 760V340C90 200 185 100 300 72c115 28 210 128 210 268v420"/></svg>
+      <svg class="model" viewBox="140 60 720 520" style="--fa:#8a4b30;--fb:#64351f;--slab:#3a2216;--edge:#f0cfa0;--glow:#e7a56f">
+        <use href="#building"/>
+      </svg>
     </div>
-    <div class="tb edit-only" id="tbEdit">
-      <i data-etool="select" class="on">Select</i><i data-etool="move">Move</i><i data-etool="rotate">Rotate</i>
-      <span class="sepv"></span>
-      <i data-etog="snap" class="on">Snap</i><i data-act="undo">Undo</i><i data-act="redo">Redo</i>
+    <div class="copy bottom">
+      <h1 class="reveal">Every plan<br><i>holds a building.</i></h1>
+      <div class="side-copy reveal">
+        <p>Upload a floor plan. PlanForge reads it, raises it on its plinth and hands you a model for Revit.</p>
+        <a class="pill" href="app.html">Convert a plan</a>
+      </div>
     </div>
-    <div class="pop hidden" id="layersPop"></div>
-    <div class="pop ctx hidden" id="ctx"><span data-c="rot">Rotate 90°</span><span data-c="dup">Duplicate</span><span data-c="wall">Back to wall</span><span data-c="del" class="danger">Delete</span></div>
-  </main>
+  </section>
 
-  <!-- ===== right: precision / properties / downloads ===== -->
-  <aside class="side right">
-    <section>
-      <h4>Precision</h4>
-      <div class="stat">
-        <div class="st"><b id="s_cov">—</b><span class="muted">walls kept</span></div>
-        <div class="st"><b id="s_dim">—</b><span class="muted">dims matched</span></div>
-        <div class="st"><b id="s_rooms">—</b><span class="muted">rooms</span></div>
-        <div class="st"><b id="s_furn">—</b><span class="muted">furniture</span></div>
+  <!-- 02 sandstone -->
+  <section class="scene sandstone" id="sandstone" data-label="02 / 04 · SANDSTONE">
+    <div class="copy split">
+      <div class="reveal">
+        <span class="eyebrow">Read</span>
+        <h2>The drawing,<br><i>understood.</i></h2>
+        <p>Walls, doors, windows, stairs and written dimensions — read from your plan and checked against each other. When the plan disagrees with itself, you are told which number was trusted.</p>
       </div>
-      <p class="muted small" id="s_scale"></p>
-    </section>
-    <section>
-      <h4 id="selTitle">Selection</h4>
-      <div id="props"><p class="muted small">Click a wall, room or furniture item.</p></div>
-    </section>
-    <section class="view-only grow-sec">
-      <h4>Rooms</h4>
-      <div class="list" id="roomList"></div>
-    </section>
-    <section class="view-only">
-      <h4>Downloads</h4>
-      <div id="dls" class="dls">
-        <a class="dl disabled" data-f="model.ifc"><b>model.ifc</b><span class="muted">IFC4 · opens in Revit</span></a>
-        <a class="dl disabled" data-f="plan.json"><b>plan.json</b><span class="muted">native Revit build</span></a>
-        <a class="dl disabled" data-f="build_in_revit.py"><b>build_in_revit.py</b><span class="muted">pyRevit script</span></a>
-        <a class="dl disabled" data-f="model.glb"><b>model.glb</b><span class="muted">3D</span></a>
-        <a class="dl disabled" data-f="floorplan_3d.zip"><b>All files (.zip)</b><span class="muted">everything</span></a>
+      <svg class="plan reveal" viewBox="0 0 560 400" fill="none" role="img" aria-label="Floor plan with walls, doors and a stair as they are read">
+        <g class="dim"><path d="M40 360h480M40 40v320M520 40v320M40 40h480"/><path d="M40 24h480M40 18v12M520 18v12"/></g>
+        <g class="walls"><path d="M60 60h440v280H60z"/><path d="M220 60v150M60 210h290M350 210v130M350 145h150M140 210v130"/></g>
+        <g class="gaps"><path d="M280 60h40M60 120v34M420 340h40"/></g>
+        <g class="thin"><path d="M420 340c0-22 18-40 40-40M60 154c20 0 34-14 34-34"/><path d="M380 230h100M380 246h100M380 262h100M380 278h100M380 294h100M380 310h100"/></g>
+        <g class="labels"><text x="262" y="16">16.00 m</text><text x="404" y="226">17R @ 150</text></g>
+      </svg>
+    </div>
+  </section>
+
+  <!-- 03 kota -->
+  <section class="scene kota" id="kota" data-label="03 / 04 · KOTA STONE">
+    <div class="stage" aria-hidden="true">
+      <svg class="model" viewBox="140 60 720 520" style="--fa:#7e8780;--fb:#5c655f;--slab:#2f3531;--edge:#e6e9e2;--glow:#b9c4ba">
+        <use href="#building"/>
+      </svg>
+    </div>
+    <div class="copy bottom">
+      <div class="reveal">
+        <span class="eyebrow">Build</span>
+        <h2>Raised on its plinth.</h2>
       </div>
-      <details class="report"><summary>Full report</summary><pre id="report"></pre></details>
-    </section>
-  </aside>
-</div>
-<div class="toast hidden" id="toast"></div>
-<script src="config.js"></script>
-<script type="module" src="app.js"></script>
+      <p class="side-copy reveal">Floor levels from the level marks, steps counted from the drawing — up to the entrance, down to the courtyard.</p>
+    </div>
+  </section>
+
+  <!-- 04 teak -->
+  <section class="scene teak" id="teak" data-label="04 / 04 · TEAK">
+    <div class="copy center reveal">
+      <span class="eyebrow">Deliver</span>
+      <h2>Open it in Revit.</h2>
+      <ul class="files">
+        <li>model.ifc</li><li>build_in_revit.py</li><li>model.glb</li><li>plan.json</li>
+      </ul>
+      <a class="pill" href="app.html">Convert your plan</a>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span class="brand-sm">PlanForge</span>
+  <span>DXF · PDF · PNG · JPG</span>
+</footer>
+
+<!-- the building, drawn once and reused by each scene (colours come from the scene's CSS variables) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="building">
+      <ellipse cx="497" cy="380" rx="360" ry="170" style="fill:var(--glow)" fill-opacity="0.10"/>
+      <ellipse cx="497" cy="370" rx="250" ry="115" style="fill:var(--glow)" fill-opacity="0.10"/>
+      <polygon points="430,179.9 811.1,399.9 563.4,542.9 182.3,322.9" style="stroke:var(--edge);fill:var(--slab)"  stroke-opacity="0.3"/>
+      <polygon points="430,170 811.1,390 563.4,533 182.3,313" style="stroke:var(--edge);fill:var(--slab)"  stroke-opacity="0.55"/>
+      <g  stroke-width="0.9" stroke-linejoin="round" style="stroke:var(--edge)">
+        <polygon points="182.3,313 430,170 430,104 182.3,247" style="fill:var(--fb)"/>
+        <polygon points="430,170 811.1,390 811.1,324 430,104" style="fill:var(--fa)"/>
+        <polygon points="582.4,258 449.1,335 449.1,269 582.4,192" style="fill:var(--fb)"/>
+        <polygon points="296.6,247 544.3,390 544.3,324 296.6,181" style="fill:var(--fa)"/>
+        <polygon points="372.8,291 258.5,357 258.5,291 372.8,225" style="fill:var(--fb)"/>
+        <polygon points="601.5,357 734.8,434 734.8,368 601.5,291" style="fill:var(--fa)"/>
+        <polygon points="544.3,390 430,456 430,390 544.3,324" style="fill:var(--fb)"/>
+        <polygon points="563.4,533 182.3,313 182.3,247 563.4,467" style="fill:var(--fa)"/>
+        <polygon points="811.1,390 563.4,533 563.4,467 811.1,324" style="fill:var(--fb)"/>
+      </g>
+      <path d="M430 104L811.1 324L563.4 467L182.3 247Z"  stroke-width="1.4" fill="none" style="stroke:var(--edge)"/>
+      <path d="M640 425l70 40M640 431l70 40M640 437l70 40"  stroke-opacity="0.8" fill="none" style="stroke:var(--edge)"/>
+    </g>
+  </defs>
+</svg>
+<script src="landing.js"></script>
 </body>
 </html>

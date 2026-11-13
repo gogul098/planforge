@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlanForge — workspace</title>
+<meta name="description" content="Convert a 2D floor plan into a 3D model for Revit.">
+<script>try{var t=localStorage.getItem("pf-theme");if(t==="day"||t==="night")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/":"./vendor/addons/"}}</script>
+</head>
+<body>
+<div id="app" class="mode-view">
+
+  <!-- ===== the scape: the 3D view fills the screen ===== -->
+  <main class="view" id="view">
+    <canvas id="c3d"></canvas>
+    <img id="traceImg" class="trace hidden" alt="Trace check: what was read, drawn over the plan">
+    <span class="vp-label" aria-hidden="true">[–][Perspective][Realistic]</span>
+    <canvas id="cube" width="168" height="168" title="View cube: click a face"></canvas>
+    <button class="home" id="btnHome" title="Home view" aria-label="Home view">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 11l8-7 8 7v9H4z"/></svg>
+    </button>
+    <div class="empty" id="empty">
+      <svg class="emark" viewBox="0 0 26 30" fill="none" aria-hidden="true"><path d="M2 29V13C2 6.5 7 2 13 2s11 4.5 11 11v16"/><path d="M7 29V15c0-3.6 2.7-6.5 6-6.5s6 2.9 6 6.5v14"/><path d="M1 29h24"/></svg>
+      <b>Every plan holds a building.</b>
+      <span class="muted">Add a floor plan to begin · DXF gives exact scale, PDF and images use the written dimensions</span>
+    </div>
+    <div class="section-ui hidden" id="sectionUi"><small>Cut height</small><input type="range" id="cutH" min="0.1" max="3.2" step="0.05" value="1.2" aria-label="Cut height"><b id="cutV">1.20 m</b></div>
+    <div class="measure-out hidden" id="measOut"></div>
+    <div class="tip" id="tip"></div>
+    <div class="tb glass view-only" id="tbView">
+      <i data-tool="orbit" class="on" title="Orbit (O)">Orbit</i><i data-tool="pan" title="Pan (P)">Pan</i><i data-tool="zoom" title="Zoom (Z)">Zoom</i><i data-act="fit" title="Fit (F)">Fit</i>
+      <span class="sepv"></span>
+      <i data-tog="section" title="Section cut">Section</i><i data-tool="measure" title="Measure (M)">Measure</i><i data-tool="walk" title="Walk (W)">Walk</i>
+      <span class="sepv"></span>
+      <i data-act="layers" title="Layers">Layers</i><i data-tog="xray" title="X-ray">X-ray</i><i data-tog="edges" title="Edges">Edges</i>
+    </div>
+    <div class="tb glass edit-only" id="tbEdit">
+      <i data-etool="select" class="on">Select</i><i data-etool="move">Move</i><i data-etool="rotate">Rotate</i>
+      <span class="sepv"></span>
+      <i data-etog="snap" class="on">Snap</i><i data-act="undo">Undo</i><i data-act="redo">Redo</i>
+    </div>
+    <div class="pop glass hidden" id="layersPop"></div>
+    <div class="pop ctx glass hidden" id="ctx"><span data-c="rot">Rotate 90°</span><span data-c="dup">Duplicate</span><span data-c="wall">Back to wall</span><span data-c="del" class="danger">Delete</span></div>
+  </main>
+
+  <!-- ===== top bar ===== -->
+  <header class="top glass">
+    <a class="logo" href="index.html">
+      <svg width="16" height="20" viewBox="0 0 26 30" fill="none" aria-hidden="true"><path d="M2 29V13C2 6.5 7 2 13 2s11 4.5 11 11v16"/><path d="M1 29h24"/></svg>
+      <span>PlanForge</span>
+    </a>
+    <span class="crumb" id="crumb">/ new plan</span>
+    <nav class="tabs" id="tabs" aria-label="Views"><span class="on" data-t="3d">3D</span><span data-t="plan">Plan</span><span data-t="trace" class="view-only">Trace check</span><span data-t="raw" class="view-only">Model output</span></nav>
+    <div class="sp"></div>
+    <span class="hint view-only" id="saveState"></span>
+    <button class="btn icon" id="btnTheme" type="button" aria-label="Switch day / night" title="Day / night">
+      <svg class="i-night" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+      <svg class="i-day" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    </button>
+    <button class="btn view-only" id="btnEdit" disabled>Edit furniture</button>
+    <a class="btn pri view-only disabled" id="btnExport">Export</a>
+    <button class="btn edit-only" id="btnCancel">Cancel</button>
+    <button class="btn pri edit-only" id="btnApply">Apply &amp; re-export</button>
+  </header>
+
+  <!-- ===== left card: drawing & options (view) / furniture library (edit) ===== -->
+  <aside class="side left glass">
+    <section class="view-only">
+      <h4>Drawing</h4>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept=".dxf,.dwg,.pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp" hidden>
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <b>Drop floor plan</b><span class="muted">or click to browse · up to 50 MB</span>
+        <div class="chips"><span class="chip">DXF</span><span class="chip" title="Save as DXF first">DWG</span><span class="chip">PDF</span><span class="chip">PNG</span><span class="chip">JPG</span></div>
+      </label>
+      <div class="file hidden" id="fileCard"><div class="ft" id="fileExt">PDF</div><div class="grow"><b id="fileName"></b><div class="muted" id="fileMeta"></div></div><span class="ok" id="fileOk">✓</span></div>
+    </section>
+    <section class="view-only">
+      <h4>Furniture</h4>
+      <div class="row"><span>Place furniture</span><button class="tog on" id="togFurn" role="switch" aria-checked="true" aria-label="Place furniture"></button></div>
+      <div class="seg" id="furnMode"><span class="on" data-v="copy">Copy from plan</span><span data-v="manual">Place manually</span></div>
+      <p class="muted small" id="furnHelp">Furniture drawn on the plan is copied exactly; edit it after conversion.</p>
+    </section>
+    <section class="view-only">
+      <h4>Scale &amp; heights</h4>
+      <div class="inp">
+        <label class="f"><small>Building width (m)</small><input id="o_bw" placeholder="Auto"></label>
+        <label class="f"><small>Wall height (m)</small><input id="o_wh" value="3.00"></label>
+        <label class="f"><small>Ext. wall (mm)</small><input id="o_ew" placeholder="Auto"></label>
+        <label class="f"><small>Int. wall (mm)</small><input id="o_iw" placeholder="Auto"></label>
+        <label class="f"><small>Door head (m)</small><input id="o_dh" value="2.10"></label>
+        <label class="f"><small>Sill (m)</small><input id="o_ws" value="0.90"></label>
+        <label class="f" title="Floor level above the ground. Leave empty to read it from the plan (level mark or counted steps)."><small>Plinth (m)</small><input id="o_pl" placeholder="From plan"></label>
+        <label class="f dxf-only hidden"><small>DXF units</small><select id="o_units"><option value="">From file</option><option value="4">mm</option><option value="5">cm</option><option value="6">m</option><option value="1">inch</option><option value="2">feet</option></select></label>
+      </div>
+    </section>
+    <div class="sp view-only"></div>
+    <div class="progress view-only hidden" id="prog"><div class="bar"><i id="progBar"></i></div><span id="progMsg"></span></div>
+    <button class="btn pri big view-only" id="btnConvert" disabled>Convert to 3D</button>
+    <section class="edit-only">
+      <h4>Add furniture</h4>
+      <div class="lib" id="lib"></div>
+      <p class="muted small">Click an item, then click in the plan to place it.</p>
+    </section>
+    <section class="edit-only grow-sec">
+      <h4>Placed (<span id="placedN">0</span>)</h4>
+      <div class="list" id="placed"></div>
+    </section>
+  </aside>
+
+  <!-- ===== right card: check / properties / downloads ===== -->
+  <aside class="side right glass">
+    <section>
+      <h4>Check</h4>
+      <div class="stat">
+        <div class="st"><b id="s_cov">—</b><span class="muted">walls kept</span></div>
+        <div class="st"><b id="s_dim">—</b><span class="muted">dims matched</span></div>
+        <div class="st"><b id="s_rooms">—</b><span class="muted">rooms</span></div>
+        <div class="st"><b id="s_furn">—</b><span class="muted">furniture</span></div>
+      </div>
+      <p class="muted small" id="s_scale"></p>
+    </section>
+    <section>
+      <h4 id="selTitle">Properties</h4>
+      <div id="props"><p class="muted small">Click a wall, room or furniture item.</p></div>
+    </section>
+    <section class="view-only grow-sec">
+      <h4>Rooms</h4>
+      <div class="list" id="roomList"></div>
+    </section>
+    <section class="view-only">
+      <h4>Download</h4>
+      <div id="dls" class="dls">
+        <a class="dl disabled" data-f="model.ifc"><b>model.ifc</b><span class="muted">IFC4 · Revit</span></a>
+        <a class="dl disabled" data-f="build_in_revit.py"><b>build_in_revit.py</b><span class="muted">native build</span></a>
+        <a class="dl disabled" data-f="plan.json"><b>plan.json</b><span class="muted">for the script</span></a>
+        <a class="dl disabled" data-f="model.glb"><b>model.glb</b><span class="muted">3D</span></a>
+        <a class="dl disabled all" data-f="floorplan_3d.zip"><b>All files (.zip)</b><span aria-hidden="true">↓</span></a>
+      </div>
+      <details class="report"><summary>Full report</summary><pre id="report"></pre></details>
+    </section>
+  </aside>
+
+  <!-- ===== command line + status bar ===== -->
+  <footer class="cmdbar glass">
+    <span class="prompt" aria-hidden="true">›</span>
+    <input id="cmd" placeholder="Type a command — ORBIT, PAN, FIT, SECTION, MEASURE, WALK, LAYERS, PLAN, 3D" aria-label="Command line" autocomplete="off" spellcheck="false">
+    <span class="cmd-out" id="cmdOut" aria-live="polite"></span>
+    <span class="coords" id="coords">0.000, 0.000, 0.000</span>
+    <span class="flags"><b>GRID</b><span>SNAP</span><b>ORTHO</b><span>1:100 · m</span></span>
+  </footer>
+</div>
+<div class="toast hidden" id="toast" role="status"></div>
+<script src="config.js"></script>
+<script src="theme.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

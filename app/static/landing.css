@@ -1,0 +1,95 @@
+/* PlanForge landing — four material scapes (laterite, sandstone, Kota stone, teak), the model at the centre. */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: Inter, system-ui, sans-serif; color: #f1e8da; background: #140e0a; -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; }
+i { font-style: italic; }
+
+/* nav: fixed, quiet, changes ink on light scenes */
+.nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 10; display: flex; align-items: center; gap: 24px;
+  padding: 26px 40px; color: #f1e8da; transition: color .5s ease;
+}
+.nav.ink { color: #2a1d12; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+.brand svg { stroke: #d9b47e; stroke-width: 1.8; }
+.nav.ink .brand svg { stroke: #8a5a1f; }
+.brand span { font-family: "Instrument Serif", serif; font-size: 24px; }
+.scene-no { margin-left: auto; font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .16em; opacity: .75; }
+.pill-line {
+  padding: 10px 20px; border: 1px solid currentColor; border-radius: 40px; text-decoration: none; font-size: 13px;
+  transition: background .3s ease, color .3s ease;
+}
+.pill-line:hover { background: #e9c99a; border-color: #e9c99a; color: #1e130d; }
+.pill {
+  display: inline-block; padding: 15px 30px; border-radius: 40px; background: #e9c99a; color: #1e130d;
+  text-decoration: none; font-size: 14px; font-weight: 500; transition: filter .3s ease;
+}
+.pill:hover { filter: brightness(1.06); }
+
+/* scenes */
+.scene { position: relative; min-height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+.laterite { background: radial-gradient(ellipse 60% 55% at 50% 52%, #5a3524 0%, #2a1810 55%, #140e0a 100%); }
+.sandstone { background: radial-gradient(ellipse 60% 55% at 50% 50%, #e8d3ac 0%, #c9a777 55%, #9c7a4e 100%); color: #2a1d12; }
+.kota { background: radial-gradient(ellipse 60% 55% at 50% 52%, #59625c 0%, #313833 55%, #1a1e1b 100%); color: #eef0ea; }
+.teak { background: radial-gradient(ellipse 60% 55% at 50% 50%, #4e301e 0%, #2b1a10 55%, #150d08 100%); }
+
+.stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+.arch { position: absolute; height: 88%; max-width: 70%; }
+.arch path { stroke: #d9b47e; stroke-opacity: .35; stroke-width: 1; }
+.arch .faint { stroke-opacity: .18; }
+.model { width: min(900px, 92vw); height: auto; max-height: 64vh; transform: translateY(-2vh); }
+
+.copy { position: relative; z-index: 1; width: 100%; max-width: 1360px; margin: 0 auto; padding: 0 40px; }
+.copy.bottom { margin-top: auto; padding-bottom: 60px; display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 32px; }
+.copy.split { margin: auto; padding-top: 110px; padding-bottom: 80px; display: flex; flex-wrap: wrap; align-items: center; gap: 56px; }
+.copy.split > div { flex: 1 1 360px; display: flex; flex-direction: column; gap: 20px; }
+.copy.center { margin: auto; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 26px; padding-top: 80px; padding-bottom: 80px; }
+
+h1, h2 { font-family: "Instrument Serif", serif; font-weight: 400; letter-spacing: -.01em; line-height: 1; }
+h1 { font-size: clamp(48px, 7vw, 92px); flex: 1 1 520px; }
+h1 i { color: #e9c99a; }
+h2 { font-size: clamp(42px, 5.4vw, 72px); }
+.eyebrow { display: block; font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .16em; text-transform: uppercase; opacity: .75; margin-bottom: 14px; }
+p { font-size: 15px; line-height: 1.65; max-width: 400px; }
+.laterite p, .teak p { color: #cdbba2; }
+.sandstone p { color: #4a3524; }
+.kota p { color: #c9cfc8; }
+.side-copy { flex: 0 1 360px; display: flex; flex-direction: column; gap: 20px; align-items: flex-start; }
+
+.plan { flex: 1 1 520px; max-width: 640px; height: auto; }
+.plan .dim { stroke: #6e5038; stroke-opacity: .5; }
+.plan .walls { stroke: #2a1d12; stroke-width: 6; stroke-linecap: square; }
+.plan .gaps { stroke: #e3cba1; stroke-width: 6; }
+.plan .thin { stroke: #2a1d12; stroke-width: 1; }
+.plan .labels { font-family: "IBM Plex Mono", monospace; font-size: 11px; fill: #4a3524; }
+.plan .walls path { stroke-dasharray: 2400; stroke-dashoffset: 2400; transition: stroke-dashoffset 2.4s ease; }
+.plan.in .walls path { stroke-dashoffset: 0; }
+
+.files { list-style: none; display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin: 6px 0 10px; }
+.files li { padding: 12px 20px; border: 1px solid #8c6b47; border-radius: 40px; font-family: "IBM Plex Mono", monospace; font-size: 13px; color: #ebd3ae; }
+
+.foot {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; padding: 28px 40px;
+  background: #150d08; border-top: 1px solid #3a281b; font-size: 12px; color: #b9a68c;
+}
+.brand-sm { font-family: "Instrument Serif", serif; font-size: 20px; color: #f1e8da; }
+
+/* quiet entrances: fade and rise a little, once */
+.reveal { opacity: 0; transform: translateY(14px); transition: opacity 1s ease, transform 1s ease; }
+.reveal.in { opacity: 1; transform: none; }
+.model { opacity: 0; transition: opacity 1.4s ease, transform 1.6s ease; }
+.model.in { opacity: 1; transform: translateY(-3vh); }
+
+@media (max-width: 760px) {
+  .nav { padding: 18px 20px; gap: 14px; } .scene-no { display: none; } .pill-line { margin-left: auto; }
+  .copy { padding: 0 20px; } .copy.bottom { padding-bottom: 40px; }
+  .model { max-height: 46vh; transform: translateY(-10vh); } .model.in { transform: translateY(-10vh); }
+  .foot { padding: 24px 20px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .reveal, .model, .plan .walls path { transition: none; opacity: 1; transform: none; stroke-dashoffset: 0; }
+}

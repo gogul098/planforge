@@ -17,8 +17,9 @@ const S = {
   etool: "select", snap: true, xray: false, edges: false, section: false, placing: null,
   hist: [], fut: [], beforeEdit: null, dirty: false,
 };
+const ACC = 0xc89b5e;                               // brass: selection, measure, markers (both themes)
 const CAT_COL = { furniture: 0xb0845c, plumbing: 0xeef0f4, appliance: 0x969ba2 };
-const LAYER_COL = { wall: 0xe9e4dc, door: 0x8a5a3b, glass: 0x8fc3e8, floor: 0xc9b9a2, stairs: 0xbfb3a3, plinth: 0xa8a096, ground: 0x93a58c };
+const LAYER_COL = { wall: 0xe9e4dc, door: 0x8a5a3b, glass: 0x8fc3e8, floor: 0xc9b9a2, stairs: 0xbfb3a3, plinth: 0xa8a096, ground: 0xa89a82 };
 const DEFAULT_SIZE = {
   bed: [2.0, 1.6], sofa: [2.0, 0.9], chair: [0.5, 0.5], table: [1.4, 0.9], wardrobe: [1.8, 0.6],
   tv_cabinet: [1.6, 0.45], toilet: [0.7, 0.4], sink: [0.6, 0.45], bath_tub: [1.7, 0.75],
@@ -41,14 +42,25 @@ const scene = new THREE.Scene();
 const persp = new THREE.PerspectiveCamera(45, 1, 0.05, 2000);
 const ortho = new THREE.OrthographicCamera(-10, 10, 10, -10, -500, 500);
 let camera = persp;
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.1));
+scene.add(new THREE.HemisphereLight(0xfff6ea, 0x5a4a3a, 1.1));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03;
 scene.add(sun, sun.target);
-const grid = new THREE.GridHelper(200, 200, 0x3a4350, 0x262d36);
-grid.material.transparent = true; grid.material.opacity = 0.5;
-scene.add(grid);
+// ground grid follows the theme (night: Kota stone, day: sandstone)
+const GRID_COL = { night: [0x4a524c, 0x343b36], day: [0xb39469, 0xc9ad84] };
+let grid = null;
+function makeGrid(theme) {
+  const pos = grid ? grid.position.clone() : null;
+  if (grid) { scene.remove(grid); grid.geometry.dispose(); grid.material.dispose(); }
+  const c = GRID_COL[theme] || GRID_COL.night;
+  grid = new THREE.GridHelper(200, 200, c[0], c[1]);
+  if (pos) grid.position.copy(pos);
+  grid.material.transparent = true; grid.material.opacity = 0.55;
+  scene.add(grid);
+}
+makeGrid(document.documentElement.dataset.theme || "night");
+window.addEventListener("pf-theme", (e) => makeGrid(e.detail));
 const building = new THREE.Group(); building.name = "building";
 const furnG = new THREE.Group(); furnG.name = "furniture";
 const helpers = new THREE.Group();
@@ -138,7 +150,7 @@ function makeFurnMesh(it) {
   const edge = new THREE.LineSegments(new THREE.EdgesGeometry(g), new THREE.LineBasicMaterial({ color: 0x2b1d12, transparent: true, opacity: 0.55 }));
   mesh.add(edge);
   // front marker: small strip on the front face
-  const mk = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.06, 0.02), new THREE.MeshBasicMaterial({ color: 0xff6a2b }));
+  const mk = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.06, 0.02), new THREE.MeshBasicMaterial({ color: ACC }));
   mk.name = "front"; mesh.add(mk);
   mesh.userData.uid = it.uid;
   return mesh;
@@ -269,9 +281,9 @@ const cubeS = new THREE.Scene(), cubeC = new THREE.PerspectiveCamera(35, 1, 0.1,
 function faceTex(txt) {
   const cv = document.createElement("canvas"); cv.width = cv.height = 128;
   const g = cv.getContext("2d");
-  g.fillStyle = "#d9dee5"; g.fillRect(0, 0, 128, 128);
-  g.strokeStyle = "#8b95a1"; g.lineWidth = 4; g.strokeRect(2, 2, 124, 124);
-  g.fillStyle = "#2b313a"; g.font = "bold 26px Inter, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillStyle = "#e8e0d3"; g.fillRect(0, 0, 128, 128);
+  g.strokeStyle = "#9a8b76"; g.lineWidth = 4; g.strokeRect(2, 2, 124, 124);
+  g.fillStyle = "#3a2e22"; g.font = "500 22px 'IBM Plex Mono', monospace"; g.textAlign = "center"; g.textBaseline = "middle";
   g.fillText(txt, 64, 64);
   const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t;
 }
@@ -339,7 +351,7 @@ function drawGrids() {
   gridLines.clear();
   for (const g of S.plan?.grids || []) {
     const pts = [new THREE.Vector3(g.start[0], 0.01, g.start[1]), new THREE.Vector3(g.end[0], 0.01, g.end[1])];
-    const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineDashedMaterial({ color: 0xff6a2b, dashSize: 0.4, gapSize: 0.2 }));
+    const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineDashedMaterial({ color: ACC, dashSize: 0.4, gapSize: 0.2 }));
     l.computeLineDistances(); gridLines.add(l);
   }
 }
@@ -355,10 +367,10 @@ helpers.add(meas.group);
 function measureClick(p) {
   if (meas.pts.length >= 2) { meas.pts = []; meas.group.clear(); }
   meas.pts.push(p.clone());
-  const dot = new THREE.Mesh(new THREE.SphereGeometry(0.06, 16, 12), new THREE.MeshBasicMaterial({ color: 0xff6a2b, depthTest: false }));
+  const dot = new THREE.Mesh(new THREE.SphereGeometry(0.06, 16, 12), new THREE.MeshBasicMaterial({ color: ACC, depthTest: false }));
   dot.position.copy(p); dot.renderOrder = 10; meas.group.add(dot);
   if (meas.pts.length === 2) {
-    const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(meas.pts), new THREE.LineBasicMaterial({ color: 0xff6a2b, depthTest: false }));
+    const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(meas.pts), new THREE.LineBasicMaterial({ color: ACC, depthTest: false }));
     l.renderOrder = 10; meas.group.add(l);
     const [a, b] = meas.pts, d = a.distanceTo(b);
     const dxz = Math.hypot(a.x - b.x, a.z - b.z);
@@ -417,10 +429,10 @@ function floorPoint(e) {
   const p = new THREE.Vector3();
   return ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p) ? p : null;
 }
-const selBox = new THREE.BoxHelper(undefined, 0xff6a2b); selBox.visible = false; helpers.add(selBox);
-const wallHi = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0xff6a2b, transparent: true, opacity: 0.35, depthTest: false }));
+const selBox = new THREE.BoxHelper(undefined, ACC); selBox.visible = false; helpers.add(selBox);
+const wallHi = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: ACC, transparent: true, opacity: 0.35, depthTest: false }));
 wallHi.visible = false; wallHi.renderOrder = 5; helpers.add(wallHi);
-const roomHi = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0xff6a2b, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthTest: false }));
+const roomHi = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: ACC, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthTest: false }));
 roomHi.visible = false; roomHi.renderOrder = 4; helpers.add(roomHi);
 function updateSelBox() {
   if (S.sel?.kind === "furn") { const m = meshOf(S.sel.uid); if (m) { selBox.setFromObject(m); selBox.visible = true; return; } }
@@ -796,3 +808,34 @@ resize(); fit(); requestAnimationFrame(loop);
 // deep link: /?job=<id> reopens a finished conversion
 const qj = new URLSearchParams(location.search).get("job");
 if (qj) fetch(`${API}/api/status/${qj}`).then((r) => r.ok && r.json()).then((st) => st && st.state === "done" && loadJob(qj, st)).catch(() => {});
+
+
+// ------------------------------------------------------------------ AutoCAD-style command line + coordinates
+const CMD = {
+  ORBIT: '#tbView [data-tool="orbit"]', PAN: '#tbView [data-tool="pan"]', ZOOM: '#tbView [data-tool="zoom"]',
+  FIT: '#tbView [data-act="fit"]', SECTION: '#tbView [data-tog="section"]', MEASURE: '#tbView [data-tool="measure"]',
+  DIST: '#tbView [data-tool="measure"]', WALK: '#tbView [data-tool="walk"]', LAYERS: '#tbView [data-act="layers"]',
+  XRAY: '#tbView [data-tog="xray"]', EDGES: '#tbView [data-tog="edges"]', PLAN: '#tabs [data-t="plan"]',
+  "3D": '#tabs [data-t="3d"]', TRACE: '#tabs [data-t="trace"]', HOME: "#btnHome",
+};
+const cmdIn = $("#cmd"), cmdOut = $("#cmdOut");
+if (cmdIn) {
+  cmdIn.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const c = cmdIn.value.trim().toUpperCase().replace(/^_/, "");
+    cmdIn.value = "";
+    if (!c) return;
+    const el = CMD[c] && document.querySelector(CMD[c]);
+    if (el) { el.click(); cmdOut.textContent = "Command: " + c; }
+    else cmdOut.textContent = "Unknown command: " + c + " · try ORBIT, PAN, FIT, SECTION, MEASURE, WALK, LAYERS, PLAN, 3D";
+  });
+}
+const coordsEl = $("#coords");
+const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+canvas.addEventListener("pointermove", (e) => {
+  if (!coordsEl) return;
+  const r = canvas.getBoundingClientRect();
+  ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+  const p = new THREE.Vector3();
+  if (ray.ray.intersectPlane(ground, p)) coordsEl.textContent = `${p.x.toFixed(3)}, ${p.z.toFixed(3)}, 0.000`;
+});
