@@ -90,7 +90,7 @@ def filter_by_room(items, room, T):
 _YOLO = {}
 
 
-def detector_furniture(img, mpp):
+def detector_furniture(img, mpp, roi=None):
     """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
     if not FURNITURE_REPO:
         return []
@@ -108,7 +108,7 @@ def detector_furniture(img, mpp):
         if _YOLO.get("w") != w:
             _YOLO.update(w=w, net=_onnx_session(w))
         dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
-                                conf=FURNITURE_LOW_CONF)
+                                conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)
         return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
                 for d in dets if d["cls"] in FURN_SPEC]
     if not os.environ.get("P3D_NO_INSTALL"):
@@ -122,7 +122,7 @@ def detector_furniture(img, mpp):
     if _YOLO.get("w") != w:                       # load once, reload only when a new release arrives
         _YOLO.update(w=w, net=YOLO(w))
     dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
-                            conf=FURNITURE_LOW_CONF)          # weak hits are checked against the rooms later
+                            conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)   # weak hits are checked against the rooms later
     return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
             for d in dets if d["cls"] in FURN_SPEC]
 

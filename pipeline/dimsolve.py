@@ -6,11 +6,16 @@ import numpy as np
 NUM = re.compile(r"\d+(?:[.,]\d+)?")
 
 
+_OCR = []
+
+
 def ocr_tokens(img_rgb, ocr=None):
     """Run RapidOCR; split multi-number boxes ('5.00 11.00') into separate tokens with estimated centres."""
-    if ocr is None:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
+    if ocr is None:                       # one engine per process: creating it loads three ONNX models
+        if not _OCR:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR.append(RapidOCR())
+        ocr = _OCR[0]
     res, _ = ocr(img_rgb[:, :, ::-1].copy())
     toks = []
     res = list(res or [])

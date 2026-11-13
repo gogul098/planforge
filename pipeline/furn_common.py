@@ -120,12 +120,22 @@ def _obb_onnx(sess, crop_rgb, conf):
     return res
 
 
-def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25):
+def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25,
+                     zooms=None, roi=None):
     """Rescale the plan so furniture has its training size, run tiled OBB detection, merge.
+    zooms: factors of the training scale (default ZOOM_FACTORS); roi: (x0, y0, x1, y1) in image px to search
+    (the building), None = whole sheet. Tiles with almost no ink are skipped.
     Returns list of dicts in ORIGINAL image pixels: cls, conf, corners(4x2)."""
     names = model.names if hasattr(model, "names") else _onnx_names(model)
+    ox, oy = 0, 0
+    if roi is not None:
+        Hi, Wi = img_rgb.shape[:2]
+        x0_, y0_, x1_, y1_ = [int(round(v)) for v in roi]
+        x0_, y0_, x1_, y1_ = max(x0_, 0), max(y0_, 0), min(x1_, Wi), min(y1_, Hi)
+        if x1_ - x0_ > 16 and y1_ - y0_ > 16:
+            img_rgb, ox, oy = img_rgb[y0_:y1_, x0_:x1_], x0_, y0_
     base = train_px_per_m / plan_px_per_m if (train_px_per_m and plan_px_per_m) else 1.0
-    scales = [base * f for f in ZOOM_FACTORS]              # several zooms, merged below
+    scales = [base * f for f in (zooms or ZOOM_FACTORS)]   # several zooms, merged below
     found = []
     for s in scales:
         s = float(np.clip(s, 0.2, 6.0))
@@ -142,6 +152,8 @@ def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, t
             for x0 in xs:
                 crop = np.full((tile, tile, 3), 255, np.uint8)
                 c = im[y0:y0 + tile, x0:x0 + tile]
+                if (c.min(axis=2) < 160).mean() < 0.002:       # blank paper: nothing to detect, skip the pass
+                    continue
                 crop[:c.shape[0], :c.shape[1]] = c
                 if hasattr(model, "run"):                     # ONNX Runtime session
                     boxes = _obb_onnx(model, crop, conf)
@@ -158,7 +170,7 @@ def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, t
                     if (x0 > 0 and cx < m) or (y0 > 0 and cy < m) or \
                        (x0 + tile < W and cx > tile - m) or (y0 + tile < H and cy > tile - m):
                         continue
-                    found.append({"cls": names[int(ci)], "conf": float(cf), "corners": (p + [x0, y0]) / s})
+                    found.append({"cls": names[int(ci)], "conf": float(cf), "corners": (p + [x0, y0]) / s + [ox, oy]})
     return rotated_nms(found)
 
 

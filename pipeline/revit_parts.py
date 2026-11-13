@@ -865,8 +865,12 @@ def _render3d(ax3, scene, title):
 
 
 def previews(img, v, plan, sol, scene, faithful, out_dir):
-    fig = plt.figure(figsize=(30, 10))
-    ax = fig.add_subplot(1, 3, 1)
+    if PREVIEW_3D:
+        fig = plt.figure(figsize=(30, 10))
+        ax = fig.add_subplot(1, 3, 1)
+    else:                                       # 2D check only: the 3D renders are slow and the website has a viewer
+        fig = plt.figure(figsize=(12, 12 * img.shape[0] / img.shape[1]))
+        ax = fig.add_subplot(1, 1, 1)
     ax.imshow(img); ax.axis("off")
     ax.set_title("model walls kept {:.1f}%, added {:.1f}%  (yellow = model wall not in Revit walls, "
                  "cyan = Revit wall the model did not mark)".format(100 * v["coverage"], 100 * v.get("added", 0)),
@@ -888,11 +892,13 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
     if v.get("extra") is not None:
         miss[v["extra"]] = (0.0, 0.85, 1.0, 1.0)
     ax.imshow(miss)
-    _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
-    _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
+    if PREVIEW_3D:
+        _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
+        _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "preview.png"), dpi=80)
     plt.show()
+    plt.close(fig)                              # a server makes many of these: free the figure
 
 
 def print_report(plan):
@@ -1160,8 +1166,11 @@ def main(img=None, room=None, icon=None, original=None):
         assert IMAGE, "Set IMAGE at the top of the cell to a floor-plan URL or file path"
         img, room, icon = predict(IMAGE)
         original = LAST_ORIGINAL
+    _lap()
     v = vectorise(room, icon, original if original is not None else img)
+    _lap("walls")
     toks = ocr_full_res(img, original)
+    _lap("OCR")
     print("OCR: {} dimension numbers, {} room sizes, {} labels".format(
         sum(t["kind"] == "num" for t in toks), sum(t["kind"] == "size" for t in toks),
         sum(t["kind"] == "label" for t in toks)))
@@ -1216,14 +1225,24 @@ def main(img=None, room=None, icon=None, original=None):
         sol = uniform_sol(v, s_new, "room sizes written on the plan ({} rooms)".format(n_rooms),
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
+    _lap("scale + plan")
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
+    _lap("stairs")
     if "fill_floor" in ASSIST:
         fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
     plan["added"] = round(v.get("added", 0.0), 4)
     if MAKE_FURNITURE:
-        items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
+        # search the building (walls' extent + a margin), not the title block, legend and empty paper
+        ysw, xsw = np.nonzero(v["model_wall"] | v["full"])
+        roi = None
+        if len(xsw):
+            pad = 0.06 * max(xsw.max() - xsw.min(), ysw.max() - ysw.min())
+            roi = (xsw.min() - pad, ysw.min() - pad, xsw.max() + pad, ysw.max() + pad)
+        _lap("floor + ground")
+        items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"], roi=roi)
+        _lap("furniture")
         dropped = 0
         if "furniture_filter" in ASSIST:
             items, dropped = filter_by_room(items, room, v["T"])
@@ -1241,6 +1260,7 @@ def main(img=None, room=None, icon=None, original=None):
             fu["id"] = k_
     else:
         plan["furniture"] = []
+    _lap("furniture")
     jp = os.path.join(OUT_DIR, "plan.json")
     json.dump(plan, open(jp, "w"), indent=1)
     fmesh = furniture_meshes(plan["furniture"]) if plan["furniture"] else {}
@@ -1250,8 +1270,12 @@ def main(img=None, room=None, icon=None, original=None):
         build_ifc(plan, os.path.join(OUT_DIR, "model.ifc"))
     except Exception as e:
         print("IFC export failed (plan.json / GLB are fine):", type(e).__name__, e)
+    _lap("3D + IFC export")
     print_report(plan)
     previews(img, v, plan, sol, scene, faithful, OUT_DIR)
+    _lap("preview")
+    print("\ntiming: " + " · ".join("{} {:.1f} s".format(k, t) for k, t in TIMES.items()) +
+          " · total {:.0f} s".format(sum(TIMES.values())))
     print("\nfiles in", OUT_DIR, ":", ", ".join(sorted(os.listdir(OUT_DIR))))
     print("Next: download plan.json -> run build_in_revit.py inside Revit (pyRevit / RevitPythonShell).")
     return plan

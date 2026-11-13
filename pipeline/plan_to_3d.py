@@ -37,7 +37,7 @@ def _softmax(z, axis=0):
     return z
 
 
-def _net_probs(net, dev, img):
+def _net_probs(net, dev, img, flip=True):
     """RGB image -> (room probs 12xHxW, icon probs 12xHxW), with horizontal-flip averaging.
     `net` is a PyTorch model (Kaggle) or an ONNX Runtime session (server: no PyTorch needed)."""
     h, w = img.shape[:2]
@@ -48,13 +48,15 @@ def _net_probs(net, dev, img):
     if dev == "onnx":
         name = net.get_inputs()[0].name
         out = net.run(None, {name: x})[0][0]
-        out += net.run(None, {name: np.ascontiguousarray(x[:, :, :, ::-1])})[0][0][:, :, ::-1]
-        out = out[:24, :h, :w] / 2
+        if flip:
+            out += net.run(None, {name: np.ascontiguousarray(x[:, :, :, ::-1])})[0][0][:, :, ::-1]
+            out /= 2
+        out = out[:24, :h, :w]
         return _softmax(out[:12].copy()), _softmax(out[12:24].copy())
     import torch
     xt = torch.from_numpy(x).to(dev)
     with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
-        out = (net(xt).float() + net(xt.flip(3)).float().flip(3)) / 2
+        out = (net(xt).float() + net(xt.flip(3)).float().flip(3)) / 2 if flip else net(xt).float()
     out = out[0, :, :h, :w]
     return (torch.softmax(out[:12], 0).cpu().numpy().astype(np.float32),
             torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float32))
@@ -247,7 +249,9 @@ def _load_model(force_check=False):
 
 def predict(image_src):
     import urllib.request
+    _lap()
     net, dev = load_model()
+    _lap("model load")
     if image_src.startswith("http"):
         req = urllib.request.Request(image_src, headers={"User-Agent": "Mozilla/5.0"})
         img = cv2.imdecode(np.frombuffer(urllib.request.urlopen(req, timeout=60).read(), np.uint8),
@@ -266,19 +270,19 @@ def predict(image_src):
     s = MAX_SIDE / max(img.shape[:2])
     img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
     h, w = img.shape[:2]
-    room_p, icon_p = _net_probs(net, dev, img)
+    room_p, icon_p = _net_probs(net, dev, img, FLIP_TTA)
     views = 1
     if ROTATE_TTA:
         # the model learned from plans drawn square to the page: show it extra copies rotated so each family
-        # of angled walls lies flat, rotate its answers back and combine (rooms averaged, objects: most sure view)
-        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        walls_ink = cv2.morphologyEx((g < 128).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
-        angs = _wall_angles(walls_ink, 8.0)[:3]
+        # of angled walls lies flat, rotate its answers back and combine (rooms averaged, objects: most sure view).
+        # Angles come from the walls the model found in the first pass, not from the ink: dimension ticks, hatching,
+        # stair and furniture lines are diagonal too and would cost a full extra pass each.
+        angs = _wall_angles(room_p.argmax(0) == WALL, 8.0)[:3]
         r_sum, r_w = room_p.copy(), np.ones((h, w), np.float32)
         for ang in angs:
             M, Mi, size = _rot_frame((h, w), ang)
             rimg = cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
-            rp, ip = _net_probs(net, dev, rimg)
+            rp, ip = _net_probs(net, dev, rimg, FLIP_TTA)
             valid = cv2.warpAffine(np.ones(size[::-1], np.float32), Mi, (w, h), flags=cv2.INTER_NEAREST)
             back = lambda pr: np.stack([cv2.warpAffine(c, Mi, (w, h), flags=cv2.INTER_LINEAR) for c in pr])
             rp, ip = back(rp), back(ip)
@@ -295,7 +299,8 @@ def predict(image_src):
     icon = icon_p.argmax(0).astype(np.uint8)
     global LAST_ICON_PROB
     LAST_ICON_PROB = (icon_p / np.maximum(icon_p.sum(0, keepdims=True), 1e-6)).astype(np.float16)
-    print(f"model: {_MODEL.get('info', '')}, image {w}x{h}, {dev}")
+    print(f"model: {_MODEL.get('info', '')}, image {w}x{h}, {dev}, {views} view(s){' x2 (mirrored)' if FLIP_TTA else ''}")
+    _lap("floor-plan model")
     return img, room, icon
 
 
@@ -859,6 +864,7 @@ def vectorise(room, icon, image=None):
     # every wall must run ON wall pixels for most of its length: a thick wall seen from a slightly different
     # angle leaves a short diagonal "wall" that only crosses the real band (and sticks out of it)
     Hh, Ww = full.shape
+    full_dil = cv2.dilate(full.astype(np.uint8), np.ones((3, 3), np.uint8))
     for sg in segs:
         if sg.get("drop"):
             continue
@@ -867,7 +873,7 @@ def vectorise(room, icon, image=None):
         ts = np.linspace(0, 1, n_)
         xs = np.clip(np.round(p0[0] + (p1[0] - p0[0]) * ts).astype(int), 0, Ww - 1)
         ys = np.clip(np.round(p0[1] + (p1[1] - p0[1]) * ts).astype(int), 0, Hh - 1)
-        on = cv2.dilate(full.astype(np.uint8), np.ones((3, 3), np.uint8))[ys, xs].mean()
+        on = full_dil[ys, xs].mean()
         if on < 0.6:
             sg["drop"] = True
     keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
