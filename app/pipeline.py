@@ -1396,6 +1396,7 @@ def furniture_meshes(furniture):
     return meshes
 
 
+import re
 # ----------------------------------------------------------------------------- 3b. stairs, entrance steps, stepped areas
 # Every stair gets: kind (entrance / interior / terrace), shape (straight / flared / irregular), the number of
 # risers, riser height, tread depth, width, run, base and top level, and one solid block per tread.
@@ -1784,6 +1785,30 @@ def drawn_step_regions(original, shape, have_px, wall_px, T):
     return out
 
 
+def _believable_drawn_steps(st, toks, mpp, pad):
+    """Steps found only in the drawing must look like a place people walk: at least 1.2 m wide,
+    unless the drawing says so itself (an UP / DN label or a level mark next to them).
+    Furniture symbols (a sofa is ~1 m) fail this."""
+    ys, xs = np.nonzero(st["mask"])
+    d = np.array(st.get("line_dir", (1.0, 0.0)))
+    pts = np.column_stack([xs + st["ox"], ys + st["oy"]]).astype(float)
+    width_m = float(np.ptp(pts @ d)) * mpp
+    cx, cy = pts.mean(0)
+    evidence = False
+    for t in toks or []:
+        if abs(t["x"] - cx) > pad + 0.5 * np.ptp(pts[:, 0]) or abs(t["y"] - cy) > pad + 0.5 * np.ptp(pts[:, 1]):
+            continue
+        w = _raw(t).strip().upper().rstrip(".")
+        if w in ("UP", "DN", "DOWN") or re.match(r"^[+\-±]\s*\d+[.,]\d+", w):
+            evidence = True
+            break
+    if width_m < 1.2 and not evidence:
+        print("  drawn lines rejected as steps: only {:.2f} m wide and nothing on the plan says they are steps "
+              "(furniture?)".format(width_m))
+        return False
+    return True
+
+
 def build_stairs(v, toks, room, plan, original=None):
     """Detected stair regions -> exact stairs, entrance steps and stepped areas (plan.json 'stairs' + 'levels')."""
     from shapely.geometry import Point, Polygon
@@ -1801,6 +1826,7 @@ def build_stairs(v, toks, room, plan, original=None):
             stair_px[st["oy"]:st["oy"] + st["mask"].shape[0], st["ox"]:st["ox"] + st["mask"].shape[1]] |= st["mask"]
     walls_px = room == WALL
     extra = drawn_step_regions(original, room.shape, stair_px, walls_px, v["T"])
+    extra = [st for st in extra if _believable_drawn_steps(st, toks, mpp, pad)]
     if extra:
         print("  steps read from the drawing (not marked by the model): {} areas".format(len(extra)))
         for st in extra:
