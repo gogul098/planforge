@@ -4,7 +4,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-// API location: same site by default; a static host (Azure Static Web Apps / GitHub Pages) points it at the
+// API location: same site by default; a static host (Vercel) points it at the
 // conversion engine via config.js or ?api=https://... in the URL.
 const API = (new URLSearchParams(location.search).get("api") || window.PLANFORGE_API || "").replace(/\/$/, "");
 const $ = (s) => document.querySelector(s);

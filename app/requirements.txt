@@ -1,6 +1,5 @@
-timm==1.0.31
-segmentation-models-pytorch==0.6.0
-ultralytics==8.3.253
+# Engine (server / Docker image): ONNX Runtime only, no PyTorch.
+# The PyTorch extras for Kaggle / local GPU runs are in requirements-torch.txt.
 huggingface_hub
 opencv-python-headless
 scikit-image
@@ -10,6 +9,7 @@ trimesh
 mapbox-earcut
 ifcopenshell>=0.8.3
 rapidocr_onnxruntime==1.2.3
+onnxruntime
 pymupdf
 matplotlib
 fastapi
@@ -17,4 +17,3 @@ uvicorn[standard]
 python-multipart
 ezdxf
 azure-storage-blob
-onnxruntime

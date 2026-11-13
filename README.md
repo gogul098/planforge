@@ -4,7 +4,7 @@ Upload a floor plan (**DXF, PDF, PNG or JPG**) and get a measured 3D building mo
 stairs, rooms and furniture, exported as **IFC4**, **glTF** and a **native Revit build script**.
 Architects then only add elevations and detailing, which cuts most of the manual modelling work.
 
-**Live demo:** _add the Azure Static Web Apps link here_ · built by [@gogul098](https://github.com/gogul098)
+**Live demo:** _add the Vercel link here_ · built by [@gogul098](https://github.com/gogul098)
 
 ![3D viewer](docs/screenshots/viewer.png)
 
@@ -64,40 +64,44 @@ plan ─► U-Net (rooms + icons) ─► vectorise walls/openings ─► OCR dim
 
 | Path | What |
 |---|---|
-| `app/` | FastAPI backend (`server.py`), pipeline (`pipeline.py`), web frontend (`static/`, three.js) |
-| `Dockerfile` | Container image for the conversion engine |
-| `pipeline/` | Pipeline source modules (`assemble.py` builds the single-file `pipeline.py`) |
+| `app/` | FastAPI engine (`server.py`), pipeline (`pipeline.py`, generated), Revit script (`build_in_revit.py`), website (`static/`, three.js) |
+| `Dockerfile` | Container image for the conversion engine (ONNX Runtime, no PyTorch) |
+| `pipeline/` | Pipeline source modules: edit these, then `python pipeline/assemble.py` rebuilds `app/pipeline.py` |
 | `training/` | Kaggle notebooks + training code for both models (2× T4, DDP, fp16, EMA) |
-| `revit/` | `build_in_revit.py`: builds the model in Revit from `plan.json` |
-| `kaggle/` | Diagnostics and a run-on-Kaggle cell |
-| `.github/workflows/azure-static-web-app.yml` | Every push to `main` redeploys the website on Azure Static Web Apps |
+| `kaggle/` | `export_onnx.py` (publish ONNX models), `run_planforge_kaggle.py` (run the engine on Kaggle), diagnostics |
+| `.github/workflows/azure-engine.yml` | Every push to `main` that changes the engine builds the image and deploys it to the Azure Web App |
+| `.github/workflows/checks.yml` | Fails if `app/pipeline.py` or the Kaggle bundle was not rebuilt |
+
+After changing anything in `pipeline/` or `app/`:
+
+```bash
+python pipeline/assemble.py     # pipeline/ -> app/pipeline.py
+python kaggle/bundle_app.py     # app/ -> the bundle inside kaggle/run_planforge_kaggle.py
+```
 
 ## Run locally
 
 ```bash
-pip install -r app/requirements.txt torch torchvision
-export HF_TOKEN=...            # read access to the model repos
+pip install -r app/requirements.txt   # ONNX Runtime engine, same as the Docker image
+export HF_TOKEN=...                    # read access to the model repos
 cd app && uvicorn server:app --port 7860
 ```
 
+The engine uses ONNX Runtime unless PyTorch is installed (or `PLANFORGE_BACKEND=torch`). To run the PyTorch
+checkpoints instead (GPU, Kaggle): `pip install torch torchvision -r app/requirements-torch.txt`.
+
 ## Deploy
 
-**Website: Azure Static Web Apps, Free plan.** It costs $0, needs no card, and uses no Azure credit. It's a separate
-resource, so other apps on the same subscription are not affected.
+- **Website:** Vercel, project root `app/static` (free).
+- **Conversion engine:** Docker image on an Azure Web App (Linux B1), models cached in Azure Blob Storage.
+  Every push to `main` that changes the engine rebuilds and redeploys it.
+- It can also run on your PC (`uvicorn server:app`) or in a Kaggle notebook (`kaggle/run_planforge_kaggle.py`
+  prints a public link). Open the website with `?api=<engine URL>` to use any of them.
 
-1. Azure portal → *Create a resource* → **Static Web App** → Plan: **Free** → Deployment source: **Other**.
-   Pick a new resource group (e.g. `planforge-rg`).
-2. In the new Static Web App → *Manage deployment token* → copy it.
-3. Here: Settings → Secrets and variables → Actions → **Secrets** → `AZURE_STATIC_WEB_APPS_API_TOKEN` = the token.
-4. Optional: Actions → **Variables** → `PLANFORGE_API` = URL of the conversion engine.
-5. Every push to `main` that touches `app/static/` redeploys the site.
-
-**Conversion engine (`app/server.py`):** runs wherever there is about 4 GB of RAM: your PC (`uvicorn server:app`), a Kaggle
-notebook (`kaggle/run_planforge_kaggle.py` prints a public link), or any container host (`Dockerfile`).
-Open the website with `?api=<engine URL>` to use it.
+Step-by-step setup: [DEPLOY_AZURE.md](DEPLOY_AZURE.md).
 
 **Models are never stored in this repo.** The engine downloads the weights from the private Hugging Face repos at
-runtime with `HF_TOKEN`, and the deploy workflow refuses to publish any weight file.
+runtime with `HF_TOKEN`, and the deploy workflow refuses to build if any weight file is in the repo.
 
 ## Credits & licence
 
