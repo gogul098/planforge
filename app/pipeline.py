@@ -6,6 +6,8 @@ IMAGE = ""                    # floor-plan image URL or file path (clean scan/ex
 HF_REPO = "floorplan-multitask-effb3-768"
 MAX_SIDE = 1280               # inference size (try 1536 for big/dense sheets)
 ROTATE_TTA = True             # also read the plan rotated so angled walls / doors lie flat (slower, x(1+angles))
+FLIP_TTA = True               # also read the mirrored plan and average (2x model time; the server turns it off)
+PREVIEW_3D = True             # preview.png with two 3D renders (slow on CPU; the server draws only the 2D check)
 
 # --- scale: written dimensions are used automatically. Only if the plan has NO dimensions:
 METERS_PER_PIXEL = None
@@ -46,6 +48,7 @@ MAKE_FURNITURE = True
 FURNITURE_REPO = "floorplan-furniture-obb"   # HF model repo from the furniture notebook ("" to skip)
 FURNITURE_CONF = 0.4          # always accepted at/above this
 FURNITURE_LOW_CONF = 0.15     # weaker hits accepted only when the room fits (bed in a bedroom, ...)
+FURNITURE_ZOOMS = (0.75, 1.0, 1.4)   # detector passes at these zooms of the training scale (server: 1.0 only)
 
 import os, sys, re, json, subprocess
 if not os.environ.get("P3D_NO_INSTALL"):
@@ -60,6 +63,18 @@ WALL, WIN, DOOR, STAIRS = 2, 1, 2, 11   # room-head wall id; icon-head ids
 LAST_ORIGINAL = None
 LAST_ICON_PROB = None
 
+import time as _time
+TIMES = {}                    # seconds per stage of the last run (printed at the end of the report)
+_LAP = [_time.time()]
+
+
+def _lap(name=None):
+    """Book the time since the previous lap to `name` (None: just restart the clock)."""
+    now = _time.time()
+    if name:
+        TIMES[name] = TIMES.get(name, 0.0) + now - _LAP[0]
+    _LAP[0] = now
+
 
 # ----------------------------------------------------------------------------- 1. model inference
 def _softmax(z, axis=0):
@@ -69,7 +84,7 @@ def _softmax(z, axis=0):
     return z
 
 
-def _net_probs(net, dev, img):
+def _net_probs(net, dev, img, flip=True):
     """RGB image -> (room probs 12xHxW, icon probs 12xHxW), with horizontal-flip averaging.
     `net` is a PyTorch model (Kaggle) or an ONNX Runtime session (server: no PyTorch needed)."""
     h, w = img.shape[:2]
@@ -80,13 +95,15 @@ def _net_probs(net, dev, img):
     if dev == "onnx":
         name = net.get_inputs()[0].name
         out = net.run(None, {name: x})[0][0]
-        out += net.run(None, {name: np.ascontiguousarray(x[:, :, :, ::-1])})[0][0][:, :, ::-1]
-        out = out[:24, :h, :w] / 2
+        if flip:
+            out += net.run(None, {name: np.ascontiguousarray(x[:, :, :, ::-1])})[0][0][:, :, ::-1]
+            out /= 2
+        out = out[:24, :h, :w]
         return _softmax(out[:12].copy()), _softmax(out[12:24].copy())
     import torch
     xt = torch.from_numpy(x).to(dev)
     with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
-        out = (net(xt).float() + net(xt.flip(3)).float().flip(3)) / 2
+        out = (net(xt).float() + net(xt.flip(3)).float().flip(3)) / 2 if flip else net(xt).float()
     out = out[0, :, :h, :w]
     return (torch.softmax(out[:12], 0).cpu().numpy().astype(np.float32),
             torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float32))
@@ -279,7 +296,9 @@ def _load_model(force_check=False):
 
 def predict(image_src):
     import urllib.request
+    _lap()
     net, dev = load_model()
+    _lap("model load")
     if image_src.startswith("http"):
         req = urllib.request.Request(image_src, headers={"User-Agent": "Mozilla/5.0"})
         img = cv2.imdecode(np.frombuffer(urllib.request.urlopen(req, timeout=60).read(), np.uint8),
@@ -298,19 +317,19 @@ def predict(image_src):
     s = MAX_SIDE / max(img.shape[:2])
     img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
     h, w = img.shape[:2]
-    room_p, icon_p = _net_probs(net, dev, img)
+    room_p, icon_p = _net_probs(net, dev, img, FLIP_TTA)
     views = 1
     if ROTATE_TTA:
         # the model learned from plans drawn square to the page: show it extra copies rotated so each family
-        # of angled walls lies flat, rotate its answers back and combine (rooms averaged, objects: most sure view)
-        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        walls_ink = cv2.morphologyEx((g < 128).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
-        angs = _wall_angles(walls_ink, 8.0)[:3]
+        # of angled walls lies flat, rotate its answers back and combine (rooms averaged, objects: most sure view).
+        # Angles come from the walls the model found in the first pass, not from the ink: dimension ticks, hatching,
+        # stair and furniture lines are diagonal too and would cost a full extra pass each.
+        angs = _wall_angles(room_p.argmax(0) == WALL, 8.0)[:3]
         r_sum, r_w = room_p.copy(), np.ones((h, w), np.float32)
         for ang in angs:
             M, Mi, size = _rot_frame((h, w), ang)
             rimg = cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
-            rp, ip = _net_probs(net, dev, rimg)
+            rp, ip = _net_probs(net, dev, rimg, FLIP_TTA)
             valid = cv2.warpAffine(np.ones(size[::-1], np.float32), Mi, (w, h), flags=cv2.INTER_NEAREST)
             back = lambda pr: np.stack([cv2.warpAffine(c, Mi, (w, h), flags=cv2.INTER_LINEAR) for c in pr])
             rp, ip = back(rp), back(ip)
@@ -327,7 +346,8 @@ def predict(image_src):
     icon = icon_p.argmax(0).astype(np.uint8)
     global LAST_ICON_PROB
     LAST_ICON_PROB = (icon_p / np.maximum(icon_p.sum(0, keepdims=True), 1e-6)).astype(np.float16)
-    print(f"model: {_MODEL.get('info', '')}, image {w}x{h}, {dev}")
+    print(f"model: {_MODEL.get('info', '')}, image {w}x{h}, {dev}, {views} view(s){' x2 (mirrored)' if FLIP_TTA else ''}")
+    _lap("floor-plan model")
     return img, room, icon
 
 
@@ -891,6 +911,7 @@ def vectorise(room, icon, image=None):
     # every wall must run ON wall pixels for most of its length: a thick wall seen from a slightly different
     # angle leaves a short diagonal "wall" that only crosses the real band (and sticks out of it)
     Hh, Ww = full.shape
+    full_dil = cv2.dilate(full.astype(np.uint8), np.ones((3, 3), np.uint8))
     for sg in segs:
         if sg.get("drop"):
             continue
@@ -899,7 +920,7 @@ def vectorise(room, icon, image=None):
         ts = np.linspace(0, 1, n_)
         xs = np.clip(np.round(p0[0] + (p1[0] - p0[0]) * ts).astype(int), 0, Ww - 1)
         ys = np.clip(np.round(p0[1] + (p1[1] - p0[1]) * ts).astype(int), 0, Hh - 1)
-        on = cv2.dilate(full.astype(np.uint8), np.ones((3, 3), np.uint8))[ys, xs].mean()
+        on = full_dil[ys, xs].mean()
         if on < 0.6:
             sg["drop"] = True
     keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
@@ -952,11 +973,16 @@ def vectorise(room, icon, image=None):
 NUM = re.compile(r"\d+(?:[.,]\d+)?")
 
 
+_OCR = []
+
+
 def ocr_tokens(img_rgb, ocr=None):
     """Run RapidOCR; split multi-number boxes ('5.00 11.00') into separate tokens with estimated centres."""
-    if ocr is None:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
+    if ocr is None:                       # one engine per process: creating it loads three ONNX models
+        if not _OCR:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR.append(RapidOCR())
+        ocr = _OCR[0]
     res, _ = ocr(img_rgb[:, :, ::-1].copy())
     toks = []
     res = list(res or [])
@@ -1367,12 +1393,22 @@ def _obb_onnx(sess, crop_rgb, conf):
     return res
 
 
-def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25):
+def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25,
+                     zooms=None, roi=None):
     """Rescale the plan so furniture has its training size, run tiled OBB detection, merge.
+    zooms: factors of the training scale (default ZOOM_FACTORS); roi: (x0, y0, x1, y1) in image px to search
+    (the building), None = whole sheet. Tiles with almost no ink are skipped.
     Returns list of dicts in ORIGINAL image pixels: cls, conf, corners(4x2)."""
     names = model.names if hasattr(model, "names") else _onnx_names(model)
+    ox, oy = 0, 0
+    if roi is not None:
+        Hi, Wi = img_rgb.shape[:2]
+        x0_, y0_, x1_, y1_ = [int(round(v)) for v in roi]
+        x0_, y0_, x1_, y1_ = max(x0_, 0), max(y0_, 0), min(x1_, Wi), min(y1_, Hi)
+        if x1_ - x0_ > 16 and y1_ - y0_ > 16:
+            img_rgb, ox, oy = img_rgb[y0_:y1_, x0_:x1_], x0_, y0_
     base = train_px_per_m / plan_px_per_m if (train_px_per_m and plan_px_per_m) else 1.0
-    scales = [base * f for f in ZOOM_FACTORS]              # several zooms, merged below
+    scales = [base * f for f in (zooms or ZOOM_FACTORS)]   # several zooms, merged below
     found = []
     for s in scales:
         s = float(np.clip(s, 0.2, 6.0))
@@ -1389,6 +1425,8 @@ def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, t
             for x0 in xs:
                 crop = np.full((tile, tile, 3), 255, np.uint8)
                 c = im[y0:y0 + tile, x0:x0 + tile]
+                if (c.min(axis=2) < 160).mean() < 0.002:       # blank paper: nothing to detect, skip the pass
+                    continue
                 crop[:c.shape[0], :c.shape[1]] = c
                 if hasattr(model, "run"):                     # ONNX Runtime session
                     boxes = _obb_onnx(model, crop, conf)
@@ -1405,7 +1443,7 @@ def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, t
                     if (x0 > 0 and cx < m) or (y0 > 0 and cy < m) or \
                        (x0 + tile < W and cx > tile - m) or (y0 + tile < H and cy > tile - m):
                         continue
-                    found.append({"cls": names[int(ci)], "conf": float(cf), "corners": (p + [x0, y0]) / s})
+                    found.append({"cls": names[int(ci)], "conf": float(cf), "corners": (p + [x0, y0]) / s + [ox, oy]})
     return rotated_nms(found)
 
 
@@ -1524,7 +1562,7 @@ def filter_by_room(items, room, T):
 _YOLO = {}
 
 
-def detector_furniture(img, mpp):
+def detector_furniture(img, mpp, roi=None):
     """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
     if not FURNITURE_REPO:
         return []
@@ -1542,7 +1580,7 @@ def detector_furniture(img, mpp):
         if _YOLO.get("w") != w:
             _YOLO.update(w=w, net=_onnx_session(w))
         dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
-                                conf=FURNITURE_LOW_CONF)
+                                conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)
         return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
                 for d in dets if d["cls"] in FURN_SPEC]
     if not os.environ.get("P3D_NO_INSTALL"):
@@ -1556,7 +1594,7 @@ def detector_furniture(img, mpp):
     if _YOLO.get("w") != w:                       # load once, reload only when a new release arrives
         _YOLO.update(w=w, net=YOLO(w))
     dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
-                            conf=FURNITURE_LOW_CONF)          # weak hits are checked against the rooms later
+                            conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)   # weak hits are checked against the rooms later
     return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
             for d in dets if d["cls"] in FURN_SPEC]
 
@@ -3239,8 +3277,12 @@ def _render3d(ax3, scene, title):
 
 
 def previews(img, v, plan, sol, scene, faithful, out_dir):
-    fig = plt.figure(figsize=(30, 10))
-    ax = fig.add_subplot(1, 3, 1)
+    if PREVIEW_3D:
+        fig = plt.figure(figsize=(30, 10))
+        ax = fig.add_subplot(1, 3, 1)
+    else:                                       # 2D check only: the 3D renders are slow and the website has a viewer
+        fig = plt.figure(figsize=(12, 12 * img.shape[0] / img.shape[1]))
+        ax = fig.add_subplot(1, 1, 1)
     ax.imshow(img); ax.axis("off")
     ax.set_title("model walls kept {:.1f}%, added {:.1f}%  (yellow = model wall not in Revit walls, "
                  "cyan = Revit wall the model did not mark)".format(100 * v["coverage"], 100 * v.get("added", 0)),
@@ -3262,11 +3304,13 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
     if v.get("extra") is not None:
         miss[v["extra"]] = (0.0, 0.85, 1.0, 1.0)
     ax.imshow(miss)
-    _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
-    _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
+    if PREVIEW_3D:
+        _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
+        _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "preview.png"), dpi=80)
     plt.show()
+    plt.close(fig)                              # a server makes many of these: free the figure
 
 
 def print_report(plan):
@@ -3534,8 +3578,11 @@ def main(img=None, room=None, icon=None, original=None):
         assert IMAGE, "Set IMAGE at the top of the cell to a floor-plan URL or file path"
         img, room, icon = predict(IMAGE)
         original = LAST_ORIGINAL
+    _lap()
     v = vectorise(room, icon, original if original is not None else img)
+    _lap("walls")
     toks = ocr_full_res(img, original)
+    _lap("OCR")
     print("OCR: {} dimension numbers, {} room sizes, {} labels".format(
         sum(t["kind"] == "num" for t in toks), sum(t["kind"] == "size" for t in toks),
         sum(t["kind"] == "label" for t in toks)))
@@ -3590,14 +3637,24 @@ def main(img=None, room=None, icon=None, original=None):
         sol = uniform_sol(v, s_new, "room sizes written on the plan ({} rooms)".format(n_rooms),
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
+    _lap("scale + plan")
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
+    _lap("stairs")
     if "fill_floor" in ASSIST:
         fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
     plan["added"] = round(v.get("added", 0.0), 4)
     if MAKE_FURNITURE:
-        items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
+        # search the building (walls' extent + a margin), not the title block, legend and empty paper
+        ysw, xsw = np.nonzero(v["model_wall"] | v["full"])
+        roi = None
+        if len(xsw):
+            pad = 0.06 * max(xsw.max() - xsw.min(), ysw.max() - ysw.min())
+            roi = (xsw.min() - pad, ysw.min() - pad, xsw.max() + pad, ysw.max() + pad)
+        _lap("floor + ground")
+        items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"], roi=roi)
+        _lap("furniture")
         dropped = 0
         if "furniture_filter" in ASSIST:
             items, dropped = filter_by_room(items, room, v["T"])
@@ -3615,6 +3672,7 @@ def main(img=None, room=None, icon=None, original=None):
             fu["id"] = k_
     else:
         plan["furniture"] = []
+    _lap("furniture")
     jp = os.path.join(OUT_DIR, "plan.json")
     json.dump(plan, open(jp, "w"), indent=1)
     fmesh = furniture_meshes(plan["furniture"]) if plan["furniture"] else {}
@@ -3624,8 +3682,12 @@ def main(img=None, room=None, icon=None, original=None):
         build_ifc(plan, os.path.join(OUT_DIR, "model.ifc"))
     except Exception as e:
         print("IFC export failed (plan.json / GLB are fine):", type(e).__name__, e)
+    _lap("3D + IFC export")
     print_report(plan)
     previews(img, v, plan, sol, scene, faithful, OUT_DIR)
+    _lap("preview")
+    print("\ntiming: " + " · ".join("{} {:.1f} s".format(k, t) for k, t in TIMES.items()) +
+          " · total {:.0f} s".format(sum(TIMES.values())))
     print("\nfiles in", OUT_DIR, ":", ", ".join(sorted(os.listdir(OUT_DIR))))
     print("Next: download plan.json -> run build_in_revit.py inside Revit (pyRevit / RevitPythonShell).")
     return plan

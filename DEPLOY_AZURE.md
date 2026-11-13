@@ -35,6 +35,9 @@ and again after every retrain. It also moves the `prod` tag, so the engine picks
    | `ALLOWED_ORIGINS` | your site, e.g. `https://planforge.vercel.app` (comma separated; default `*` = any site) |
    | `PLANFORGE_MODEL_REV` | optional, Hugging Face tag/branch to serve (default `prod`, falls back to `main`) |
    | `PLANFORGE_JOB_TTL_H` | optional, hours a finished job's files are kept (default `24`) |
+   | `PLANFORGE_FLIP_TTA` | optional, `1` = also read the mirrored plan (2x model time, slightly smoother masks; default off) |
+   | `PLANFORGE_FURNITURE_ZOOMS` | optional, detector zooms, e.g. `0.75,1.0,1.4` (each zoom costs a full pass; default `1.0`) |
+   | `PLANFORGE_PREVIEW_3D` | optional, `1` = 3D renders in preview.png (slow on CPU; default off) |
 
    Also turn **Always On** off if you want it to sleep when idle (first request then waits for a cold start).
 4. **Make the image pullable:** GitHub profile -> Packages -> `planforge-engine` -> Package settings ->

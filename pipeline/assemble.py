@@ -28,6 +28,8 @@ IMAGE = ""                    # floor-plan image URL or file path (clean scan/ex
 HF_REPO = "floorplan-multitask-effb3-768"
 MAX_SIDE = 1280               # inference size (try 1536 for big/dense sheets)
 ROTATE_TTA = True             # also read the plan rotated so angled walls / doors lie flat (slower, x(1+angles))
+FLIP_TTA = True               # also read the mirrored plan and average (2x model time; the server turns it off)
+PREVIEW_3D = True             # preview.png with two 3D renders (slow on CPU; the server draws only the 2D check)
 
 # --- scale: written dimensions are used automatically. Only if the plan has NO dimensions:
 METERS_PER_PIXEL = None
@@ -68,6 +70,7 @@ MAKE_FURNITURE = True
 FURNITURE_REPO = "floorplan-furniture-obb"   # HF model repo from the furniture notebook ("" to skip)
 FURNITURE_CONF = 0.4          # always accepted at/above this
 FURNITURE_LOW_CONF = 0.15     # weaker hits accepted only when the room fits (bed in a bedroom, ...)
+FURNITURE_ZOOMS = (0.75, 1.0, 1.4)   # detector passes at these zooms of the training scale (server: 1.0 only)
 
 import os, sys, re, json, subprocess
 if not os.environ.get("P3D_NO_INSTALL"):
@@ -81,6 +84,18 @@ from skimage.morphology import skeletonize
 WALL, WIN, DOOR, STAIRS = 2, 1, 2, 11   # room-head wall id; icon-head ids
 LAST_ORIGINAL = None
 LAST_ICON_PROB = None
+
+import time as _time
+TIMES = {}                    # seconds per stage of the last run (printed at the end of the report)
+_LAP = [_time.time()]
+
+
+def _lap(name=None):
+    """Book the time since the previous lap to `name` (None: just restart the clock)."""
+    now = _time.time()
+    if name:
+        TIMES[name] = TIMES.get(name, 0.0) + now - _LAP[0]
+    _LAP[0] = now
 
 
 '''

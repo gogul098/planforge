@@ -191,6 +191,11 @@ def run_job(job, src, ext, opt):
             P.INTERNAL_WALL_M = float(opt["int_wall"]) / 1000 if opt.get("int_wall") else None
             P.MAKE_FURNITURE = opt.get("furniture", "copy") == "copy"
             P.PLINTH_HEIGHT = float(opt["plinth"]) if opt.get("plinth") not in (None, "") else None
+            # speed on a small CPU (each can be turned back on with an environment variable):
+            P.FLIP_TTA = os.environ.get("PLANFORGE_FLIP_TTA", "0") == "1"          # mirrored second pass: 2x model time
+            P.PREVIEW_3D = os.environ.get("PLANFORGE_PREVIEW_3D", "0") == "1"      # 3D renders in preview.png
+            P.FURNITURE_ZOOMS = tuple(float(z) for z in os.environ.get("PLANFORGE_FURNITURE_ZOOMS", "1.0").split(","))
+            P.TIMES.clear()
             with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                 _set(job, progress=0.15, msg="Detecting walls, doors, windows, rooms")
                 if os.environ.get("P3D_TEST_MASKS"):                 # offline test hook
