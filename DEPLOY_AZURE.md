@@ -1,43 +1,65 @@
-# Hosting PlanForge on Azure
+# Hosting PlanForge
 
-Two separate pieces, both in their own resources (nothing existing in the subscription is touched):
+Two separate pieces:
 
-| Piece | Azure service | Cost |
+| Piece | Where | Cost |
 |---|---|---|
-| Website (app/static) | Static Web Apps, Free plan | free |
-| Conversion engine (app/server.py, model) | Container Apps, consumption, scale to zero | free monthly grant (180,000 vCPU-s + 360,000 GiB-s); about 200-300 conversions a month fit |
+| Website (`app/static`) | Vercel (Hobby plan) | free |
+| Conversion engine (`app/server.py` + models, Docker image) | Azure Web App for Containers, Linux **B1**, in its own resource group | billed to the Azure for Students credit |
+| Model weights | Azure Blob Storage (copied from Hugging Face) | a few cents |
 
-Model weights never go in the repo, the site or the image. The engine downloads them from Hugging Face on first use with `HF_TOKEN`.
+The engine is its own resource group (e.g. `planforge-rg`), so nothing else in the subscription is touched.
+Model weights never go in the repo, the site or the image: the engine copies them from Hugging Face into Blob when a
+new release appears and loads them from there.
+
+## Before the first deploy: publish the ONNX models
+
+The engine image has **no PyTorch**. It runs both models with ONNX Runtime and loads
+`checkpoints/model.onnx` (floor-plan model) and `checkpoints/best.onnx` (furniture detector) from Hugging Face.
+Run `kaggle/export_onnx.py` once in a Kaggle notebook (secret `HF_TOKEN` with write access) to create them,
+and again after every retrain. It also moves the `prod` tag, so the engine picks the new version up on its next start.
 
 ## One-time setup
 
-1. **Service principal for GitHub** (Azure Cloud Shell):
-   ```
-   az ad sp create-for-rbac --name planforge-github --role contributor \
-     --scopes /subscriptions/<SUBSCRIPTION_ID> --sdk-auth
-   ```
-   Copy the JSON output.
-2. **GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret**
-   - `AZURE_CREDENTIALS` = the JSON from step 1
-   - `HF_TOKEN` = your Hugging Face read token
-3. **Engine**: Actions -> "Engine -> Azure Container Apps" -> Run workflow. The last log line prints the engine URL.
-4. **Make the image pullable**: GitHub profile -> Packages -> `planforge-engine` -> Package settings -> Change visibility -> Public (it holds code only, no weights).
-   Then re-run the engine workflow once.
-5. **Website**: Azure portal -> Create resource -> Static Web App -> Plan **Free**, resource group `planforge-rg`, Source **Other**.
-   Open it -> Manage deployment token -> copy it into the GitHub secret `AZURE_STATIC_WEB_APPS_API_TOKEN`.
-6. **Connect the two**: GitHub -> Settings -> Secrets and variables -> Actions -> Variables -> `PLANFORGE_API` = engine URL from step 3.
-   Run "Website -> Azure Static Web Apps". The site's URL is on the Static Web App's overview page.
+1. **Storage account** (Azure portal -> Storage account, same resource group, LRS). Copy its connection string
+   (Security + networking -> Access keys). The engine creates the `models` container itself.
+2. **Web App** (Create a resource -> Web App): Publish **Container**, OS **Linux**, plan **B1**, resource group `planforge-rg`.
+   Image source: Other container registries -> `ghcr.io/gogul098/planforge-engine:latest`.
+3. **Web App -> Settings -> Environment variables** (app settings):
 
-After this, every push to `main` redeploys whichever piece changed.
+   | Name | Value |
+   |---|---|
+   | `WEBSITES_PORT` | `8080` |
+   | `HF_TOKEN` | Hugging Face read token |
+   | `AZURE_STORAGE_CONNECTION_STRING` | from step 1 |
+   | `ALLOWED_ORIGINS` | your site, e.g. `https://planforge.vercel.app` (comma separated; default `*` = any site) |
+   | `PLANFORGE_MODEL_REV` | optional, Hugging Face tag/branch to serve (default `prod`, falls back to `main`) |
+   | `PLANFORGE_JOB_TTL_H` | optional, hours a finished job's files are kept (default `24`) |
+
+   Also turn **Always On** off if you want it to sleep when idle (first request then waits for a cold start).
+4. **Make the image pullable:** GitHub profile -> Packages -> `planforge-engine` -> Package settings ->
+   Change visibility -> Public (it holds code only, no weights).
+5. **Automatic deploys:** Web App -> Overview -> *Download publish profile*. In GitHub:
+   Settings -> Secrets and variables -> Actions
+   - Secret `AZURE_WEBAPP_PUBLISH_PROFILE` = contents of that file
+   - Variable `AZURE_WEBAPP_NAME` = the Web App's name
+
+   From now on every push to `main` that touches `app/`, the `Dockerfile` or the workflow builds the image and deploys it
+   (`.github/workflows/azure-engine.yml`). Health check: `https://<web-app>.azurewebsites.net/api/health`,
+   running build: `/api/version`.
+6. **Website:** on vercel.com -> Add New -> Project -> import `gogul098/planforge`, **Root Directory `app/static`**,
+   Framework preset *Other*, no build command. Every push to `main` redeploys it.
+   The engine URL is set in `app/static/config.js`; `?api=<engine URL>` overrides it for testing.
 
 ## Notes
-- The first conversion after an idle period takes ~30-60 s extra (container start + model download).
+- After an idle period the first conversion waits for the container to start and the models to load from Blob.
 - To stop all costs: delete the resource group `planforge-rg`.
-- Set a budget alert: Cost Management -> Budgets -> e.g. 1 USD on `planforge-rg`.
+- Set a budget alert: Cost Management -> Budgets -> e.g. 5 USD on `planforge-rg`.
 
 ## Run the engine locally with Docker
 ```
 docker build -t planforge-engine .
 docker run -p 8080:8080 -e HF_TOKEN=<your token> planforge-engine
 ```
-Open http://localhost:8080 (website + engine together). Health check: http://localhost:8080/api/health
+Health check: http://localhost:8080/api/health. Open the website with `?api=http://localhost:8080`.
+Without `AZURE_STORAGE_CONNECTION_STRING` the engine downloads the models straight from Hugging Face.

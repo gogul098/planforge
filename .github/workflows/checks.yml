@@ -1,0 +1,30 @@
+name: Checks
+
+# Fails a push / PR when a generated file was not rebuilt:
+#  * app/pipeline.py must equal what pipeline/assemble.py builds from pipeline/
+#  * the app bundle inside kaggle/run_planforge_kaggle.py must match app/
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  generated-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: app/pipeline.py is up to date
+        run: |
+          python pipeline/assemble.py
+          git diff --exit-code app/pipeline.py || (echo "Run: python pipeline/assemble.py" && exit 1)
+      - name: Kaggle bundle is up to date
+        run: python kaggle/bundle_app.py --check
+      - name: Python files compile
+        run: python -m py_compile app/server.py app/pipeline.py app/build_in_revit.py kaggle/*.py pipeline/assemble.py
+      - name: Converter projects the model's walls (no added / removed wall)
+        run: |
+          pip install -q pytest numpy opencv-python-headless scikit-image scipy shapely matplotlib
+          pytest -q tests

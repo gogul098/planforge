@@ -1,0 +1,5 @@
+# Extra packages for running the models with PyTorch (Kaggle GPU, local dev). Install torch itself separately.
+-r requirements.txt
+timm==1.0.31
+segmentation-models-pytorch==0.6.0
+ultralytics==8.3.253

@@ -391,28 +391,29 @@ def _band_runs(c, b0, b1, L, G):
         t = float(np.median(widths[widths > 0]))
         cols = seg.sum(0)
         centre = b0 + float((cols * np.arange(len(cols))).sum() / cols.sum())
-        out.append((centre, float(r0), float(r1 + 1), t))
+        out.append((centre, float(r0) - 0.5, float(r1) + 0.5, t))   # pixel centres at integers, like `centre`
     return out
 
 
 def _frame_walls(full, openings_any, icon, T):
     """Horizontal / vertical walls + their openings in one frame (the image, or the image rotated so a
     family of angled walls runs horizontally)."""
-    # straight segments: horizontal / vertical runs longer than ~2.5 T
-    L = max(int(2.5 * T), 12)
+    # straight segments: horizontal / vertical runs longer than ~1.6 T. The run length must stay above the
+    # thickness of the walls crossing this direction, otherwise a wall's cross-section would read as a wall.
+    # Nothing is bridged: a break the model left in a wall stays a break (only 1-2 px antialiasing gaps close).
+    L = max(int(round(1.6 * T)), 5) | 1          # odd sizes: an even kernel shifts every wall by 1 px
     segs = []
-    G = max(int(3 * T), 6)
+    G = 3
     for o, ker, gap in (("h", np.ones((1, L), np.uint8), np.ones((1, G), np.uint8)),
                         ("v", np.ones((L, 1), np.uint8), np.ones((G, 1), np.uint8))):
         # merge double-line walls (window drawn as two thin parallel lines) into one solid band
-        P = max(3, int(round(0.8 * T)))
+        P = max(3, int(round(0.8 * T))) | 1
         perp = np.ones((P, 1), np.uint8) if o == "h" else np.ones((1, P), np.uint8)
         m = cv2.morphologyEx(full.astype(np.uint8), cv2.MORPH_CLOSE, perp)
-        # keep only genuinely long runs in this direction FIRST, then bridge small gaps between them
-        # (bridging first would join side-by-side perpendicular walls into fake material)
+        # keep only runs in this direction, then close 1-2 px gaps (no larger bridging: the model decides)
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ker)
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, gap)
-        for comp, st in _components(m, L * 2):
+        for comp, st in _components(m, L):
             x, y, w, h = st[:4]
             c = comp[y:y + h, x:x + w]
             if o == "h":                         # work in "vertical" orientation: runs go down rows
@@ -421,7 +422,7 @@ def _frame_walls(full, openings_any, icon, T):
                 off_run, off_across = y, x
             for centre, a0, a1, t in _straight_runs(c, L, G, T):
                 segs.append({"o": o, "c": off_across + centre, "a0": float(off_run + a0),
-                             "a1": float(off_run + a1), "t": max(t, 0.6 * T)})
+                             "a1": float(off_run + a1), "t": t})      # thickness as the model drew it
     for o in "hv":
         idx = [i for i, s in enumerate(segs) if s["o"] == o]
         if idx:
@@ -457,19 +458,22 @@ def _frame_walls(full, openings_any, icon, T):
                 if p["o"] == sg["o"] or not (p["a0"] - reach <= sg["c"] <= p["a1"] + reach):
                     continue
                 tol = p["t"] / 2 + (1.5 * T if "snap_corners" in ASSIST else 2.0)
+                if abs(sg["a0"] - p["c"]) <= tol and abs(sg["a1"] - p["c"]) <= tol:
+                    continue                         # both ends inside the same wall: a block (column), not a joint
                 if abs(sg["a0"] - p["c"]) <= tol:
                     sg["a0"] = p["c"] - p["t"] / 2
                     sg["j0"] = (p["c"], p["t"])      # joined: perpendicular centre-line + thickness
                 if abs(sg["a1"] - p["c"]) <= tol:
                     sg["a1"] = p["c"] + p["t"] / 2
                     sg["j1"] = (p["c"], p["t"])
-    segs = [sg for sg in segs if sg["a1"] - sg["a0"] >= 2 * T]
+    segs = [sg for sg in segs if sg["a1"] - sg["a0"] >= 1.5 * T]
 
     # openings -> intervals on their host wall
     openings = []
     for kind, cls in (("door", DOOR), ("window", WIN)):
         for comp, st in _components(icon == cls, max(12, 0.3 * T * T)):
             x, y, w, h = [float(v) for v in st[:4]]
+            x, y = x - 0.5, y - 0.5                     # pixel edges, same convention as the wall centre-lines
             cx, cy = x + w / 2, y + h / 2
             best, best_ov = None, 0.0
             for i, s in enumerate(segs):
@@ -670,6 +674,102 @@ def _drawn_windows(segs, merged, image, T, model_shape):
     return segs, merged, found
 
 
+def _skeleton_paths(sk):
+    """Skeleton pixels -> list of ordered pixel paths, split at junctions and ends."""
+    ys, xs = np.nonzero(sk)
+    pix = set(zip(xs.tolist(), ys.tolist()))
+    nb = lambda p: [(p[0] + dx, p[1] + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                    if (dx or dy) and (p[0] + dx, p[1] + dy) in pix]
+    deg = {p: len(nb(p)) for p in pix}
+    nodes = {p for p, d in deg.items() if d != 2}
+    seen_edges, paths = set(), []
+
+    def walk(a, b):
+        path = [a, b]
+        prev, cur = a, b
+        while cur not in nodes:
+            nxt = [q for q in nb(cur) if q != prev and (min(cur, q), max(cur, q)) not in seen_edges]
+            if not nxt:
+                break
+            seen_edges.add((min(cur, nxt[0]), max(cur, nxt[0])))
+            prev, cur = cur, nxt[0]
+            path.append(cur)
+        return path
+
+    for a in nodes:
+        for b in nb(a):
+            e = (min(a, b), max(a, b))
+            if e in seen_edges:
+                continue
+            seen_edges.add(e)
+            paths.append(walk(a, b))
+    left = [p for p in pix if p not in nodes and not any((min(p, q), max(p, q)) in seen_edges for q in nb(p))]
+    while left:                                               # closed loops (no ends, no junctions)
+        a = left[0]
+        nodes.add(a)
+        for b in nb(a)[:1]:
+            seen_edges.add((min(a, b), max(a, b)))
+            paths.append(walk(a, b))
+        nodes.discard(a)
+        done = {q for pth in paths for q in pth}
+        left = [p for p in left if p not in done]
+    return paths
+
+
+def _trace_leftovers(model_wall, segs, T):
+    """Model wall pixels that no straight wall explains (curved walls, irregular pieces): follow the mask's
+    centre-line with straight pieces (Revit walls are straight) no further than ~T/4 from it, thickness as drawn."""
+    claimed = np.zeros(model_wall.shape, np.uint8)
+    for sg in segs:
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+        n = np.array([-d[1], d[0]]) * (sg["t"] / 2 + 1)
+        # joined ends reach on by half the other wall's thickness (the corner block the 3D / Revit wall fills)
+        p0 = p0 - d * ((sg["j0"][1] / 2 if "j0" in sg else 0) + 1)
+        p1 = p1 + d * ((sg["j1"][1] / 2 if "j1" in sg else 0) + 1)
+        cv2.fillPoly(claimed, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n])).astype(np.int32)], 1)
+    left = model_wall & ~(claimed > 0)
+    out = []
+    for comp, st in _components(left, max(4, int(0.25 * T * T))):
+        dist = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
+        sk = skeletonize(comp)
+        if comp.sum() < 2 * sk.sum():                        # a 1 px sliver along a wall's edge (rounding)
+            continue
+        ys_, xs_ = np.nonzero(comp)
+        (cx, cy), (rw, rh), ang = cv2.minAreaRect(np.stack([xs_, ys_], 1).astype(np.float32))
+        rw, rh = rw + 1, rh + 1                              # pixel centres -> pixel edges
+        if comp.sum() >= 0.8 * rw * rh and (sk.sum() < 1.5 * T or max(rw, rh) < 3 * min(rw, rh)):
+            # a solid block (column, pier, short thick piece): one wall exactly over it, its real size and angle
+            a_ = np.radians(ang if rw >= rh else ang + 90)
+            d = np.array([np.cos(a_), np.sin(a_)]) * max(rw, rh) / 2
+            out.append({"o": "a", "frame": "trace", "t": float(min(rw, rh)), "p0": [cx - d[0], cy - d[1]],
+                        "p1": [cx + d[0], cy + d[1]], "j0_hv": False, "j1_hv": False})
+            continue
+        if sk.sum() < 1.5 * T:
+            continue
+        for path in _skeleton_paths(sk):
+            if len(path) < 1.5 * T:
+                continue
+            pts = np.array(path, np.float32).reshape(-1, 1, 2)
+            poly = cv2.approxPolyDP(pts, max(1.0, T / 4), False).reshape(-1, 2).astype(float)
+            idx = [int(np.argmin(np.abs(np.array(path) - q).sum(1))) for q in poly]
+            pieces = []
+            for k in range(len(poly) - 1):
+                seg_px = np.array(path[idx[k]:idx[k + 1] + 1])
+                t = 2 * float(np.median(dist[seg_px[:, 1], seg_px[:, 0]])) if len(seg_px) else T
+                pieces.append({"o": "a", "frame": "trace", "t": max(t, 1.0),
+                               "p0": [float(poly[k][0]), float(poly[k][1])],
+                               "p1": [float(poly[k + 1][0]), float(poly[k + 1][1])],
+                               "j0_hv": False, "j1_hv": False})
+            for k, pc in enumerate(pieces):                   # neighbours share their bend point: close the joint
+                if k > 0:
+                    pc["j0"] = (None, pieces[k - 1]["t"])
+                if k < len(pieces) - 1:
+                    pc["j1"] = (None, pieces[k + 1]["t"])
+            out.extend(pc for pc in pieces if np.hypot(pc["p1"][0] - pc["p0"][0], pc["p1"][1] - pc["p0"][1]) >= 1)
+    return out
+
+
 def vectorise(room, icon, image=None):
     wall = room == WALL
     openings_any = np.isin(icon, [WIN, DOOR])
@@ -682,7 +782,7 @@ def vectorise(room, icon, image=None):
     # so thin partitions and walls detached from the main structure are kept)
     # (no morphological opening: it erases thin double-line window walls the model got right;
     #  specks are removed by size below)
-    comps = _components(wall, max(10, int(1.5 * T * T)))
+    comps = _components(wall, max(4, int(0.25 * T * T)))     # only specks well under a wall's size
     if not comps:
         raise RuntimeError("No walls detected.")
     wall = np.any([m for m, s in comps], axis=0)
@@ -738,15 +838,30 @@ def vectorise(room, icon, image=None):
             segs.append(sg)
             cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"] + T))))
-    # the same wall found in two frames (a straight angled wall + staircase stubs of it, or two close angles):
-    # longest first; a piece mostly inside an already accepted wall of another frame is a duplicate
+    # the same wall found in two frames (a straight angled wall + staircase stubs of it, a square column read as
+    # a diamond in a 45 degree frame, ...): the piece whose band lies best on the model's wall pixels wins, then
+    # the longer one; a piece mostly inside an already accepted wall of another frame is a duplicate
     if done_angles:
         seg_len = lambda sg: np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
-        bands = {}
-        for sg in sorted(segs, key=lambda sg: -seg_len(sg)):
+
+        def band(sg, extra=0.0):
             m = np.zeros(full.shape, np.uint8)
-            cv2.line(m, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
-                     1, max(1, int(round(sg["t"]))))
+            p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+            d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+            n = np.array([-d[1], d[0]]) * (sg["t"] + extra) / 2
+            cv2.fillPoly(m, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n])).astype(np.int32)], 1)
+            return m
+
+        full_d = cv2.dilate(full.astype(np.uint8), np.ones((3, 3), np.uint8))
+        for sg in segs:
+            m = band(sg)
+            sg["_fit"] = float((m & full_d).sum() / max(1, m.sum()))
+        bands = {}
+        for sg in sorted(segs, key=lambda sg: (-round(sg["_fit"], 2), -seg_len(sg))):
+            if sg["frame"] != 0 and (sg["_fit"] < 0.9 or sg["t"] <= 2):   # or a rotation sliver
+                sg["drop"] = True        # a chord across a curve, not a straight wall: the tracer follows it
+                continue
+            m = band(sg)
             area = m.sum()
             other = np.zeros(full.shape, np.uint8)
             for fr, bm in bands.items():
@@ -757,8 +872,9 @@ def vectorise(room, icon, image=None):
                 sg["drop"] = True
                 continue
             bm = bands.setdefault(sg["frame"], np.zeros(full.shape, np.uint8))
-            cv2.line(bm, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
-                     1, max(1, int(round(sg["t"] + T))))
+            bm |= band(sg, T)
+        for sg in segs:
+            sg.pop("_fit", None)
     # every wall must run ON wall pixels for most of its length: a thick wall seen from a slightly different
     # angle leaves a short diagonal "wall" that only crosses the real band (and sticks out of it)
     Hh, Ww = full.shape
@@ -778,12 +894,16 @@ def vectorise(room, icon, image=None):
     merged = [dict(o, wall=kmap[o["wall"]]) for o in merged if o["wall"] in kmap]
     segs = _join_across([segs[i] for i in keep_idx], T)
     segs_ok = [i for i, sg in enumerate(segs) if not sg.get("drop") and
-               np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1]) >= 2 * T]
+               np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1]) >= 1.5 * T]
     if not segs_ok:
         raise RuntimeError("No straight walls found. Try MAX_SIDE = 1024 or 1536, or a cleaner plan image.")
     remap = {i: k for k, i in enumerate(segs_ok)}
     segs = [segs[i] for i in segs_ok]
     merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
+    traced = _trace_leftovers(model_wall, segs, T)
+    if traced:
+        print("  walls traced along the model's mask (curves / irregular pieces): {}".format(len(traced)))
+    segs = segs + traced
     n_win = 0
     if "drawn_windows" in ASSIST:
         segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
@@ -801,12 +921,17 @@ def vectorise(room, icon, image=None):
         d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
         n = np.array([-d[1], d[0]]) * sg["t"] / 2
         cv2.fillPoly(struct, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n])).astype(np.int32)], 1)
-    # how much of the model's wall prediction made it into the vector walls
-    covered = cv2.dilate(struct, np.ones((max(3, int(T)),) * 2, np.uint8)) > 0
-    missed = model_wall & ~covered
+    # faithfulness, both ways, with 1 px tolerance (edge rounding only):
+    #   coverage = share of the model's wall pixels that are inside a vector wall
+    #   added    = share of the vector walls' pixels where the model marked no wall and no door / window
+    k3 = np.ones((3, 3), np.uint8)
+    missed = model_wall & ~(cv2.dilate(struct, k3) > 0)
+    extra = (struct > 0) & ~(cv2.dilate((model_wall | openings_any).astype(np.uint8), k3) > 0)
     coverage = 1.0 - missed.sum() / max(1, model_wall.sum())
+    added = extra.sum() / max(1, int((struct > 0).sum()))
     return {"T": T, "walls": segs, "openings": merged, "stairs": stairs, "full": struct > 0,
             "model_wall": model_wall, "missed": missed, "coverage": float(coverage),
+            "added": float(added), "extra": extra,
             "openings_mask": full & ~wall}
 
 
@@ -2272,7 +2397,7 @@ def _split_unsupported(walls, openings, segs, room, s, T):
     model wall pixels and no opening is cut out again (an open porch front stays open)."""
     wallpx = cv2.dilate((room == WALL).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     Hh, Ww = wallpx.shape
-    min_gap = max(0.3, 2 * T * s)
+    min_gap = 3 * s                       # any break longer than 2-3 px of antialiasing stays open
     out_w, remap = [], {}
     for i, (w, sg) in enumerate(zip(walls, segs)):
         p0, p1 = np.array(sg["p0"], float), np.array(sg["p1"], float)
@@ -3104,8 +3229,9 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
     fig = plt.figure(figsize=(30, 10))
     ax = fig.add_subplot(1, 3, 1)
     ax.imshow(img); ax.axis("off")
-    ax.set_title("model walls kept {:.1f}%  (yellow = model wall pixels not in Revit walls)".format(
-        100 * v["coverage"]), fontsize=13)
+    ax.set_title("model walls kept {:.1f}%, added {:.1f}%  (yellow = model wall not in Revit walls, "
+                 "cyan = Revit wall the model did not mark)".format(100 * v["coverage"], 100 * v.get("added", 0)),
+                 fontsize=13)
     mp = plan["mapping"]
     for axis in ("x", "y"):
         for px, m in zip(mp["axes"][axis]["px"], mp["axes"][axis]["m"]):
@@ -3120,6 +3246,8 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
         ax.add_patch(plt.Polygon([p0 - n, p1 - n, p1 + n, p0 + n], fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
     miss = np.zeros(v["missed"].shape + (4,))
     miss[v["missed"]] = (1.0, 0.85, 0.0, 1.0)
+    if v.get("extra") is not None:
+        miss[v["extra"]] = (0.0, 0.85, 1.0, 1.0)
     ax.imshow(miss)
     _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
     _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
@@ -3158,6 +3286,7 @@ def print_report(plan):
     for r in plan["rooms"]:
         print("  room: {:<34} {:>6.2f} m2".format(r["name"], r["area_m2"]))
     print("  model wall pixels kept in Revit walls: {:.1f}%".format(100 * plan.get("coverage", 0)))
+    print("  Revit wall area the model did not mark: {:.1f}%".format(100 * plan.get("added", 0)))
     if plan.get("furniture"):
         cnt = {}
         for fu in plan["furniture"]:
@@ -3453,6 +3582,7 @@ def main(img=None, room=None, icon=None, original=None):
         fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
+    plan["added"] = round(v.get("added", 0.0), 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
         dropped = 0

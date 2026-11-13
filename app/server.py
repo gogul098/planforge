@@ -28,6 +28,8 @@ LOCK = threading.Lock()          # the pipeline uses module-level settings -> on
 STATUS = {}                      # job -> {"state", "progress", "msg", ...}
 UNIT_M = {0: None, 1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 14: 0.1}   # DXF $INSUNITS -> metres
 OUT_FILES = ("plan.json", "model.ifc", "model.glb", "model_faithful.glb", "preview.png", "build_in_revit.py")
+MAX_UPLOAD = 50 * 2 ** 20                                   # bytes
+JOB_TTL_S = float(os.environ.get("PLANFORGE_JOB_TTL_H", "24")) * 3600   # finished jobs are deleted after this
 
 app = FastAPI(title="PlanForge")
 
@@ -41,6 +43,40 @@ def _warm():
         except Exception as e:
             print("model preload failed (will retry on first plan):", e)
     threading.Thread(target=go, daemon=True).start()
+    threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+
+def cleanup_jobs(now=None):
+    """Delete job folders older than JOB_TTL_S so the instance's disk does not fill up. Running jobs are kept."""
+    now = now or time.time()
+    removed = 0
+    for job in os.listdir(JOBS):
+        d = os.path.join(JOBS, job)
+        if not os.path.isdir(d) or STATUS.get(job, {}).get("state") in ("queued", "running"):
+            continue
+        try:
+            age = now - os.path.getmtime(d)
+            sp = os.path.join(d, "status.json")
+            if os.path.exists(sp):
+                age = min(age, now - os.path.getmtime(sp))
+        except OSError:
+            continue
+        if age > JOB_TTL_S:
+            shutil.rmtree(d, ignore_errors=True)
+            STATUS.pop(job, None)
+            removed += 1
+    if removed:
+        print("cleanup: removed {} old job(s)".format(removed))
+    return removed
+
+
+def _cleanup_loop():
+    while True:
+        try:
+            cleanup_jobs()
+        except Exception as e:
+            print("cleanup failed:", e)
+        time.sleep(3600)
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402  the website may be hosted elsewhere
 # The website lives on Vercel; this engine only answers /api/*. Set ALLOWED_ORIGINS (comma separated) to lock it to
@@ -187,10 +223,18 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
     work = os.path.join(JOBS, job)
     os.makedirs(work)
     src = os.path.join(work, "input" + ext)
-    with open(src, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    if os.path.getsize(src) > 50 * 2 ** 20:
-        raise HTTPException(413, "File is larger than 50 MB")
+    size = 0
+    with open(src, "wb") as f:                     # stop as soon as the limit is passed, not after the whole upload
+        while True:
+            chunk = await file.read(2 ** 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD:
+                f.close()
+                shutil.rmtree(work, ignore_errors=True)
+                raise HTTPException(413, "File is larger than 50 MB")
+            f.write(chunk)
     opt = json.loads(options or "{}")
     _set(job, state="queued", progress=0.0, msg="Waiting in queue", name=file.filename)
     threading.Thread(target=run_job, args=(job, src, ext, opt), daemon=True).start()

@@ -1,13 +1,26 @@
-p3 = open("plan_to_3d.py").read()
+"""Builds the single-file pipeline from the modules in this folder.
+Writes  app/pipeline.py         (used by the engine; do not edit it by hand)
+and     pipeline/plan_to_revit.py (the same code, to paste into a Kaggle cell; git-ignored).
+Run from anywhere:  python pipeline/assemble.py"""
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def read(name):
+    return open(os.path.join(HERE, name)).read()
+
+
+p3 = read("plan_to_3d.py")
 core = p3[p3.index("# ----------------------------------------------------------------------------- 1. model inference"):
           p3.index("# ----------------------------------------------------------------------------- 3. scale + rooms + json")]
-dim = open("dimsolve.py").read()
+dim = read("dimsolve.py")
 dim = dim[dim.index("NUM = re.compile"):]
-parts = open("revit_parts.py").read()
-fc = open("furn_common.py").read()
+parts = read("revit_parts.py")
+fc = read("furn_common.py")
 fc = fc[fc.index("# FloorPlanCAD classes"):]
-fparts = open("furn_parts.py").read()
-stp = open("stairs.py").read()
+fparts = read("furn_parts.py")
+stp = read("stairs.py")
 header = '''# ===================== FLOOR PLAN -> EXACT 3D FOR REVIT =====================
 # Reads the plan with your model + OCR, solves wall positions from the WRITTEN dimensions,
 # and writes plan.json (for build_in_revit.py), model.ifc (Revit: Open/Link IFC) and model.glb (preview).
@@ -72,6 +85,10 @@ LAST_ICON_PROB = None
 
 '''
 dim_hdr = "# ----------------------------------------------------------------------------- 2b. dimension solving (OCR)\n"
-open("plan_to_revit.py", "w").write(header + core + dim_hdr + dim + "\n\n" +
-     "# ----------------------------------------------------------------------------- furniture detector helpers\n" +
-     fc + "\n\n" + fparts + "\n\n" + stp + "\n\n" + parts)
+code = (header + core + dim_hdr + dim + "\n\n" +
+        "# ----------------------------------------------------------------------------- furniture detector helpers\n" +
+        fc + "\n\n" + fparts + "\n\n" + stp + "\n\n" + parts)
+open(os.path.join(HERE, "plan_to_revit.py"), "w").write(code)
+open(os.path.join(HERE, "..", "app", "pipeline.py"), "w").write(
+    "# generated from pipeline/ by assemble.py - do not edit\n" + code)
+print("wrote app/pipeline.py and pipeline/plan_to_revit.py")
