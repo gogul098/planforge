@@ -62,19 +62,55 @@ LAST_ICON_PROB = None
 
 
 # ----------------------------------------------------------------------------- 1. model inference
+def _softmax(z, axis=0):
+    z = z - z.max(axis, keepdims=True)
+    np.exp(z, out=z)
+    z /= z.sum(axis, keepdims=True)
+    return z
+
+
 def _net_probs(net, dev, img):
-    """RGB image -> (room probs 12xHxW, icon probs 12xHxW), with horizontal-flip averaging."""
-    import torch
+    """RGB image -> (room probs 12xHxW, icon probs 12xHxW), with horizontal-flip averaging.
+    `net` is a PyTorch model (Kaggle) or an ONNX Runtime session (server: no PyTorch needed)."""
     h, w = img.shape[:2]
     pad = cv2.copyMakeBorder(img, 0, (32 - h % 32) % 32, 0, (32 - w % 32) % 32,
                              cv2.BORDER_CONSTANT, value=(255, 255, 255))
-    x = (pad.astype(np.float32) - [123.675, 116.28, 103.53]) / [58.395, 57.12, 57.375]
-    x = torch.from_numpy(x.transpose(2, 0, 1)).float()[None].to(dev)
+    x = ((pad.astype(np.float32) - [123.675, 116.28, 103.53]) / [58.395, 57.12, 57.375]).astype(np.float32)
+    x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
+    if dev == "onnx":
+        name = net.get_inputs()[0].name
+        out = net.run(None, {name: x})[0][0]
+        out += net.run(None, {name: np.ascontiguousarray(x[:, :, :, ::-1])})[0][0][:, :, ::-1]
+        out = out[:24, :h, :w] / 2
+        return _softmax(out[:12].copy()), _softmax(out[12:24].copy())
+    import torch
+    xt = torch.from_numpy(x).to(dev)
     with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
-        out = (net(x).float() + net(x.flip(3)).float().flip(3)) / 2
+        out = (net(xt).float() + net(xt.flip(3)).float().flip(3)) / 2
     out = out[0, :, :h, :w]
     return (torch.softmax(out[:12], 0).cpu().numpy().astype(np.float32),
             torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float32))
+
+
+def _onnx_session(path):
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = max(1, os.cpu_count() or 1)
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.enable_mem_pattern = False                      # inputs change size from plan to plan
+    return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+
+
+def use_onnx():
+    """ONNX Runtime when PyTorch is not installed (the server image), or when asked (PLANFORGE_BACKEND=onnx)."""
+    want = os.environ.get("PLANFORGE_BACKEND", "").lower()
+    if want in ("onnx", "torch"):
+        return want == "onnx"
+    try:
+        import torch  # noqa: F401
+        return False
+    except ImportError:
+        return True
 
 
 # ----------------------------------------------------------------------------- model store
@@ -181,11 +217,27 @@ def _load_model(force_check=False):
     """The model is loaded once and kept in memory. Every MODEL_CHECK_S seconds (between plans) the
     Hugging Face release tag is checked; only if it moved is the new checkpoint downloaded and swapped in.
     If Hugging Face cannot be reached, the model already loaded keeps working."""
-    import time, torch, segmentation_models_pytorch as smp
+    import time
     now = time.time()
     if _MODEL["net"] is not None and not force_check and (MODEL_CHECK_S <= 0 or now - _MODEL["checked"] < MODEL_CHECK_S):
         return _MODEL["net"], _MODEL["dev"]
     _MODEL["checked"] = now
+    if use_onnx():
+        try:
+            rev, paths = model_files(HF_REPO, ["checkpoints/model.onnx"], recheck=_MODEL["net"] is not None)
+        except Exception as e:
+            if _MODEL["net"] is not None:
+                print("model update check failed ({}); keeping the loaded model".format(e))
+                return _MODEL["net"], _MODEL["dev"]
+            raise RuntimeError("ONNX model not found ({}). Run the export cell (kaggle/export_onnx.py) once to publish "
+                               "checkpoints/model.onnx to Hugging Face.".format(e))
+        if _MODEL["net"] is not None and rev == _MODEL["rev"]:
+            return _MODEL["net"], _MODEL["dev"]
+        sess = _onnx_session(paths["checkpoints/model.onnx"])
+        meta = sess.get_modelmeta().custom_metadata_map
+        _MODEL.update(net=sess, dev="onnx", rev=rev, info="{}, ONNX Runtime".format(meta.get("info", "")))
+        print("model loaded (ONNX): revision", rev)
+        return sess, "onnx"
     local = "/kaggle/working/checkpoints/best.pt"
     if os.path.exists(local):
         ckpt, rev = local, "local"
@@ -200,6 +252,7 @@ def _load_model(force_check=False):
         if _MODEL["net"] is not None and rev == _MODEL["rev"]:
             return _MODEL["net"], _MODEL["dev"]
         ckpt = paths["checkpoints/best.pt"]
+    import torch, segmentation_models_pytorch as smp
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
@@ -1141,10 +1194,45 @@ def dataset_px_per_m(stats):
 
 
 # ----------------------------------------------------------------------------- inference on a plan
+def _onnx_names(sess):
+    import ast
+    return ast.literal_eval(sess.get_modelmeta().custom_metadata_map.get("names", "{}"))
+
+
+def _obb_onnx(sess, crop_rgb, conf):
+    """Ultralytics YOLO-OBB exported to ONNX: output (1, 4 + classes + 1, N) = cx, cy, w, h, class scores, angle (rad).
+    Returns [(corners 4x2 in crop px, class id, score)]; overlaps are merged later by rotated_nms."""
+    x = np.ascontiguousarray((crop_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None])
+    out = sess.run(None, {sess.get_inputs()[0].name: x})[0][0]          # (4 + nc + 1, N)
+    nc = out.shape[0] - 5
+    scores = out[4:4 + nc]
+    cls = scores.argmax(0)
+    sc = scores[cls, np.arange(scores.shape[1])]
+    keep = np.nonzero(sc >= conf)[0]
+    if len(keep) > 1:                                  # same NMS Ultralytics applies (rotated, per class)
+        rects = [((float(out[0, k]), float(out[1, k])), (float(out[2, k]), float(out[3, k])),
+                  float(np.degrees(out[4 + nc, k]))) for k in keep]
+        sel = []
+        for c_ in np.unique(cls[keep]):
+            idx = [j for j, k in enumerate(keep) if cls[k] == c_]
+            r = cv2.dnn.NMSBoxesRotated([rects[j] for j in idx], [float(sc[keep[j]]) for j in idx], conf, 0.7)
+            sel += [idx[int(j)] for j in np.array(r).reshape(-1)]
+        keep = keep[sorted(sel)]
+    res = []
+    for k in keep:
+        cx, cy, w, h = out[:4, k]
+        a = float(out[4 + nc, k])
+        c, s_ = np.cos(a), np.sin(a)
+        dx, dy = np.array([c, s_]) * w / 2, np.array([-s_, c]) * h / 2
+        ctr = np.array([cx, cy])
+        res.append((np.array([ctr + dx + dy, ctr + dx - dy, ctr - dx - dy, ctr - dx + dy]), int(cls[k]), float(sc[k])))
+    return res
+
+
 def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25):
     """Rescale the plan so furniture has its training size, run tiled OBB detection, merge.
     Returns list of dicts in ORIGINAL image pixels: cls, conf, corners(4x2)."""
-    names = model.names
+    names = model.names if hasattr(model, "names") else _onnx_names(model)
     base = train_px_per_m / plan_px_per_m if (train_px_per_m and plan_px_per_m) else 1.0
     scales = [base * f for f in ZOOM_FACTORS]              # several zooms, merged below
     found = []
@@ -1164,20 +1252,22 @@ def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, t
                 crop = np.full((tile, tile, 3), 255, np.uint8)
                 c = im[y0:y0 + tile, x0:x0 + tile]
                 crop[:c.shape[0], :c.shape[1]] = c
-                res = model.predict(crop[:, :, ::-1], imgsz=tile, conf=conf, verbose=False)[0]
-                if res.obb is None or len(res.obb) == 0:
-                    continue
-                pts = res.obb.xyxyxyxy.cpu().numpy()
-                for k in range(len(pts)):
-                    p = pts[k].reshape(4, 2)
+                if hasattr(model, "run"):                     # ONNX Runtime session
+                    boxes = _obb_onnx(model, crop, conf)
+                else:
+                    res = model.predict(crop[:, :, ::-1], imgsz=tile, conf=conf, verbose=False)[0]
+                    if res.obb is None or len(res.obb) == 0:
+                        continue
+                    pts_ = res.obb.xyxyxyxy.cpu().numpy()
+                    boxes = [(pts_[k].reshape(4, 2), int(res.obb.cls[k]), float(res.obb.conf[k])) for k in range(len(pts_))]
+                for p, ci, cf in boxes:
                     cx, cy = p[:, 0].mean(), p[:, 1].mean()
                     # ignore detections centred in the overlap margin of an inner tile edge
                     m = tile * overlap / 2
                     if (x0 > 0 and cx < m) or (y0 > 0 and cy < m) or \
                        (x0 + tile < W and cx > tile - m) or (y0 + tile < H and cy > tile - m):
                         continue
-                    found.append({"cls": names[int(res.obb.cls[k])], "conf": float(res.obb.conf[k]),
-                                  "corners": (p + [x0, y0]) / s})
+                    found.append({"cls": names[int(ci)], "conf": float(cf), "corners": (p + [x0, y0]) / s})
     return rotated_nms(found)
 
 
@@ -1300,14 +1390,23 @@ def detector_furniture(img, mpp):
     """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
     if not FURNITURE_REPO:
         return []
+    onnx = use_onnx()
+    wfile = "checkpoints/best.onnx" if onnx else "checkpoints/best.pt"
     try:
-        _, fp = model_files(FURNITURE_REPO, ["checkpoints/best.pt", "furniture_meta.json"])
-        w = fp["checkpoints/best.pt"]
+        _, fp = model_files(FURNITURE_REPO, [wfile, "furniture_meta.json"])
+        w = fp[wfile]
         meta = json.load(open(fp["furniture_meta.json"]))
     except Exception as e:
         print("furniture detector not available yet ({}): using fixtures from the floor-plan model only".format(
             type(e).__name__))
         return []
+    if onnx:
+        if _YOLO.get("w") != w:
+            _YOLO.update(w=w, net=_onnx_session(w))
+        dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
+                                conf=FURNITURE_LOW_CONF)
+        return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
+                for d in dets if d["cls"] in FURN_SPEC]
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
     os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/yolo")

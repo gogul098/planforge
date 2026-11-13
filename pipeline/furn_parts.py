@@ -94,14 +94,23 @@ def detector_furniture(img, mpp):
     """Run the furniture detector from your HF repo (skipped if it is not trained yet)."""
     if not FURNITURE_REPO:
         return []
+    onnx = use_onnx()
+    wfile = "checkpoints/best.onnx" if onnx else "checkpoints/best.pt"
     try:
-        _, fp = model_files(FURNITURE_REPO, ["checkpoints/best.pt", "furniture_meta.json"])
-        w = fp["checkpoints/best.pt"]
+        _, fp = model_files(FURNITURE_REPO, [wfile, "furniture_meta.json"])
+        w = fp[wfile]
         meta = json.load(open(fp["furniture_meta.json"]))
     except Exception as e:
         print("furniture detector not available yet ({}): using fixtures from the floor-plan model only".format(
             type(e).__name__))
         return []
+    if onnx:
+        if _YOLO.get("w") != w:
+            _YOLO.update(w=w, net=_onnx_session(w))
+        dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
+                                conf=FURNITURE_LOW_CONF)
+        return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
+                for d in dets if d["cls"] in FURN_SPEC]
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
     os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/yolo")

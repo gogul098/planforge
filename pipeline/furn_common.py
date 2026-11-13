@@ -85,10 +85,45 @@ def dataset_px_per_m(stats):
 
 
 # ----------------------------------------------------------------------------- inference on a plan
+def _onnx_names(sess):
+    import ast
+    return ast.literal_eval(sess.get_modelmeta().custom_metadata_map.get("names", "{}"))
+
+
+def _obb_onnx(sess, crop_rgb, conf):
+    """Ultralytics YOLO-OBB exported to ONNX: output (1, 4 + classes + 1, N) = cx, cy, w, h, class scores, angle (rad).
+    Returns [(corners 4x2 in crop px, class id, score)]; overlaps are merged later by rotated_nms."""
+    x = np.ascontiguousarray((crop_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None])
+    out = sess.run(None, {sess.get_inputs()[0].name: x})[0][0]          # (4 + nc + 1, N)
+    nc = out.shape[0] - 5
+    scores = out[4:4 + nc]
+    cls = scores.argmax(0)
+    sc = scores[cls, np.arange(scores.shape[1])]
+    keep = np.nonzero(sc >= conf)[0]
+    if len(keep) > 1:                                  # same NMS Ultralytics applies (rotated, per class)
+        rects = [((float(out[0, k]), float(out[1, k])), (float(out[2, k]), float(out[3, k])),
+                  float(np.degrees(out[4 + nc, k]))) for k in keep]
+        sel = []
+        for c_ in np.unique(cls[keep]):
+            idx = [j for j, k in enumerate(keep) if cls[k] == c_]
+            r = cv2.dnn.NMSBoxesRotated([rects[j] for j in idx], [float(sc[keep[j]]) for j in idx], conf, 0.7)
+            sel += [idx[int(j)] for j in np.array(r).reshape(-1)]
+        keep = keep[sorted(sel)]
+    res = []
+    for k in keep:
+        cx, cy, w, h = out[:4, k]
+        a = float(out[4 + nc, k])
+        c, s_ = np.cos(a), np.sin(a)
+        dx, dy = np.array([c, s_]) * w / 2, np.array([-s_, c]) * h / 2
+        ctr = np.array([cx, cy])
+        res.append((np.array([ctr + dx + dy, ctr + dx - dy, ctr - dx - dy, ctr - dx + dy]), int(cls[k]), float(sc[k])))
+    return res
+
+
 def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, tile=1024, overlap=0.25):
     """Rescale the plan so furniture has its training size, run tiled OBB detection, merge.
     Returns list of dicts in ORIGINAL image pixels: cls, conf, corners(4x2)."""
-    names = model.names
+    names = model.names if hasattr(model, "names") else _onnx_names(model)
     base = train_px_per_m / plan_px_per_m if (train_px_per_m and plan_px_per_m) else 1.0
     scales = [base * f for f in ZOOM_FACTORS]              # several zooms, merged below
     found = []
@@ -108,20 +143,22 @@ def detect_furniture(model, img_rgb, plan_px_per_m, train_px_per_m, conf=0.35, t
                 crop = np.full((tile, tile, 3), 255, np.uint8)
                 c = im[y0:y0 + tile, x0:x0 + tile]
                 crop[:c.shape[0], :c.shape[1]] = c
-                res = model.predict(crop[:, :, ::-1], imgsz=tile, conf=conf, verbose=False)[0]
-                if res.obb is None or len(res.obb) == 0:
-                    continue
-                pts = res.obb.xyxyxyxy.cpu().numpy()
-                for k in range(len(pts)):
-                    p = pts[k].reshape(4, 2)
+                if hasattr(model, "run"):                     # ONNX Runtime session
+                    boxes = _obb_onnx(model, crop, conf)
+                else:
+                    res = model.predict(crop[:, :, ::-1], imgsz=tile, conf=conf, verbose=False)[0]
+                    if res.obb is None or len(res.obb) == 0:
+                        continue
+                    pts_ = res.obb.xyxyxyxy.cpu().numpy()
+                    boxes = [(pts_[k].reshape(4, 2), int(res.obb.cls[k]), float(res.obb.conf[k])) for k in range(len(pts_))]
+                for p, ci, cf in boxes:
                     cx, cy = p[:, 0].mean(), p[:, 1].mean()
                     # ignore detections centred in the overlap margin of an inner tile edge
                     m = tile * overlap / 2
                     if (x0 > 0 and cx < m) or (y0 > 0 and cy < m) or \
                        (x0 + tile < W and cx > tile - m) or (y0 + tile < H and cy > tile - m):
                         continue
-                    found.append({"cls": names[int(res.obb.cls[k])], "conf": float(res.obb.conf[k]),
-                                  "corners": (p + [x0, y0]) / s})
+                    found.append({"cls": names[int(ci)], "conf": float(cf), "corners": (p + [x0, y0]) / s})
     return rotated_nms(found)
 
 

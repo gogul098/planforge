@@ -30,19 +30,55 @@ WALL, WIN, DOOR, STAIRS = 2, 1, 2, 11   # room-head wall id; icon-head ids
 
 
 # ----------------------------------------------------------------------------- 1. model inference
+def _softmax(z, axis=0):
+    z = z - z.max(axis, keepdims=True)
+    np.exp(z, out=z)
+    z /= z.sum(axis, keepdims=True)
+    return z
+
+
 def _net_probs(net, dev, img):
-    """RGB image -> (room probs 12xHxW, icon probs 12xHxW), with horizontal-flip averaging."""
-    import torch
+    """RGB image -> (room probs 12xHxW, icon probs 12xHxW), with horizontal-flip averaging.
+    `net` is a PyTorch model (Kaggle) or an ONNX Runtime session (server: no PyTorch needed)."""
     h, w = img.shape[:2]
     pad = cv2.copyMakeBorder(img, 0, (32 - h % 32) % 32, 0, (32 - w % 32) % 32,
                              cv2.BORDER_CONSTANT, value=(255, 255, 255))
-    x = (pad.astype(np.float32) - [123.675, 116.28, 103.53]) / [58.395, 57.12, 57.375]
-    x = torch.from_numpy(x.transpose(2, 0, 1)).float()[None].to(dev)
+    x = ((pad.astype(np.float32) - [123.675, 116.28, 103.53]) / [58.395, 57.12, 57.375]).astype(np.float32)
+    x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
+    if dev == "onnx":
+        name = net.get_inputs()[0].name
+        out = net.run(None, {name: x})[0][0]
+        out += net.run(None, {name: np.ascontiguousarray(x[:, :, :, ::-1])})[0][0][:, :, ::-1]
+        out = out[:24, :h, :w] / 2
+        return _softmax(out[:12].copy()), _softmax(out[12:24].copy())
+    import torch
+    xt = torch.from_numpy(x).to(dev)
     with torch.no_grad(), torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
-        out = (net(x).float() + net(x.flip(3)).float().flip(3)) / 2
+        out = (net(xt).float() + net(xt.flip(3)).float().flip(3)) / 2
     out = out[0, :, :h, :w]
     return (torch.softmax(out[:12], 0).cpu().numpy().astype(np.float32),
             torch.softmax(out[12:24], 0).cpu().numpy().astype(np.float32))
+
+
+def _onnx_session(path):
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = max(1, os.cpu_count() or 1)
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.enable_mem_pattern = False                      # inputs change size from plan to plan
+    return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+
+
+def use_onnx():
+    """ONNX Runtime when PyTorch is not installed (the server image), or when asked (PLANFORGE_BACKEND=onnx)."""
+    want = os.environ.get("PLANFORGE_BACKEND", "").lower()
+    if want in ("onnx", "torch"):
+        return want == "onnx"
+    try:
+        import torch  # noqa: F401
+        return False
+    except ImportError:
+        return True
 
 
 # ----------------------------------------------------------------------------- model store
@@ -149,11 +185,27 @@ def _load_model(force_check=False):
     """The model is loaded once and kept in memory. Every MODEL_CHECK_S seconds (between plans) the
     Hugging Face release tag is checked; only if it moved is the new checkpoint downloaded and swapped in.
     If Hugging Face cannot be reached, the model already loaded keeps working."""
-    import time, torch, segmentation_models_pytorch as smp
+    import time
     now = time.time()
     if _MODEL["net"] is not None and not force_check and (MODEL_CHECK_S <= 0 or now - _MODEL["checked"] < MODEL_CHECK_S):
         return _MODEL["net"], _MODEL["dev"]
     _MODEL["checked"] = now
+    if use_onnx():
+        try:
+            rev, paths = model_files(HF_REPO, ["checkpoints/model.onnx"], recheck=_MODEL["net"] is not None)
+        except Exception as e:
+            if _MODEL["net"] is not None:
+                print("model update check failed ({}); keeping the loaded model".format(e))
+                return _MODEL["net"], _MODEL["dev"]
+            raise RuntimeError("ONNX model not found ({}). Run the export cell (kaggle/export_onnx.py) once to publish "
+                               "checkpoints/model.onnx to Hugging Face.".format(e))
+        if _MODEL["net"] is not None and rev == _MODEL["rev"]:
+            return _MODEL["net"], _MODEL["dev"]
+        sess = _onnx_session(paths["checkpoints/model.onnx"])
+        meta = sess.get_modelmeta().custom_metadata_map
+        _MODEL.update(net=sess, dev="onnx", rev=rev, info="{}, ONNX Runtime".format(meta.get("info", "")))
+        print("model loaded (ONNX): revision", rev)
+        return sess, "onnx"
     local = "/kaggle/working/checkpoints/best.pt"
     if os.path.exists(local):
         ckpt, rev = local, "local"
@@ -168,6 +220,7 @@ def _load_model(force_check=False):
         if _MODEL["net"] is not None and rev == _MODEL["rev"]:
             return _MODEL["net"], _MODEL["dev"]
         ckpt = paths["checkpoints/best.pt"]
+    import torch, segmentation_models_pytorch as smp
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
