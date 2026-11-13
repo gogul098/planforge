@@ -18,7 +18,6 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 import pipeline as P
 
@@ -44,7 +43,10 @@ def _warm():
     threading.Thread(target=go, daemon=True).start()
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402  the website may be hosted elsewhere
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# The website lives on Vercel; this engine only answers /api/*. Set ALLOWED_ORIGINS (comma separated) to lock it to
+# your site(s), e.g. "https://planforge.vercel.app,https://planforge.tech". Default "*" = any site.
+_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_ORIGINS, allow_methods=["GET", "POST"], allow_headers=["*"])
 
 
 # ----------------------------------------------------------------------------- input formats
@@ -298,4 +300,12 @@ def catalog():
     return {k: {"height": v[0], "category": v[1]} for k, v in P.FURN_SPEC.items()}
 
 
-app.mount("/", StaticFiles(directory=os.path.join(HERE, "static"), html=True), name="static")
+@app.get("/")
+def root():
+    """API only: the website is hosted separately (Vercel)."""
+    site = os.environ.get("FRONTEND_URL")
+    if site:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(site)
+    return {"service": "PlanForge engine", "api": ["/api/health", "/api/version", "/api/convert", "/api/status/{job}",
+                                                    "/api/files/{job}/{name}"]}

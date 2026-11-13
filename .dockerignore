@@ -13,3 +13,4 @@ docs/
 revit/
 pipeline/
 *.md
+app/static/
