@@ -1662,6 +1662,36 @@ def _chain_flights(infos):
             f_["warnings"] = [w_ for w_ in f_["warnings"] if not w_.startswith("direction not marked")]
 
 
+def _closed_box(run, d, n, ink, thick, Tk):
+    """Furniture symbols (sofas, beds, tables) are nested rectangles: their parallel lines are tied together
+    at both ends by short cross lines. Step lines are not - they stop at an open edge, a wall or a stringer on
+    at most one side. Look along both end edges of the group (wall ink excluded): drawn on both -> a box."""
+    H, W = ink.shape
+    free = ink & (1 - cv2.dilate(thick, np.ones((5, 5), np.uint8)))
+    offs = [q[0] for q in run]
+    o0, o1 = min(offs), max(offs)
+    if o1 - o0 < 1:
+        return False
+    cover = []
+    for u in (float(np.median([q[1] for q in run])), float(np.median([q[2] for q in run]))):
+        hits, tot = 0, 0
+        for o in np.linspace(o0, o1, max(8, int(o1 - o0))):
+            best = 0
+            for du in (-2, -1, 0, 1, 2):                       # the cross line may sit a pixel or two off
+                x, y = (d * (u + du) + n * o).round().astype(int)
+                if 0 <= x < W and 0 <= y < H and free[y, x]:
+                    best = 1
+                    break
+            hits += best
+            tot += 1
+        cover.append(hits / max(tot, 1))
+    width = float(np.median([q[2] - q[1] for q in run]))
+    spacing = (o1 - o0) / max(len(run) - 1, 1)
+    # a flight is wide for its tread spacing (a 1 m stair with 280 mm treads is already ~3.5x);
+    # a furniture symbol is a small box: both ends drawn AND narrow
+    return min(cover) >= 0.3 and width < 3.0 * spacing
+
+
 def drawn_step_regions(original, shape, have_px, wall_px, T):
     """Steps the model did not mark, read from the drawing: 4+ parallel thin lines, evenly spaced about a tread
     apart, overlapping each other (stepped seating, sunken areas, unmarked flights).
@@ -1725,6 +1755,10 @@ def drawn_step_regions(original, shape, have_px, wall_px, T):
                     run.append(L_)
                 elif gap > hi_s:
                     break
+            if len(run) >= 4 and _closed_box(run, d, n, ink, thick, k * T):
+                print("  drawn lines rejected as steps: they close into boxes (furniture), not open treads")
+                i += len(run)
+                continue
             if len(run) >= 4:
                 pts = []
                 for off, u0, u1 in run:
