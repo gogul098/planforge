@@ -2157,6 +2157,74 @@ def _room_name(text):
     return t.title() if len(t) >= 3 and t.isupper() else (t[:1].upper() + t[1:])
 
 
+def _split_unsupported(walls, openings, segs, room, s, T):
+    """A wall exists only where the model marked wall pixels or an opening. Joining pieces of a wall across a gap
+    (to carry a door / window the model marked in it) must not close the rest of the gap: every stretch with no
+    model wall pixels and no opening is cut out again (an open porch front stays open)."""
+    wallpx = cv2.dilate((room == WALL).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    Hh, Ww = wallpx.shape
+    min_gap = max(0.3, 2 * T * s)
+    out_w, remap = [], {}
+    for i, (w, sg) in enumerate(zip(walls, segs)):
+        p0, p1 = np.array(sg["p0"], float), np.array(sg["p1"], float)
+        n = max(2, int(np.hypot(*(p1 - p0))))
+        t = np.linspace(0, 1, n)
+        xs = np.clip(np.round(p0[0] + (p1[0] - p0[0]) * t).astype(int), 0, Ww - 1)
+        ys = np.clip(np.round(p0[1] + (p1[1] - p0[1]) * t).astype(int), 0, Hh - 1)
+        cov = wallpx[ys, xs].copy()
+        a, b = np.array(w["start"], float), np.array(w["end"], float)
+        L = float(np.linalg.norm(b - a)) or 1e-9
+        for o in openings:
+            if o["wall"] == i:
+                cov |= np.abs(t * L - o["offset"]) <= o["width"] / 2 + 0.05
+        # cut stretches longer than min_gap with no support
+        cuts, k = [], 0
+        while k < n:
+            if not cov[k]:
+                j = k
+                while j < n and not cov[j]:
+                    j += 1
+                if (j - k) / n * L >= min_gap:
+                    cuts.append((t[k], t[j - 1]))
+                k = j
+            else:
+                k += 1
+        if not cuts:
+            remap[i] = [(len(out_w), 0.0, 1.0)]
+            out_w.append(w)
+            continue
+        print("  wall {}: {:.2f} m with no model wall pixels and no opening left open (not walled over)".format(
+            i, sum(c1 - c0 for c0, c1 in cuts) * L))
+        pieces, f = [], 0.0
+        for c0, c1 in cuts:
+            pieces.append((f, c0)); f = c1
+        pieces.append((f, 1.0))
+        remap[i] = []
+        for f0, f1 in pieces:
+            if (f1 - f0) * L < 0.2:
+                continue
+            nw = dict(w)
+            nw["start"] = [round(float(c), 4) for c in a + (b - a) * f0]
+            nw["end"] = [round(float(c), 4) for c in a + (b - a) * f1]
+            j0, j1 = list(w.get("joined", [False, False]))
+            nw["joined"] = [j0 if f0 == 0.0 else False, j1 if f1 == 1.0 else False]
+            if "ext" in w:
+                nw["ext"] = [w["ext"][0] if f0 == 0.0 else 0.0, w["ext"][1] if f1 == 1.0 else 0.0]
+            remap[i].append((len(out_w), f0, f1))
+            out_w.append(nw)
+    out_o = []
+    for o in openings:
+        L = float(np.linalg.norm(np.array(walls[o["wall"]]["end"]) - np.array(walls[o["wall"]]["start"]))) or 1e-9
+        f = o["offset"] / L
+        for k_, f0, f1 in remap.get(o["wall"], []):
+            if f0 - 1e-6 <= f <= f1 + 1e-6:
+                out_o.append(dict(o, wall=k_, offset=round(o["offset"] - f0 * L, 4)))
+                break
+    for k_, o in enumerate(out_o):
+        o["id"] = k_
+    return out_w, out_o
+
+
 def build_plan(v, sol, toks, room):
     from shapely.geometry import Polygon, Point, LineString
     from shapely.ops import unary_union
@@ -2275,6 +2343,7 @@ def build_plan(v, sol, toks, room):
             continue
         merged.append(o)
     openings = merged
+    walls, openings = _split_unsupported(walls, openings, segs, room, s, v["T"])
     for i, o in enumerate(openings):
         o["id"] = i
 
