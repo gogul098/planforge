@@ -638,7 +638,9 @@ function renderStats(st) {
   const p = S.plan, pr = p.precision || {};
   $("#s_cov").textContent = p.coverage !== undefined ? (p.coverage * 100).toFixed(1) + "%" : "—";
   $("#s_cov").className = p.coverage >= 0.97 ? "ok" : "";
-  $("#s_dim").textContent = pr.dimensions_read ? `${pr.dimensions_exact}/${pr.dimensions_read}` : "0";
+  const oneScale = (pr.report || []).some((r) => r.status === "superseded");   // one scale for the sheet: all were read
+  $("#s_dim").textContent = pr.dimensions_read ? (oneScale ? `${pr.dimensions_read}` : `${pr.dimensions_exact}/${pr.dimensions_read}`) : "0";
+  const dimLbl = $("#s_dim").nextElementSibling; if (dimLbl) dimLbl.textContent = oneScale ? "dims read" : "dims matched";
   $("#s_rooms").textContent = (p.rooms || []).length;
   $("#s_furn").textContent = S.furn.length;
   $("#s_scale").textContent = (st?.exact_scale ? "Scale: exact, from the DXF drawing units." : "Scale: " + (pr.scale_source || p.mapping?.source || "")) +

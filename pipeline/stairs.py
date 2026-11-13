@@ -427,8 +427,10 @@ def build_stairs(v, toks, room, plan, original=None):
         if "mask" in st:
             stair_px[st["oy"]:st["oy"] + st["mask"].shape[0], st["ox"]:st["ox"] + st["mask"].shape[1]] |= st["mask"]
     walls_px = room == WALL
-    extra = drawn_step_regions(original, room.shape, stair_px, walls_px, v["T"])
-    extra = [st for st in extra if _believable_drawn_steps(st, toks, mpp, pad)]
+    extra = []
+    if "drawn_steps" in ASSIST:
+        extra = drawn_step_regions(original, room.shape, stair_px, walls_px, v["T"])
+        extra = [st for st in extra if _believable_drawn_steps(st, toks, mpp, pad)]
     if extra:
         print("  steps read from the drawing (not marked by the model): {} areas".format(len(extra)))
         for st in extra:
@@ -471,7 +473,10 @@ def build_stairs(v, toks, room, plan, original=None):
             outside = (not footprint.contains(pc)) or (out_frac >= 0.6 and footprint.exterior.distance(pc) < 1.0)
         else:
             outside = out_frac >= 0.4
-        kind = "entrance" if outside else ("terrace" if (shape == "irregular" or st.get("drawn")) else "interior")
+        # a stair the model marks is a stair: outside the building outline it leads up to the floor,
+        # inside it leads to the next floor. Stepped areas (sunken / raised) only with the "stepped_areas" helper.
+        stepped = "stepped_areas" in ASSIST and (shape == "irregular" or st.get("drawn"))
+        kind = "entrance" if outside else ("terrace" if stepped else "interior")
         # distance (model px) to the HIGH side of the stair
         wx0, wy0, wx1, wy1 = _window(room.shape, ox, oy, ox + w, oy + h, pad)
         cx_px, cy_px = float(xs.mean() + ox), float(ys.mean() + oy)
@@ -617,6 +622,10 @@ def build_stairs(v, toks, room, plan, original=None):
             rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
+            if i["n"] and not (0.12 <= total / i["n"] <= 0.21) and i["sources"].get("risers") != "written on the plan":
+                # the converter's own tread count cannot be right for this storey height: do not build it
+                w.append("only {} treads could be read on the drawing: risers set from the storey height".format(i["n"] - 1))
+                i["n"] = None
             if not i["n"]:
                 i["n"] = int(np.clip(round(total / STAIR_RISE), 3, 30))
                 i["sources"]["risers"] = "estimated from the storey height"

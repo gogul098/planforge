@@ -696,7 +696,9 @@ def vectorise(room, icon, image=None):
     remap = {i: k for k, i in enumerate(segs_ok)}
     segs = [segs[i] for i in segs_ok]
     merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
-    segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
+    n_win = 0
+    if "drawn_windows" in ASSIST:
+        segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
     if n_win:
         print("  windows read from the drawing (not marked by the model): {}".format(n_win))
 

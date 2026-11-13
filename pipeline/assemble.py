@@ -33,6 +33,15 @@ SLAB, STAIR_RISE = 0.15, 0.175
 PLINTH_HEIGHT = None          # floor level above ground (m), e.g. 0.45; None = from the plan
 STAIR_RISE_EXT = 0.15         # riser assumed for outside steps / stepped areas when nothing is written
 STEPPED_AREAS = "down"        # stepped areas (L / U steps, seating): "down" = sunken (floor cut out), "up" = raised
+# --- the converter PROJECTS what the model marks; it does not fill in for the model.
+# Helpers that guess what the model missed are OFF. To switch one on for a plan, add its name:
+#   "drawn_windows"  windows read from the drawing where the model marked none
+#   "drawn_steps"    steps read from the drawing where the model marked no stairs
+#   "stepped_areas"  irregular stair areas become sunken / raised stepped areas with open ground
+#   "fill_floor"     carry broken outer walls on and add floor where the wall outline left gaps
+#   "widen_doors"    a door marked too narrow gets a standard width
+#   "furniture_filter"  drop furniture in the wrong room or outside the building
+ASSIST = set()                # e.g. ASSIST = {"drawn_windows", "fill_floor"}
 OUT_DIR = "/kaggle/working/plan_revit"
 
 # --- furniture: fixtures from the floor-plan model + your trained furniture detector (if available)

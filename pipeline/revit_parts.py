@@ -111,7 +111,7 @@ def build_plan(v, sol, toks, room):
         centre = list(a_ + d_ * along)                     # exactly on the wall centre-line
         u0, u1 = 0.0, float(np.linalg.norm(q1 - q0))
         width = abs(u1 - u0)
-        if o["kind"] == "door" and width < 0.5:
+        if o["kind"] == "door" and width < 0.5 and "widen_doors" in ASSIST:
             # the model found a door but marked only part of it (e.g. the hinge / arc): use a standard width
             # centred on the mark, as long as it fits on the wall
             L_w = float(np.linalg.norm(np.array(w["end"]) - np.array(w["start"])))
@@ -120,8 +120,8 @@ def build_plan(v, sol, toks, room):
             if room_ < 0.6:
                 continue
             width = min(std, room_)
-        elif width < (0.5 if o["kind"] == "door" else 0.3):
-            continue
+        elif width < 0.3:
+            continue                                        # too small to cut an opening
         if o["kind"] == "door":
             width = _snap(width, DOOR_WIDTHS, 0.09)
             width = width if width in DOOR_WIDTHS else _round(width, 0.05)
@@ -823,14 +823,21 @@ def print_report(plan):
     pr = plan["precision"]
     print("\n=== PRECISION ({}) ===".format(pr["scale_source"]))
     for r in pr["report"]:
-        if "written_m" in r:
+        if "written_m" in r and r["status"] == "superseded":
+            print("  ..  {:<15} {}  {:<22} written {:>7.3f} m  (read; one scale is used for the whole sheet)".format(
+                r.get("kind", "dimension"), r["axis"], r["text"][:22], r["written_m"]))
+        elif "written_m" in r:
             mark = "OK " if r["status"] == "ok" else ("-- " if r["status"].startswith("rejected") else "!! ")
             print("  {} {:<15} {}  {:<22} written {:>7.3f} m  model {:>7.3f} m  error {:+7.1f} mm{}".format(
                 mark, r.get("kind", "dimension"), r["axis"], r["text"][:22], r["written_m"], r["model_m"],
                 r["error_mm"], "  (rejected: conflicts)" if r["status"].startswith("rejected") else ""))
         else:
             print("  ?? {}: {} {}".format(r["axis"], r["text"], r.get("status", "")))
-    print("  {}/{} written dimensions reproduced exactly".format(pr["dimensions_exact"], pr["dimensions_read"]))
+    if any(r.get("status") == "superseded" for r in pr["report"]):
+        print("  scale: {} written dimensions read; one scale for the whole sheet from the {}".format(
+            pr["dimensions_read"], pr["scale_source"]))
+    else:
+        print("  {}/{} written dimensions reproduced exactly".format(pr["dimensions_exact"], pr["dimensions_read"]))
     nd = sum(o["type"] == "door" for o in plan["openings"])
     nw = len(plan["openings"]) - nd
     xs = [c for w in plan["walls"] for c in (w["start"][0], w["end"][0])]
@@ -1002,7 +1009,7 @@ def uniform_sol(v, s, source, report=()):
     """One scale for the whole sheet (no per-grid corrections)."""
     gx = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "v"}) or [0.0, 1.0]
     gy = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "h"}) or [0.0, 1.0]
-    rep = [dict(r, status="rejected: conflicts with room sizes") if r.get("status") == "ok" else r for r in report]
+    rep = [dict(r, status="superseded") if "written_m" in r else r for r in report]
     return {"scale_m_per_px": s, "source": source, "report": rep,
             "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
                      "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}}}
@@ -1133,18 +1140,21 @@ def main(img=None, room=None, icon=None, original=None):
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
-    fill_floor_gaps(plan, v, room)
+    if "fill_floor" in ASSIST:
+        fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
-        items, dropped = filter_by_room(items, room, v["T"])
+        dropped = 0
+        if "furniture_filter" in ASSIST:
+            items, dropped = filter_by_room(items, room, v["T"])
         if dropped:
             print("  furniture: {} detections rejected by room check (wrong room for the object)".format(dropped))
         plan["furniture"] = build_furniture(items, plan)
         from shapely.geometry import Point as _Pt, Polygon as _Pg
         fp_ = _Pg(plan["floor"]["polygon"]).buffer(0.3)
-        inside_ = [fu for fu in plan["furniture"] if fp_.contains(_Pt(*fu["center"]))]
+        inside_ = [fu for fu in plan["furniture"] if "furniture_filter" not in ASSIST or fp_.contains(_Pt(*fu["center"]))]
         if len(inside_) < len(plan["furniture"]):
             print("  furniture: {} items outside the building dropped (title block / legend / notes)".format(
                 len(plan["furniture"]) - len(inside_)))

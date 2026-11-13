@@ -24,6 +24,15 @@ SLAB, STAIR_RISE = 0.15, 0.175
 PLINTH_HEIGHT = None          # floor level above ground (m), e.g. 0.45; None = from the plan
 STAIR_RISE_EXT = 0.15         # riser assumed for outside steps / stepped areas when nothing is written
 STEPPED_AREAS = "down"        # stepped areas (L / U steps, seating): "down" = sunken (floor cut out), "up" = raised
+# --- the converter PROJECTS what the model marks; it does not fill in for the model.
+# Helpers that guess what the model missed are OFF. To switch one on for a plan, add its name:
+#   "drawn_windows"  windows read from the drawing where the model marked none
+#   "drawn_steps"    steps read from the drawing where the model marked no stairs
+#   "stepped_areas"  irregular stair areas become sunken / raised stepped areas with open ground
+#   "fill_floor"     carry broken outer walls on and add floor where the wall outline left gaps
+#   "widen_doors"    a door marked too narrow gets a standard width
+#   "furniture_filter"  drop furniture in the wrong room or outside the building
+ASSIST = set()                # e.g. ASSIST = {"drawn_windows", "fill_floor"}
 OUT_DIR = "/kaggle/working/plan_revit"
 
 # --- furniture: fixtures from the floor-plan model + your trained furniture detector (if available)
@@ -713,7 +722,9 @@ def vectorise(room, icon, image=None):
     remap = {i: k for k, i in enumerate(segs_ok)}
     segs = [segs[i] for i in segs_ok]
     merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
-    segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
+    n_win = 0
+    if "drawn_windows" in ASSIST:
+        segs, merged, n_win = _drawn_windows(segs, merged, image, T, full.shape)
     if n_win:
         print("  windows read from the drawing (not marked by the model): {}".format(n_win))
 
@@ -1825,8 +1836,10 @@ def build_stairs(v, toks, room, plan, original=None):
         if "mask" in st:
             stair_px[st["oy"]:st["oy"] + st["mask"].shape[0], st["ox"]:st["ox"] + st["mask"].shape[1]] |= st["mask"]
     walls_px = room == WALL
-    extra = drawn_step_regions(original, room.shape, stair_px, walls_px, v["T"])
-    extra = [st for st in extra if _believable_drawn_steps(st, toks, mpp, pad)]
+    extra = []
+    if "drawn_steps" in ASSIST:
+        extra = drawn_step_regions(original, room.shape, stair_px, walls_px, v["T"])
+        extra = [st for st in extra if _believable_drawn_steps(st, toks, mpp, pad)]
     if extra:
         print("  steps read from the drawing (not marked by the model): {} areas".format(len(extra)))
         for st in extra:
@@ -1869,7 +1882,10 @@ def build_stairs(v, toks, room, plan, original=None):
             outside = (not footprint.contains(pc)) or (out_frac >= 0.6 and footprint.exterior.distance(pc) < 1.0)
         else:
             outside = out_frac >= 0.4
-        kind = "entrance" if outside else ("terrace" if (shape == "irregular" or st.get("drawn")) else "interior")
+        # a stair the model marks is a stair: outside the building outline it leads up to the floor,
+        # inside it leads to the next floor. Stepped areas (sunken / raised) only with the "stepped_areas" helper.
+        stepped = "stepped_areas" in ASSIST and (shape == "irregular" or st.get("drawn"))
+        kind = "entrance" if outside else ("terrace" if stepped else "interior")
         # distance (model px) to the HIGH side of the stair
         wx0, wy0, wx1, wy1 = _window(room.shape, ox, oy, ox + w, oy + h, pad)
         cx_px, cy_px = float(xs.mean() + ox), float(ys.mean() + oy)
@@ -2015,6 +2031,10 @@ def build_stairs(v, toks, room, plan, original=None):
             rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
+            if i["n"] and not (0.12 <= total / i["n"] <= 0.21) and i["sources"].get("risers") != "written on the plan":
+                # the converter's own tread count cannot be right for this storey height: do not build it
+                w.append("only {} treads could be read on the drawing: risers set from the storey height".format(i["n"] - 1))
+                i["n"] = None
             if not i["n"]:
                 i["n"] = int(np.clip(round(total / STAIR_RISE), 3, 30))
                 i["sources"]["risers"] = "estimated from the storey height"
@@ -2218,7 +2238,7 @@ def build_plan(v, sol, toks, room):
         centre = list(a_ + d_ * along)                     # exactly on the wall centre-line
         u0, u1 = 0.0, float(np.linalg.norm(q1 - q0))
         width = abs(u1 - u0)
-        if o["kind"] == "door" and width < 0.5:
+        if o["kind"] == "door" and width < 0.5 and "widen_doors" in ASSIST:
             # the model found a door but marked only part of it (e.g. the hinge / arc): use a standard width
             # centred on the mark, as long as it fits on the wall
             L_w = float(np.linalg.norm(np.array(w["end"]) - np.array(w["start"])))
@@ -2227,8 +2247,8 @@ def build_plan(v, sol, toks, room):
             if room_ < 0.6:
                 continue
             width = min(std, room_)
-        elif width < (0.5 if o["kind"] == "door" else 0.3):
-            continue
+        elif width < 0.3:
+            continue                                        # too small to cut an opening
         if o["kind"] == "door":
             width = _snap(width, DOOR_WIDTHS, 0.09)
             width = width if width in DOOR_WIDTHS else _round(width, 0.05)
@@ -2930,14 +2950,21 @@ def print_report(plan):
     pr = plan["precision"]
     print("\n=== PRECISION ({}) ===".format(pr["scale_source"]))
     for r in pr["report"]:
-        if "written_m" in r:
+        if "written_m" in r and r["status"] == "superseded":
+            print("  ..  {:<15} {}  {:<22} written {:>7.3f} m  (read; one scale is used for the whole sheet)".format(
+                r.get("kind", "dimension"), r["axis"], r["text"][:22], r["written_m"]))
+        elif "written_m" in r:
             mark = "OK " if r["status"] == "ok" else ("-- " if r["status"].startswith("rejected") else "!! ")
             print("  {} {:<15} {}  {:<22} written {:>7.3f} m  model {:>7.3f} m  error {:+7.1f} mm{}".format(
                 mark, r.get("kind", "dimension"), r["axis"], r["text"][:22], r["written_m"], r["model_m"],
                 r["error_mm"], "  (rejected: conflicts)" if r["status"].startswith("rejected") else ""))
         else:
             print("  ?? {}: {} {}".format(r["axis"], r["text"], r.get("status", "")))
-    print("  {}/{} written dimensions reproduced exactly".format(pr["dimensions_exact"], pr["dimensions_read"]))
+    if any(r.get("status") == "superseded" for r in pr["report"]):
+        print("  scale: {} written dimensions read; one scale for the whole sheet from the {}".format(
+            pr["dimensions_read"], pr["scale_source"]))
+    else:
+        print("  {}/{} written dimensions reproduced exactly".format(pr["dimensions_exact"], pr["dimensions_read"]))
     nd = sum(o["type"] == "door" for o in plan["openings"])
     nw = len(plan["openings"]) - nd
     xs = [c for w in plan["walls"] for c in (w["start"][0], w["end"][0])]
@@ -3109,7 +3136,7 @@ def uniform_sol(v, s, source, report=()):
     """One scale for the whole sheet (no per-grid corrections)."""
     gx = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "v"}) or [0.0, 1.0]
     gy = sorted({sg["c"] for sg in v["walls"] if sg["o"] == "h"}) or [0.0, 1.0]
-    rep = [dict(r, status="rejected: conflicts with room sizes") if r.get("status") == "ok" else r for r in report]
+    rep = [dict(r, status="superseded") if "written_m" in r else r for r in report]
     return {"scale_m_per_px": s, "source": source, "report": rep,
             "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
                      "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}}}
@@ -3240,18 +3267,21 @@ def main(img=None, room=None, icon=None, original=None):
                           (sol or {}).get("report", []))
         plan = build_plan(v, sol, toks, room)
     plan["stairs"], plan["levels"] = build_stairs(v, toks, room, plan, original)
-    fill_floor_gaps(plan, v, room)
+    if "fill_floor" in ASSIST:
+        fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
-        items, dropped = filter_by_room(items, room, v["T"])
+        dropped = 0
+        if "furniture_filter" in ASSIST:
+            items, dropped = filter_by_room(items, room, v["T"])
         if dropped:
             print("  furniture: {} detections rejected by room check (wrong room for the object)".format(dropped))
         plan["furniture"] = build_furniture(items, plan)
         from shapely.geometry import Point as _Pt, Polygon as _Pg
         fp_ = _Pg(plan["floor"]["polygon"]).buffer(0.3)
-        inside_ = [fu for fu in plan["furniture"] if fp_.contains(_Pt(*fu["center"]))]
+        inside_ = [fu for fu in plan["furniture"] if "furniture_filter" not in ASSIST or fp_.contains(_Pt(*fu["center"]))]
         if len(inside_) < len(plan["furniture"]):
             print("  furniture: {} items outside the building dropped (title block / legend / notes)".format(
                 len(plan["furniture"]) - len(inside_)))
