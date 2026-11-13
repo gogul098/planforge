@@ -754,8 +754,20 @@ $("#btnConvert").onclick = async () => {
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const { job } = await r.json();
     let st;
+    let misses = 0;
     for (;;) {
-      st = await (await fetch(`${API}/api/status/${job}?wait=25`)).json();   // answers when progress changes
+      let r2;
+      try { r2 = await fetch(`${API}/api/status/${job}?wait=25`); }      // answers when progress changes
+      catch (e) { r2 = null; }
+      if (!r2 || r2.status >= 500) {                                      // network blip / engine busy: wait, ask again
+        if (++misses > 12) throw new Error("lost contact with the engine (it may have restarted or run out of memory)");
+        progress(st ? st.progress : 0.05, "Waiting for the engine…");
+        await new Promise((res) => setTimeout(res, 5000));
+        continue;
+      }
+      if (r2.status === 404) throw new Error("the engine restarted and lost this job — please convert again");
+      misses = 0;
+      st = await r2.json();
       progress(st.progress, st.msg);
       if (st.state === "done" || st.state === "error") break;
     }
