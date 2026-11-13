@@ -20,8 +20,10 @@ Architects then only add elevations and detailing, which cuts most of the manual
   classes (walls, doors, windows, stairs, fixtures). Best validation score 0.747.
 - **Furniture detector:** YOLO11m-OBB trained on FloorPlanCAD (18 classes, mAP50 ≈ 0.87). It keeps the exact
   rotation, checks each object against the room it sits in, and snaps it back against the nearest wall.
-- **Vectorisation:** masks become centre-line walls with snapped thicknesses, joined corners and openings hosted
-  in walls. On the test plans, 99% of predicted wall pixels end up in BIM walls.
+- **Vectorisation = projection:** the model's wall mask becomes centre-line walls exactly where and as thick as the
+  model drew them, with openings hosted in walls. Nothing is filled in or dropped: a break the model left stays open,
+  short pieces and columns are kept, curves are followed with short straight walls. Each run reports both
+  directions (model wall missing from the BIM walls, and BIM wall the model did not mark); `tests/` checks this.
 - **Exports:**
   - `model.ifc`: IFC4 with wall types, doors, windows, spaces, slab, stairs and furniture.
   - `plan.json` + `build_in_revit.py`: builds native Revit walls, doors, windows, floors, rooms, grids and

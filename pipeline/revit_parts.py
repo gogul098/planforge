@@ -36,7 +36,7 @@ def _split_unsupported(walls, openings, segs, room, s, T):
     model wall pixels and no opening is cut out again (an open porch front stays open)."""
     wallpx = cv2.dilate((room == WALL).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     Hh, Ww = wallpx.shape
-    min_gap = max(0.3, 2 * T * s)
+    min_gap = 3 * s                       # any break longer than 2-3 px of antialiasing stays open
     out_w, remap = [], {}
     for i, (w, sg) in enumerate(zip(walls, segs)):
         p0, p1 = np.array(sg["p0"], float), np.array(sg["p1"], float)
@@ -868,8 +868,9 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
     fig = plt.figure(figsize=(30, 10))
     ax = fig.add_subplot(1, 3, 1)
     ax.imshow(img); ax.axis("off")
-    ax.set_title("model walls kept {:.1f}%  (yellow = model wall pixels not in Revit walls)".format(
-        100 * v["coverage"]), fontsize=13)
+    ax.set_title("model walls kept {:.1f}%, added {:.1f}%  (yellow = model wall not in Revit walls, "
+                 "cyan = Revit wall the model did not mark)".format(100 * v["coverage"], 100 * v.get("added", 0)),
+                 fontsize=13)
     mp = plan["mapping"]
     for axis in ("x", "y"):
         for px, m in zip(mp["axes"][axis]["px"], mp["axes"][axis]["m"]):
@@ -884,6 +885,8 @@ def previews(img, v, plan, sol, scene, faithful, out_dir):
         ax.add_patch(plt.Polygon([p0 - n, p1 - n, p1 + n, p0 + n], fc=(0.9, 0.1, 0.1, 0.45), ec="r", lw=0.6))
     miss = np.zeros(v["missed"].shape + (4,))
     miss[v["missed"]] = (1.0, 0.85, 0.0, 1.0)
+    if v.get("extra") is not None:
+        miss[v["extra"]] = (0.0, 0.85, 1.0, 1.0)
     ax.imshow(miss)
     _render3d(fig.add_subplot(1, 3, 2, projection="3d"), faithful, "3D straight from the model (model_faithful.glb)")
     _render3d(fig.add_subplot(1, 3, 3, projection="3d"), scene, "Revit-ready walls (plan.json / model.ifc)")
@@ -922,6 +925,7 @@ def print_report(plan):
     for r in plan["rooms"]:
         print("  room: {:<34} {:>6.2f} m2".format(r["name"], r["area_m2"]))
     print("  model wall pixels kept in Revit walls: {:.1f}%".format(100 * plan.get("coverage", 0)))
+    print("  Revit wall area the model did not mark: {:.1f}%".format(100 * plan.get("added", 0)))
     if plan.get("furniture"):
         cnt = {}
         for fu in plan["furniture"]:
@@ -1217,6 +1221,7 @@ def main(img=None, room=None, icon=None, original=None):
         fill_floor_gaps(plan, v, room)
     plan["floor"]["holes"] = open_ground(plan)
     plan["coverage"] = round(v["coverage"], 4)
+    plan["added"] = round(v.get("added", 0.0), 4)
     if MAKE_FURNITURE:
         items = icon_fixtures(icon, v["T"]) + detector_furniture(img, plan["mapping"]["scale_m_per_px"])
         dropped = 0
