@@ -11,6 +11,9 @@ ENV PYTHONUNBUFFERED=1 MPLBACKEND=Agg YOLO_CONFIG_DIR=/tmp/yolo HF_HOME=/tmp/hf 
 RUN useradd -m -u 1000 planforge && mkdir -p /tmp/jobs /tmp/hf /tmp/yolo /tmp/planforge-models \
     && chown -R planforge /app /tmp/jobs /tmp/hf /tmp/yolo /tmp/planforge-models
 USER planforge
+ARG GIT_SHA=dev
+ARG BUILT_AT=unknown
+ENV PLANFORGE_VERSION=$GIT_SHA PLANFORGE_BUILT_AT=$BUILT_AT
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8080/api/health')" || exit 1
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]

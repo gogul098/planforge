@@ -36,6 +36,9 @@ jobs:
           context: .
           push: true
           provenance: false
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILT_AT=${{ github.event.head_commit.timestamp || github.run_started_at }}
           tags: ${{ env.IMAGE }}:latest,${{ env.IMAGE }}:${{ github.sha }}
       - name: Deploy to the Web App
         if: env.HAS_AZ == 'true'

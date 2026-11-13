@@ -286,6 +286,13 @@ def health():
     return {"ok": True}
 
 
+@app.get("/api/version")
+def version():
+    """Which build is running: the git commit it was built from and when."""
+    return {"commit": os.environ.get("PLANFORGE_VERSION", "dev"), "built_at": os.environ.get("PLANFORGE_BUILT_AT", "unknown"),
+            "model_revision": str(getattr(P, "_MODEL", {}).get("rev") or "not loaded yet")}
+
+
 @app.get("/api/catalog")
 def catalog():
     return {k: {"height": v[0], "category": v[1]} for k, v in P.FURN_SPEC.items()}
