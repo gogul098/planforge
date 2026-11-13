@@ -41,6 +41,12 @@ STEPPED_AREAS = "down"        # stepped areas (L / U steps, seating): "down" = s
 #   "fill_floor"     carry broken outer walls on and add floor where the wall outline left gaps
 #   "widen_doors"    a door marked too narrow gets a standard width
 #   "furniture_filter"  drop furniture in the wrong room or outside the building
+#   "join_gaps"      join wall pieces across small gaps the model left (up to 1.5 wall thicknesses)
+#   "snap_corners"   stretch wall ends (up to 1.5-2 thicknesses) so corners meet
+#   "align_walls"    line near-parallel walls up on one centre-line
+#   "standard_sizes" snap wall thickness / door width to WALL_THICKNESSES / DOOR_WIDTHS
+#   "merge_windows"  merge neighbouring windows on a wall into one
+#   "fix_treads"     an implausible tread count -> risers from the storey height
 ASSIST = set()                # e.g. ASSIST = {"drawn_windows", "fill_floor"}
 OUT_DIR = "/kaggle/working/plan_revit"
 

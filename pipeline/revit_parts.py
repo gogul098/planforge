@@ -120,7 +120,8 @@ def build_plan(v, sol, toks, room):
     # walls: centre-lines meeting at the centre-line of the wall they join (Revit joins them)
     walls = []
     for sg in segs:
-        t = _snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if WALL_THICKNESSES else _round(sg["t"] * s, 0.005)
+        t = (_snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if (WALL_THICKNESSES and "standard_sizes" in ASSIST)
+             else _round(sg["t"] * s, 0.005))                 # measured, not snapped to a standard
         a, b = [MX(sg["p0"][0]), MY(sg["p0"][1])], [MX(sg["p1"][0]), MY(sg["p1"][1])]
         walls.append({"start": [round(c, 4) for c in a], "end": [round(c, 4) for c in b], "thickness": t,
                       "height": WALL_HEIGHT, "joined": ["j0" in sg, "j1" in sg]})
@@ -129,7 +130,7 @@ def build_plan(v, sol, toks, room):
         e = []
         for key in ("j0", "j1"):
             if key in sg:
-                e.append(round(_snap(sg[key][1] * s, WALL_THICKNESSES, 0.35) / 2 if WALL_THICKNESSES
+                e.append(round(_snap(sg[key][1] * s, WALL_THICKNESSES, 0.35) / 2 if (WALL_THICKNESSES and "standard_sizes" in ASSIST)
                                else sg[key][1] * s / 2, 4))
             else:
                 e.append(0.0)
@@ -191,8 +192,11 @@ def build_plan(v, sol, toks, room):
         elif width < 0.3:
             continue                                        # too small to cut an opening
         if o["kind"] == "door":
-            width = _snap(width, DOOR_WIDTHS, 0.09)
-            width = width if width in DOOR_WIDTHS else _round(width, 0.05)
+            if "standard_sizes" in ASSIST:
+                width = _snap(width, DOOR_WIDTHS, 0.09)
+                width = width if width in DOOR_WIDTHS else _round(width, 0.05)
+            else:
+                width = _round(width, 0.01)                     # as marked
             sill, head = 0.0, DOOR_HEIGHT
         else:
             width = _round(width, 0.05)
@@ -205,7 +209,7 @@ def build_plan(v, sol, toks, room):
     merged = []
     for o in openings:
         p = merged[-1] if merged else None
-        if p and p["wall"] == o["wall"] and p["type"] == o["type"] == "window" and \
+        if "merge_windows" in ASSIST and p and p["wall"] == o["wall"] and p["type"] == o["type"] == "window" and \
                 (o["offset"] - o["width"] / 2) - (p["offset"] + p["width"] / 2) < 0.25:
             lo, hi = p["offset"] - p["width"] / 2, o["offset"] + o["width"] / 2
             w_ = walls[p["wall"]]

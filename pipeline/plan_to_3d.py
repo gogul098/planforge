@@ -340,7 +340,8 @@ def _frame_walls(full, openings_any, icon, T):
     for o in "hv":
         idx = [i for i, s in enumerate(segs) if s["o"] == o]
         if idx:
-            snapped = _cluster([segs[i]["c"] for i in idx], 0.75 * T)
+            snapped = (_cluster([segs[i]["c"] for i in idx], 0.75 * T) if "align_walls" in ASSIST
+                       else [segs[i]["c"] for i in idx])
             for i, c in zip(idx, snapped):
                 segs[i]["c"] = float(c)
     # merge collinear pieces of the same wall
@@ -355,7 +356,8 @@ def _frame_walls(full, openings_any, icon, T):
             g0, g1 = int(p["a1"]), int(sg["a0"]) + 1
             band = openings_any[max(c0, 0):c1, g0:g1] if sg["o"] == "h" else openings_any[g0:g1, max(c0, 0):c1]
             bridged = band.size > 0 and band.any(axis=0 if sg["o"] == "h" else 1).mean() > 0.25
-        if p and p["o"] == sg["o"] and abs(p["c"] - sg["c"]) < 0.5 and (sg["a0"] <= p["a1"] + 1.5 * T or bridged):
+        join_gap = 1.5 * T if "join_gaps" in ASSIST else 2.0      # px: only pieces that touch, unless asked
+        if p and p["o"] == sg["o"] and abs(p["c"] - sg["c"]) < 0.5 and (sg["a0"] <= p["a1"] + join_gap or bridged):
             lp, ls = p["a1"] - p["a0"], sg["a1"] - sg["a0"]
             p["t"] = (p["t"] * lp + sg["t"] * ls) / (lp + ls)
             p["a1"] = max(p["a1"], sg["a1"])
@@ -366,10 +368,10 @@ def _frame_walls(full, openings_any, icon, T):
     for _ in range(2):
         for sg in segs:
             for p in segs:
-                reach = sg["t"] / 2 + 1.5 * T
+                reach = sg["t"] / 2 + (1.5 * T if "snap_corners" in ASSIST else 2.0)
                 if p["o"] == sg["o"] or not (p["a0"] - reach <= sg["c"] <= p["a1"] + reach):
                     continue
-                tol = p["t"] / 2 + 1.5 * T
+                tol = p["t"] / 2 + (1.5 * T if "snap_corners" in ASSIST else 2.0)
                 if abs(sg["a0"] - p["c"]) <= tol:
                     sg["a0"] = p["c"] - p["t"] / 2
                     sg["j0"] = (p["c"], p["t"])      # joined: perpendicular centre-line + thickness
@@ -483,11 +485,12 @@ def _join_across(segs, T):
                     # intersection of the two centre-lines
                     tq = ((pe[0] - q0[0]) * d[1] - (pe[1] - q0[1]) * d[0]) / (e[0] * d[1] - e[1] * d[0])
                     X = q0 + e * tq
-                    reach_q = q["t"] / 2 + 2 * T
+                    slack = 2 * T if "snap_corners" in ASSIST else 2.0
+                    reach_q = q["t"] / 2 + slack
                     if not (-reach_q <= tq <= M + reach_q):
                         continue
                     dist = np.linalg.norm(X - pe)
-                    if dist > q["t"] / (2 * abs(cr)) + 2 * T:
+                    if dist > q["t"] / (2 * abs(cr)) + slack:
                         continue
                     # do not cut a wall in half: the new end must stay on the same side of the old one
                     u = (X - p0) @ d

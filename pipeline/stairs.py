@@ -622,7 +622,8 @@ def build_stairs(v, toks, room, plan, original=None):
             rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
-            if i["n"] and not (0.12 <= total / i["n"] <= 0.21) and i["sources"].get("risers") != "written on the plan":
+            if "fix_treads" in ASSIST and i["n"] and not (0.12 <= total / i["n"] <= 0.21) \
+                    and i["sources"].get("risers") != "written on the plan":
                 # the converter's own tread count cannot be right for this storey height: do not build it
                 w.append("only {} treads could be read on the drawing: risers set from the storey height".format(i["n"] - 1))
                 i["n"] = None

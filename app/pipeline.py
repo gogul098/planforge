@@ -32,6 +32,12 @@ STEPPED_AREAS = "down"        # stepped areas (L / U steps, seating): "down" = s
 #   "fill_floor"     carry broken outer walls on and add floor where the wall outline left gaps
 #   "widen_doors"    a door marked too narrow gets a standard width
 #   "furniture_filter"  drop furniture in the wrong room or outside the building
+#   "join_gaps"      join wall pieces across small gaps the model left (up to 1.5 wall thicknesses)
+#   "snap_corners"   stretch wall ends (up to 1.5-2 thicknesses) so corners meet
+#   "align_walls"    line near-parallel walls up on one centre-line
+#   "standard_sizes" snap wall thickness / door width to WALL_THICKNESSES / DOOR_WIDTHS
+#   "merge_windows"  merge neighbouring windows on a wall into one
+#   "fix_treads"     an implausible tread count -> risers from the storey height
 ASSIST = set()                # e.g. ASSIST = {"drawn_windows", "fill_floor"}
 OUT_DIR = "/kaggle/working/plan_revit"
 
@@ -366,7 +372,8 @@ def _frame_walls(full, openings_any, icon, T):
     for o in "hv":
         idx = [i for i, s in enumerate(segs) if s["o"] == o]
         if idx:
-            snapped = _cluster([segs[i]["c"] for i in idx], 0.75 * T)
+            snapped = (_cluster([segs[i]["c"] for i in idx], 0.75 * T) if "align_walls" in ASSIST
+                       else [segs[i]["c"] for i in idx])
             for i, c in zip(idx, snapped):
                 segs[i]["c"] = float(c)
     # merge collinear pieces of the same wall
@@ -381,7 +388,8 @@ def _frame_walls(full, openings_any, icon, T):
             g0, g1 = int(p["a1"]), int(sg["a0"]) + 1
             band = openings_any[max(c0, 0):c1, g0:g1] if sg["o"] == "h" else openings_any[g0:g1, max(c0, 0):c1]
             bridged = band.size > 0 and band.any(axis=0 if sg["o"] == "h" else 1).mean() > 0.25
-        if p and p["o"] == sg["o"] and abs(p["c"] - sg["c"]) < 0.5 and (sg["a0"] <= p["a1"] + 1.5 * T or bridged):
+        join_gap = 1.5 * T if "join_gaps" in ASSIST else 2.0      # px: only pieces that touch, unless asked
+        if p and p["o"] == sg["o"] and abs(p["c"] - sg["c"]) < 0.5 and (sg["a0"] <= p["a1"] + join_gap or bridged):
             lp, ls = p["a1"] - p["a0"], sg["a1"] - sg["a0"]
             p["t"] = (p["t"] * lp + sg["t"] * ls) / (lp + ls)
             p["a1"] = max(p["a1"], sg["a1"])
@@ -392,10 +400,10 @@ def _frame_walls(full, openings_any, icon, T):
     for _ in range(2):
         for sg in segs:
             for p in segs:
-                reach = sg["t"] / 2 + 1.5 * T
+                reach = sg["t"] / 2 + (1.5 * T if "snap_corners" in ASSIST else 2.0)
                 if p["o"] == sg["o"] or not (p["a0"] - reach <= sg["c"] <= p["a1"] + reach):
                     continue
-                tol = p["t"] / 2 + 1.5 * T
+                tol = p["t"] / 2 + (1.5 * T if "snap_corners" in ASSIST else 2.0)
                 if abs(sg["a0"] - p["c"]) <= tol:
                     sg["a0"] = p["c"] - p["t"] / 2
                     sg["j0"] = (p["c"], p["t"])      # joined: perpendicular centre-line + thickness
@@ -509,11 +517,12 @@ def _join_across(segs, T):
                     # intersection of the two centre-lines
                     tq = ((pe[0] - q0[0]) * d[1] - (pe[1] - q0[1]) * d[0]) / (e[0] * d[1] - e[1] * d[0])
                     X = q0 + e * tq
-                    reach_q = q["t"] / 2 + 2 * T
+                    slack = 2 * T if "snap_corners" in ASSIST else 2.0
+                    reach_q = q["t"] / 2 + slack
                     if not (-reach_q <= tq <= M + reach_q):
                         continue
                     dist = np.linalg.norm(X - pe)
-                    if dist > q["t"] / (2 * abs(cr)) + 2 * T:
+                    if dist > q["t"] / (2 * abs(cr)) + slack:
                         continue
                     # do not cut a wall in half: the new end must stay on the same side of the old one
                     u = (X - p0) @ d
@@ -2031,7 +2040,8 @@ def build_stairs(v, toks, room, plan, original=None):
             rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
-            if i["n"] and not (0.12 <= total / i["n"] <= 0.21) and i["sources"].get("risers") != "written on the plan":
+            if "fix_treads" in ASSIST and i["n"] and not (0.12 <= total / i["n"] <= 0.21) \
+                    and i["sources"].get("risers") != "written on the plan":
                 # the converter's own tread count cannot be right for this storey height: do not build it
                 w.append("only {} treads could be read on the drawing: risers set from the storey height".format(i["n"] - 1))
                 i["n"] = None
@@ -2247,7 +2257,8 @@ def build_plan(v, sol, toks, room):
     # walls: centre-lines meeting at the centre-line of the wall they join (Revit joins them)
     walls = []
     for sg in segs:
-        t = _snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if WALL_THICKNESSES else _round(sg["t"] * s, 0.005)
+        t = (_snap(sg["t"] * s, WALL_THICKNESSES, 0.35) if (WALL_THICKNESSES and "standard_sizes" in ASSIST)
+             else _round(sg["t"] * s, 0.005))                 # measured, not snapped to a standard
         a, b = [MX(sg["p0"][0]), MY(sg["p0"][1])], [MX(sg["p1"][0]), MY(sg["p1"][1])]
         walls.append({"start": [round(c, 4) for c in a], "end": [round(c, 4) for c in b], "thickness": t,
                       "height": WALL_HEIGHT, "joined": ["j0" in sg, "j1" in sg]})
@@ -2256,7 +2267,7 @@ def build_plan(v, sol, toks, room):
         e = []
         for key in ("j0", "j1"):
             if key in sg:
-                e.append(round(_snap(sg[key][1] * s, WALL_THICKNESSES, 0.35) / 2 if WALL_THICKNESSES
+                e.append(round(_snap(sg[key][1] * s, WALL_THICKNESSES, 0.35) / 2 if (WALL_THICKNESSES and "standard_sizes" in ASSIST)
                                else sg[key][1] * s / 2, 4))
             else:
                 e.append(0.0)
@@ -2318,8 +2329,11 @@ def build_plan(v, sol, toks, room):
         elif width < 0.3:
             continue                                        # too small to cut an opening
         if o["kind"] == "door":
-            width = _snap(width, DOOR_WIDTHS, 0.09)
-            width = width if width in DOOR_WIDTHS else _round(width, 0.05)
+            if "standard_sizes" in ASSIST:
+                width = _snap(width, DOOR_WIDTHS, 0.09)
+                width = width if width in DOOR_WIDTHS else _round(width, 0.05)
+            else:
+                width = _round(width, 0.01)                     # as marked
             sill, head = 0.0, DOOR_HEIGHT
         else:
             width = _round(width, 0.05)
@@ -2332,7 +2346,7 @@ def build_plan(v, sol, toks, room):
     merged = []
     for o in openings:
         p = merged[-1] if merged else None
-        if p and p["wall"] == o["wall"] and p["type"] == o["type"] == "window" and \
+        if "merge_windows" in ASSIST and p and p["wall"] == o["wall"] and p["type"] == o["type"] == "window" and \
                 (o["offset"] - o["width"] / 2) - (p["offset"] + p["width"] / 2) < 0.25:
             lo, hi = p["offset"] - p["width"] / 2, o["offset"] + o["width"] / 2
             w_ = walls[p["wall"]]
