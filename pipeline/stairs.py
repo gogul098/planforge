@@ -269,10 +269,29 @@ def _chain_flights(infos):
             u["direction"] = "from the landing up, away from the main flight"
         n_up = max(u["n"] for u in uppers)                # parallel flights (split stair) climb together
         r = WALL_HEIGHT / (main["n"] + n_up)
-        main.update(chain_base=0.0, chain_total=r * main["n"], chain_size=len(fl))
-        for u in uppers:
-            u.update(chain_base=r * main["n"], chain_total=WALL_HEIGHT - r * main["n"], chain_size=len(fl))
-            u["n"] = n_up
+        # a riser height written on the plan ("16R @ 150") is exact: the main flight climbs n x riser, the
+        # flights above the landing take what is left of the storey at the same riser height
+        r_w = next((f_["notes"]["riser"] for f_ in [main] + uppers if f_["notes"].get("riser")), None)
+        if r_w and main["notes"].get("risers") and WALL_HEIGHT - main["n"] * r_w > 0.5 * r_w:
+            low = main["n"] * r_w
+            n_up = max(1, int(round((WALL_HEIGHT - low) / r_w)))
+            main.update(chain_base=0.0, chain_total=low, chain_size=len(fl), chain_rsrc="written: {} risers x {:.0f} mm "
+                        "to the landing".format(main["n"], r_w * 1000))
+            for u in uppers:
+                u.update(chain_base=low, chain_total=WALL_HEIGHT - low, chain_size=len(fl),
+                         chain_rsrc="rest of the storey height above the landing at the written {:.0f} mm "
+                         "risers".format(r_w * 1000))
+                u["n"] = n_up
+                u["sources"]["risers"] = "storey height left above the landing / written riser height"
+                u["warnings"] = [w_ for w_ in u["warnings"] if not w_.startswith("risers not written")]
+                if abs((WALL_HEIGHT - low) / n_up - r_w) > 0.01:
+                    u["warnings"].append("the storey height ({:.2f} m) does not divide into {:.0f} mm risers above "
+                                         "the landing: check".format(WALL_HEIGHT, r_w * 1000))
+        else:
+            main.update(chain_base=0.0, chain_total=r * main["n"], chain_size=len(fl))
+            for u in uppers:
+                u.update(chain_base=r * main["n"], chain_total=WALL_HEIGHT - r * main["n"], chain_size=len(fl))
+                u["n"] = n_up
         for f_ in fl:
             f_["warnings"] = [w_ for w_ in f_["warnings"] if not w_.startswith("direction not marked")]
 
@@ -462,8 +481,41 @@ def build_stairs(v, toks, room, plan, original=None):
             open_inside[ys_o[inside], xs_o[inside]] = 1
             n_oi, oi_lab, oi_st, _ = cv2.connectedComponentsWithStats(open_inside)
             min_px = 1.0 / (mpp * mpp)                                # under 1 m2: a speck, not a pit
+            Ho, Wo = room.shape
+            pit_word = re.compile(r"PIT|SUNKEN|COURT|AMPHI", re.I)
+
+            def _regions_at(t):
+                """Open-ground regions a text belongs to: the one under it, or the ones continuing the region of
+                room class the model put under the text."""
+                x_, y_ = int(round(t["x"])), int(round(t["y"]))
+                if not (0 <= y_ < Ho and 0 <= x_ < Wo):
+                    return set()
+                if oi_lab[y_, x_]:
+                    return {int(oi_lab[y_, x_])}
+                c_ = room[y_, x_]
+                if c_ in (0, 1, WALL):
+                    return set()
+                same = ((room == c_) & ~walls_px).astype(np.uint8)
+                ff = np.zeros((Ho + 2, Wo + 2), np.uint8)
+                cv2.floodFill(same, ff, (x_, y_), 2)
+                patch = same == 2
+                # the open ground continues the labelled room when they share at least ~1 m of open boundary
+                # (no wall, no stair between): the model classified only part of that room's floor
+                ring_ = (cv2.dilate(patch.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0) & ~patch
+                labs_, cnt_ = np.unique(oi_lab[ring_], return_counts=True)
+                return {int(q) for q, n_ in zip(labs_, cnt_) if q and n_ * mpp >= 1.0}
+
+            at = [(t, _regions_at(t)) for t in toks if t["kind"] in ("size", "label")]
             for l_ in range(1, n_oi):
-                if oi_st[l_, cv2.CC_STAT_AREA] < min_px:
+                small = oi_st[l_, cv2.CC_STAT_AREA] < min_px
+                # a written room size inside it ("6000 x 6000"): a room the model left unclassified, its floor
+                # stays - unless its name says it is a pit / sunken court
+                room_named = any(t["kind"] == "size" and l_ in r for t, r in at) and not any(
+                    t["kind"] == "label" and l_ in r and pit_word.search(t.get("text", "")) for t, r in at)
+                if small or room_named:
+                    if room_named and not small:
+                        print("  open ground with a written room size in it kept as floor (an unlabelled room, "
+                              "not a pit): {:.1f} m2".format(oi_st[l_, cv2.CC_STAT_AREA] * mpp * mpp))
                     open_inside[oi_lab == l_] = 0
                     oi_lab[oi_lab == l_] = 0
             open_inside = open_inside > 0
@@ -630,8 +682,8 @@ def build_stairs(v, toks, room, plan, original=None):
             if cs_:
                 cpts = max(cs_, key=cv2.contourArea)[:, 0].astype(float)
                 pg = Polygon(np.stack([mx(cpts[:, 0]), my(cpts[:, 1])], 1)).buffer(0)
-                if pg.area >= 1.0:
-                    pits.append(pg)
+                # an outline that touches itself (a pinch) cleans up into several pieces: keep each real one
+                pits.extend(q for q in getattr(pg, "geoms", [pg]) if q.area >= 1.0)
         down = bool(pits) or (kind == "terrace" and STEPPED_AREAS == "down")
         infos.append(dict(kind=kind, shape=shape, hull=hull_m, centre=centre, d=d, run=run, width=width,
                           down=down, pits=pits,
@@ -674,7 +726,7 @@ def build_stairs(v, toks, room, plan, original=None):
                 w.append("plinth height not written: set 'Plinth height' to make the steps exact")
         elif kind == "interior" and "chain_base" in i:
             base, total = i["chain_base"], i["chain_total"]
-            rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
+            rsrc = i.get("chain_rsrc") or "storey height shared by {} connected flights".format(i["chain_size"])
         elif kind == "interior" and i["n"] and "riser" in i["notes"]:
             # count AND height written ("16R @ 150"): the plan says how high the flight climbs
             base, total = 0.0, i["n"] * i["notes"]["riser"]
