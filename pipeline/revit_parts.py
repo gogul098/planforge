@@ -518,6 +518,26 @@ def open_ground(plan):
         a, b = np.array(st["start"]), np.array(st["end"])
         d = (b - a) / max(np.linalg.norm(b - a), 1e-9)
         c = np.array(ol.centroid.coords[0])
+        pit = unary_union([Polygon(q).buffer(0) for q in st.get("pit", []) if len(q) >= 3])
+        if not pit.is_empty:
+            # the model marked the open ground: cut out exactly that, tiers fall towards it
+            pc = np.array(pit.centroid.coords[0])
+            dn = (pc - c) / max(np.linalg.norm(pc - c), 1e-9)
+            space = pit
+            st["open_ground"] = round(float(space.difference(ol).area), 2)
+            st["direction"] = "goes DOWN from the raised floor ({:+.2f}) to the open ground ({:+.2f})".format(0.0, -pl)
+            trs = sorted(st["treads"], key=lambda tr: float(np.mean(np.array(tr["polygon"]) @ dn)))
+            n = len(trs)
+            depth = float(st.get("depth_user") or 0) or (pl if pl > 0.01 else abs(float(st.get("base_z", 0.0))) or 0.15 * (n + 1))
+            rise = depth / (n + 1)                       # n tiers between floor and pit = n + 1 risers
+            for r, tr in enumerate(trs):                 # nearest the floor first
+                tr["z0"] = round(-depth, 4)
+                tr["z1"] = round(-rise * (r + 1), 4)
+            st["treads"], st["riser"], st["risers"] = trs, round(rise, 4), n + 1
+            st["base_z"], st["top_z"] = round(-depth, 4), 0.0
+            st["pit_depth"] = round(depth, 4)
+            holes.append(unary_union([ol, space]).buffer(0))
+            continue
         best = None
         for sgn in (1, -1):                              # how far can the area sweep each way before a wall?
             dn = d * sgn
@@ -534,13 +554,22 @@ def open_ground(plan):
         cell = [g for g in getattr(free, "geoms", [free]) if g.intersects(ol)]
         space = sweep.intersection(unary_union(cell)) if cell else sweep
         st["open_ground"] = round(float(space.difference(ol).area), 2)
-        st["direction"] = "goes DOWN from the raised floor ({:+.2f}) to the open ground ({:+.2f})".format(0.0, -pl)
-        # tiers: highest next to the floor, lowest next to the open space
         trs = sorted(st["treads"], key=lambda tr: float(np.mean(np.array(tr["polygon"]) @ dn)))
         n = len(trs)
-        for r, tr in enumerate(trs):
-            tr["z0"] = round(-pl, 4) if pl else tr["z0"]
-            tr["z1"] = round(-st["riser"] * (r + 1), 4) if r < n - 1 else round(-pl + st["riser"], 4) if pl else tr["z1"]
+        if st.get("depth_user"):
+            # the architect set the depth: n tiers between floor and open ground = n + 1 risers
+            depth = float(st["depth_user"])
+            rise = depth / (n + 1)
+            for r, tr in enumerate(trs):
+                tr["z0"], tr["z1"] = round(-depth, 4), round(-rise * (r + 1), 4)
+            st["riser"], st["risers"], st["base_z"], st["top_z"] = round(rise, 4), n + 1, round(-depth, 4), 0.0
+            st["direction"] = "goes DOWN from the floor (+0.00) to the open ground ({:+.2f})".format(-depth)
+        else:
+            st["direction"] = "goes DOWN from the raised floor ({:+.2f}) to the open ground ({:+.2f})".format(0.0, -pl)
+            # tiers: highest next to the floor, lowest next to the open space
+            for r, tr in enumerate(trs):
+                tr["z0"] = round(-pl, 4) if pl else tr["z0"]
+                tr["z1"] = round(-st["riser"] * (r + 1), 4) if r < n - 1 else round(-pl + st["riser"], 4) if pl else tr["z1"]
         st["treads"] = trs
         holes.append(unary_union([ol, space]).buffer(0))
     merged = unary_union(holes).buffer(0.01).buffer(-0.01)

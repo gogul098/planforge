@@ -581,7 +581,20 @@ function renderProps() {
       prop("Run", fmt(s.run, 2) + " m") + prop("Levels", `${s.base_z >= 0 ? "+" : ""}${fmt(s.base_z, 2)} → ${s.top_z >= 0 ? "+" : ""}${fmt(s.top_z, 2)} m`) +
       prop("Direction", s.direction || "—") +
       Object.entries(src).map(([k, v]) => prop("From · " + k, `<span class="muted">${v}</span>`)).join("") +
-      (s.warnings || []).map((w) => `<p class="small" style="color:#ffb86b">Check: ${w}</p>`).join("");
+      (s.warnings || []).map((w) => `<p class="small" style="color:#ffb86b">Check: ${w}</p>`).join("") +
+      `<div class="stair-edit">
+         <p class="small muted">Is it right? Set what these steps really do:</p>
+         <div class="seg">
+           <button class="btn" data-smode="down" title="Steps go down from the floor to open ground (sandpit, sunken court); the ground beside them is cut out of the floor">Down</button>
+           <button class="btn" data-smode="up" title="Raised seating on the floor">Up</button>
+           <button class="btn" data-smode="stair" title="A stair to the floor above">Stair</button>
+           <button class="btn" data-smode="flat" title="Not steps: plain floor">Flat</button>
+         </div>
+         <label class="small muted">Height between floor and the other level (m)
+           <input id="stairDepth" type="number" min="0.05" max="6" step="0.05" value="${(Math.abs(s.top_z - s.base_z) || S.plan.levels?.plinth || 0.45).toFixed(2)}">
+         </label>
+       </div>`;
+    $$("#props [data-smode]").forEach((b) => (b.onclick = () => editStair(s, b.dataset.smode)));
     return;
   }
   if (sel.kind === "room") {
@@ -666,6 +679,23 @@ function leaveEdit() {
   app.classList.replace("mode-edit", "mode-view");
   $("#crumb").textContent = `/ ${S.file?.name || "plan"}`;
   S.placing = null; tctl.detach(); select(null); setTab("3d"); resize();
+}
+async function editStair(s, mode) {
+  const btns = $$("#props [data-smode]"); btns.forEach((x) => (x.disabled = true));
+  try {
+    const depth = parseFloat($("#stairDepth")?.value);
+    const r = await fetch(`${API}/api/stair/${S.job}`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id, mode, depth: isFinite(depth) ? depth : null }) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    S.plan = await (await fetch(`${API}/api/files/${S.job}/plan.json?t=${Date.now()}`)).json();
+    await loadBuilding(`${API}/api/files/${S.job}/shell.glb`);
+    const again = (S.plan.stairs || []).find((x) => x.id === s.id);
+    select(again ? { kind: "stair", s: again } : null);
+    renderStats();
+    toast({ down: "Steps go down to open ground: floor and plinth cut out", up: "Raised seating on the floor",
+            stair: "Stair to the floor above", flat: "Steps removed: plain floor" }[mode] + " · IFC, GLB, plan.json and zip rebuilt");
+    $("#saveState").textContent = "stairs edited · exports up to date";
+  } catch (err) { toast("Stair change failed: " + err.message, true); btns.forEach((x) => (x.disabled = false)); }
 }
 $("#btnEdit").onclick = enterEdit;
 $("#btnCancel").onclick = () => { S.furn = JSON.parse(S.beforeEdit || "[]"); rebuildFurniture(); leaveEdit(); };
