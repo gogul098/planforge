@@ -589,6 +589,118 @@ def _join_across(segs, T):
     return segs
 
 
+def _edge_direction(full, p0, p1, t, T):
+    """Direction (degrees, mod 180) and coherence (0..1) of the model mask's edges around a wall piece."""
+    p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+    pad = int(np.ceil(t / 2 + T)) + 3
+    H, W = full.shape
+    x0 = max(0, int(min(p0[0], p1[0])) - pad); x1 = min(W, int(max(p0[0], p1[0])) + pad + 1)
+    y0 = max(0, int(min(p0[1], p1[1])) - pad); y1 = min(H, int(max(p0[1], p1[1])) + pad + 1)
+    win = cv2.GaussianBlur(full[y0:y1, x0:x1].astype(np.float32), (0, 0), max(1.0, T / 4))
+    gx, gy = cv2.Sobel(win, cv2.CV_32F, 1, 0), cv2.Sobel(win, cv2.CV_32F, 0, 1)
+    d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
+    n = np.array([-d[1], d[0]]) * (t / 2 + T / 2)
+    m = np.zeros(win.shape, np.uint8)
+    o = np.array([x0, y0])
+    cv2.fillPoly(m, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n]) - o).astype(np.int32)], 1)
+    gx, gy = gx[m > 0], gy[m > 0]
+    jxx, jyy, jxy = float((gx * gx).sum()), float((gy * gy).sum()), float((gx * gy).sum())
+    if jxx + jyy < 1e-6:
+        return None, 0.0
+    coh = np.hypot(jxx - jyy, 2 * jxy) / (jxx + jyy)
+    normal = 0.5 * np.degrees(np.arctan2(2 * jxy, jxx - jyy))
+    return (normal + 90) % 180, float(coh)
+
+
+def _drop_cross_stubs(full, segs, T):
+    """A short straight-pass (h / v) piece whose surrounding mask edges run at a clearly different angle is a
+    stub across a stair-stepped angled or curved wall band, not a wall: drop it so the tracer follows the band
+    as one piece. Real short h / v walls and square columns have h / v edges and stay."""
+    for sg in segs:
+        if sg.get("drop") or sg["frame"] != 0:
+            continue
+        p0, p1 = np.array(sg["p0"]), np.array(sg["p1"])
+        L = np.linalg.norm(p1 - p0)
+        if L >= 4 * T:
+            continue
+        ang, coh = _edge_direction(full, p0, p1, sg["t"], T)
+        if ang is None or coh < 0.5:
+            continue
+        own = np.degrees(np.arctan2(p1[1] - p0[1], p1[0] - p0[0])) % 180
+        diff = abs(ang - own) % 180
+        diff = min(diff, 180 - diff)
+        if diff > 25:
+            sg["drop"] = True
+    return segs
+
+
+def _join_trace_ends(segs, traced, T):
+    """Close the corners where a traced chain meets another wall. The straight wall already claimed the corner
+    pixels, so the chain stops about half a wall short of it, often with a tiny kink where the mask's centre-line
+    bends into the junction. Drop that kink (shorter than ~T, at a free chain end) and run the chain's end on
+    to the other wall's centre-line, only through the corner the model marked (at most ~T past its old end)."""
+    seglen = lambda sg: np.hypot(sg["p1"][0] - sg["p0"][0], sg["p1"][1] - sg["p0"][1])
+    chains = {}
+    for pc in traced:
+        if "_chain" in pc:
+            chains.setdefault(pc["_chain"], []).append(pc)
+    for ch in chains.values():                    # pieces are in path order; trim tiny kinks at free ends
+        while len(ch) > 1 and seglen(ch[0]) < T and "j0" not in ch[0]:
+            ch.pop(0)["drop"] = True
+            ch[0].pop("j0", None)
+        while len(ch) > 1 and seglen(ch[-1]) < T and "j1" not in ch[-1]:
+            ch.pop()["drop"] = True
+            ch[-1].pop("j1", None)
+    traced = [pc for pc in traced if not pc.pop("drop", False)]
+    walls = segs + traced
+    for pc in traced:
+        if "_chain" not in pc:
+            continue                              # solid blocks stand on their own
+        p0, p1 = np.array(pc["p0"]), np.array(pc["p1"])
+        L = max(np.linalg.norm(p1 - p0), 1e-9)
+        d = (p1 - p0) / L
+        for end, key in ((0, "j0"), (1, "j1")):
+            if key in pc:
+                continue
+            pe = p0 if end == 0 else p1
+            out_d = -d if end == 0 else d         # pointing away from the piece
+            best = None
+            for q in walls:
+                if q is pc or q.get("_chain", -1) == pc["_chain"]:
+                    continue
+                q0, q1 = np.array(q["p0"]), np.array(q["p1"])
+                M = max(np.linalg.norm(q1 - q0), 1e-9)
+                e = (q1 - q0) / M
+                cr = d[0] * e[1] - d[1] * e[0]
+                if abs(cr) < np.sin(np.radians(12)):
+                    continue
+                tq = ((pe[0] - q0[0]) * d[1] - (pe[1] - q0[1]) * d[0]) / (e[0] * d[1] - e[1] * d[0])
+                if not (-T <= tq <= M + T):
+                    continue
+                X = q0 + e * tq
+                s = (X - pe) @ out_d               # how far the end moves (outwards > 0)
+                if s < -q["t"] / 2 or s > q["t"] / (2 * abs(cr)) + T:
+                    continue
+                if abs(s) > 0.6 * L and s < 0:     # never eat most of the piece
+                    continue
+                if best is None or abs(s) < best[0]:
+                    best = (abs(s), X, q["t"], q, tq, M)
+            if best is not None:
+                _, X, qt, q, tq, M = best
+                pc["p0" if end == 0 else "p1"] = [float(X[0]), float(X[1])]
+                pc[key] = (None, qt)
+                # the other wall ends right there too (a free end inside the corner block): end it at the
+                # shared corner instead of letting it poke through the joint
+                reach = pc["t"] / 2 + T
+                for qend, qkey, near in ((0, "j0", tq <= reach), (1, "j1", tq >= M - reach)):
+                    if near and qkey not in q and not q.get(qkey + "_hv") and 0 < tq < M:
+                        q["p0" if qend == 0 else "p1"] = [float(X[0]), float(X[1])]
+                        q[qkey] = (None, pc["t"])
+    for pc in traced:
+        pc.pop("_chain", None)
+    return [pc for pc in traced if seglen(pc) >= 1]
+
+
 def _drawn_windows(segs, merged, image, T, model_shape):
     """Windows the model did not mark, read from the drawing: a gap between two collinear walls with 2+ thin
     lines running along the wall inside its thickness. The two walls become one wall with a window in it.
@@ -709,6 +821,34 @@ def _skeleton_paths(sk):
     return paths
 
 
+K3_ = np.ones((3, 3), np.uint8)
+
+
+def _prune_spurs(sk, T):
+    """Remove skeleton side branches shorter than ~T (a free end to a junction): edge noise, not wall."""
+    sk = sk.copy()
+    for _ in range(3):
+        paths = _skeleton_paths(sk)
+        if len(paths) <= 1:
+            break
+        deg = {}
+        for pth in paths:
+            for q in (pth[0], pth[-1]):
+                deg[q] = deg.get(q, 0) + 1
+        cut = False
+        for pth in paths:
+            a, b = pth[0], pth[-1]
+            free_a, free_b = deg[a] == 1, deg[b] == 1
+            if len(pth) < T and (free_a != free_b):          # one free end, the other at a junction
+                for q in pth:
+                    if q != (b if free_a else a):
+                        sk[q[1], q[0]] = False
+                cut = True
+        if not cut:
+            break
+    return sk
+
+
 def _trace_leftovers(model_wall, segs, T):
     """Model wall pixels that no straight wall explains (curved walls, irregular pieces): follow the mask's
     centre-line with straight pieces (Revit walls are straight) no further than ~T/4 from it, thickness as drawn."""
@@ -722,10 +862,13 @@ def _trace_leftovers(model_wall, segs, T):
         p1 = p1 + d * ((sg["j1"][1] / 2 if "j1" in sg else 0) + 1)
         cv2.fillPoly(claimed, [np.round(np.array([p0 - n, p1 - n, p1 + n, p0 + n])).astype(np.int32)], 1)
     left = model_wall & ~(claimed > 0)
-    out = []
+    out, chain_id = [], [0]
     for comp, st in _components(left, max(4, int(0.25 * T * T))):
         dist = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
-        sk = skeletonize(comp)
+        # centre-line of the band with its ragged edges smoothed (JPEG / photo noise grows side branches that
+        # cut the line into pieces too short to trace), then the remaining short side branches pruned
+        sm = cv2.GaussianBlur(comp.astype(np.float32), (0, 0), max(1.0, T / 4)) > 0.5
+        sk = _prune_spurs(skeletonize(sm & (cv2.dilate(comp.astype(np.uint8), K3_) > 0)), T)
         if comp.sum() < 2 * sk.sum():                        # a 1 px sliver along a wall's edge (rounding)
             continue
         ys_, xs_ = np.nonzero(comp)
@@ -741,6 +884,7 @@ def _trace_leftovers(model_wall, segs, T):
         if sk.sum() < 1.5 * T:
             continue
         for path in _skeleton_paths(sk):
+            chain_id[0] += 1
             if len(path) < 1.5 * T:
                 continue
             pts = np.array(path, np.float32).reshape(-1, 1, 2)
@@ -750,7 +894,7 @@ def _trace_leftovers(model_wall, segs, T):
             for k in range(len(poly) - 1):
                 seg_px = np.array(path[idx[k]:idx[k + 1] + 1])
                 t = 2 * float(np.median(dist[seg_px[:, 1], seg_px[:, 0]])) if len(seg_px) else T
-                pieces.append({"o": "a", "frame": "trace", "t": max(t, 1.0),
+                pieces.append({"o": "a", "frame": "trace", "t": max(t, 1.0), "_chain": chain_id[0],
                                "p0": [float(poly[k][0]), float(poly[k][1])],
                                "p1": [float(poly[k + 1][0]), float(poly[k + 1][1])],
                                "j0_hv": False, "j1_hv": False})
@@ -983,6 +1127,7 @@ def vectorise(room, icon, image=None):
         on = full_dil[ys, xs].mean()
         if on < 0.6:
             sg["drop"] = True
+    _drop_cross_stubs(full, segs, T)
     keep_idx = [i for i, sg in enumerate(segs) if not sg.get("drop")]
     kmap = {i: k for k, i in enumerate(keep_idx)}
     merged = [dict(o, wall=kmap[o["wall"]]) for o in merged if o["wall"] in kmap]
@@ -994,7 +1139,7 @@ def vectorise(room, icon, image=None):
     remap = {i: k for k, i in enumerate(segs_ok)}
     segs = [segs[i] for i in segs_ok]
     merged = [dict(o, wall=remap[o["wall"]]) for o in merged if o["wall"] in remap]
-    traced = _trace_leftovers(model_wall, segs, T)
+    traced = _join_trace_ends(segs, _trace_leftovers(model_wall, segs, T), T)
     if traced:
         print("  walls traced along the model's mask (curves / irregular pieces): {}".format(len(traced)))
     segs = segs + traced

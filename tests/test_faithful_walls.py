@@ -192,3 +192,51 @@ def test_walls_each_at_their_own_angle():
         assert len(along) == 1, "wall at {:.1f} deg came out as {} pieces".format(
             np.degrees(np.arctan2(d[1], d[0])) % 180, len(along))
         assert np.linalg.norm(along[0][1] - along[0][0]) > 0.85 * np.linalg.norm(b - a)
+
+
+
+def _chamfered(noise, R=700):
+    """A house whose four corners are cut by gently bowed ~45 degree walls (no straight frame fits them, so they
+    are traced) with stair-stepped, optionally ragged mask edges - as on the curved plans from real models."""
+    room = np.full((900, 1100), 3, np.uint8)
+    x0, y0, x1, y1, c = 150, 150, 950, 750, 150
+    for a, b in [((x0 + c, y0), (x1 - c, y0)), ((x0 + c, y1), (x1 - c, y1)),
+                 ((x0, y0 + c), (x0, y1 - c)), ((x1, y0 + c), (x1, y1 - c))]:
+        cv2.line(room, a, b, 2, 10)
+    diags = [((x0, y0 + c), (x0 + c, y0)), ((x1 - c, y0), (x1, y0 + c)),
+             ((x1, y1 - c), (x1 - c, y1)), ((x0 + c, y1), (x0, y1 - c))]
+    for a, b in diags:
+        a, b = np.array(a, float), np.array(b, float)
+        m, ch = (a + b) / 2, np.linalg.norm(b - a)
+        ctr = m - np.sign(m - np.array([550, 450])) / np.sqrt(2) * np.sqrt(R * R - ch * ch / 4)
+        pts = [ctr + (p - ctr) / np.linalg.norm(p - ctr) * R for p in (a + (b - a) * t for t in np.linspace(0, 1, 40))]
+        cv2.polylines(room, [np.round(pts).astype(np.int32)], False, 2, 10)
+    if noise:
+        rs = np.random.RandomState(0)
+        m = room == 2
+        edge = (cv2.dilate(m.astype(np.uint8), K3) > 0) & ~(cv2.erode(m.astype(np.uint8), K3) > 0)
+        flip = edge & (rs.rand(*room.shape) < noise)
+        room[flip & m] = 3
+        room[flip & ~m] = 2
+    return room, diags
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.3])
+def test_corners_of_angled_bands_are_clean(noise):
+    """No straight-pass stubs across a stair-stepped bowed diagonal band; it comes out as one or two traced
+    pieces whose ends meet the straight walls at the corners."""
+    room, diags = _chamfered(noise)
+    walls = convert(room, np.zeros_like(room))
+    T = 10
+    for a, b in diags:
+        a, b = np.array(a, float), np.array(b, float)
+        lo, hi = np.minimum(a, b) + 2 * T, np.maximum(a, b) - 2 * T
+        inside = [w for w in walls if np.all(lo <= (w[0] + w[1]) / 2) and np.all((w[0] + w[1]) / 2 <= hi)]
+        stubs = [w for w in inside if min(abs(w[1][0] - w[0][0]), abs(w[1][1] - w[0][1])) < 1e-6]
+        assert not stubs, "horizontal / vertical stubs across the diagonal at {}: {}".format(a, len(stubs))
+        assert 1 <= len(inside) <= 2, "diagonal at {} came out as {} pieces".format(a, len(inside))
+        for p in (a, b):
+            assert wall_through(walls, *p), "corner at {} left open".format(p)
+    added, missed = added_missed(room, np.zeros_like(room), walls)
+    mw = int((room == 2).sum())
+    assert missed <= 0.02 * mw and added <= 0.025 * mw, (added, missed)
