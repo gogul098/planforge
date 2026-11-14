@@ -185,11 +185,16 @@ force_total = None
 if os.path.exists(os.path.join(CKPT_DIR, "last.pt")):
     import torch
     ck = torch.load(os.path.join(CKPT_DIR, "last.pt"), map_location="cpu", weights_only=False)
-    print(f"resuming: epoch {ck['epoch']}/{ck['total_epochs']}, best score {ck['best_score']:.4f}")
-    if EXTRA_EPOCHS > 0:
+    if ck.get("signature", {}).get("data_version", "v1") != DATA_VERSION:
+        print(f"previous run (data {ck.get('signature', {}).get('data_version', 'v1')}): epoch {ck['epoch']}, "
+              f"best score {ck['best_score']:.4f} -> NEW run with data {DATA_VERSION}, starting from its weights")
+    elif EXTRA_EPOCHS > 0:
+        print(f"resuming: epoch {ck['epoch']}/{ck['total_epochs']}, +{EXTRA_EPOCHS} extra epochs")
         force_total = ck["total_epochs"] + EXTRA_EPOCHS
     elif ck["epoch"] >= ck["total_epochs"]:
         print("Schedule already finished. Set EXTRA_EPOCHS > 0 to keep training.")
+    else:
+        print(f"resuming: epoch {ck['epoch']}/{ck['total_epochs']}, best score {ck['best_score']:.4f}")
     del ck
 else:
     print("fresh run")''')
