@@ -25,6 +25,9 @@ HEAT_CLASSES = ["WallJunction", "OpeningEndpoint", "IconCorner"]
 N_ROOM, N_ICON, N_HEAT = len(ROOM_CLASSES), len(ICON_CLASSES), len(HEAT_CLASSES)
 N_OUT = N_ROOM + N_ICON + N_HEAT
 IGNORE = 255
+NOT_WALL = 254       # room target: "known not wall, room type unknown" (sources that only label walls)
+# Rotation augmentation: plans with angled wings mostly use these angles; any angle is also trained
+ROT_ANGLES = (30.0, 45.0, 60.0)
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32) * 255.0
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32) * 255.0
 
@@ -53,15 +56,26 @@ def render_heatmaps(points, h, w, sigma):
 class CachedFloorplans(torch.utils.data.Dataset):
     """Reads the preprocessed cache: <root>/data/<id>_img.png, _lbl.png (B=room, G=icon), _pts.npy"""
 
-    def __init__(self, root, split, train, crop=768, sigma=3.0, scale_range=(0.75, 1.3)):
+    def __init__(self, root, split, train, crop=768, sigma=3.0, scale_range=(0.6, 1.8), rot_prob=0.6,
+                 fixed_angle=None, sources=None, limit=None):
+        """rot_prob: share of training crops rotated by a non-90-degree angle (30/45/60 +-3 deg, or any angle).
+        fixed_angle: evaluation only - every sample rotated by exactly this angle (rotated-plan validation)."""
         with open(os.path.join(root, "index.json")) as f:
             index = json.load(f)
         self.items = index[split]
+        if sources is not None:                     # e.g. ["cubicasa"]; entries without "source" are CubiCasa5K
+            self.items = [it for it in self.items if it.get("source", "cubicasa") in sources]
+        if limit:
+            self.items = self.items[:limit]
         self.root = os.path.join(root, "data")
         self.train, self.crop, self.sigma, self.scale_range = train, crop, sigma, scale_range
+        self.rot_prob, self.fixed_angle = rot_prob, fixed_angle
 
     def __len__(self):
         return len(self.items)
+
+    def source_of(self, i):
+        return self.items[i].get("source", "cubicasa")
 
     def _load(self, i):
         sid = self.items[i]["id"]
@@ -70,17 +84,25 @@ class CachedFloorplans(torch.utils.data.Dataset):
         if img is None or lbl is None:
             raise RuntimeError(f"Corrupt cache entry {sid}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        pts = np.load(os.path.join(self.root, sid + "_pts.npy")).astype(np.float32).reshape(-1, 3)
+        pp = os.path.join(self.root, sid + "_pts.npy")
+        # sources without junction labels have no _pts file: their heat target is "unknown", not "none"
+        pts = np.load(pp).astype(np.float32).reshape(-1, 3) if os.path.exists(pp) else None
         return img, lbl[:, :, 0].copy(), lbl[:, :, 1].copy(), pts
 
     def __getitem__(self, i):
         img, room, icon, pts = self._load(i)
+        has_heat = pts is not None
+        if pts is None:
+            pts = np.zeros((0, 3), np.float32)
         if self.train:
             img, room, icon, pts = self._augment(img, room, icon, pts)
+        elif self.fixed_angle is not None:
+            img, room, icon, pts = self._rotate_whole(img, room, icon, pts, self.fixed_angle)
+            img, room, icon = self._pad32(img, room, icon)
         else:
             img, room, icon = self._pad32(img, room, icon)
         h, w = room.shape
-        heat = render_heatmaps(pts, h, w, self.sigma)
+        heat = render_heatmaps(pts, h, w, self.sigma) if has_heat else np.full((N_HEAT, h, w), -1.0, np.float32)
         x = (img.astype(np.float32) - MEAN) / STD
         return (torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))),
                 torch.from_numpy(np.ascontiguousarray(room)).long(),
@@ -97,6 +119,24 @@ class CachedFloorplans(torch.utils.data.Dataset):
             icon = cv2.copyMakeBorder(icon, 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=IGNORE)
         return img, room, icon
 
+    @staticmethod
+    def _rotate_whole(img, room, icon, pts, angle):
+        """Rotate a whole plan by `angle` degrees on a canvas that fits it (evaluation on rotated plans)."""
+        h, w = room.shape
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        c, s_ = abs(M[0, 0]), abs(M[0, 1])
+        W2, H2 = int(math.ceil(h * s_ + w * c)), int(math.ceil(h * c + w * s_))
+        M[0, 2] += W2 / 2 - w / 2
+        M[1, 2] += H2 / 2 - h / 2
+        img = cv2.warpAffine(img, M, (W2, H2), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+        room = cv2.warpAffine(room, M, (W2, H2), flags=cv2.INTER_NEAREST, borderValue=IGNORE)
+        icon = cv2.warpAffine(icon, M, (W2, H2), flags=cv2.INTER_NEAREST, borderValue=IGNORE)
+        if len(pts):
+            pts = pts.copy()
+            xy = pts[:, :2] @ M[:, :2].T + M[:, 2]
+            pts[:, 0], pts[:, 1] = xy[:, 0], xy[:, 1]
+        return img, room, icon, pts
+
     def _augment(self, img, room, icon, pts):
         S = self.crop
         h, w = room.shape
@@ -106,6 +146,13 @@ class CachedFloorplans(torch.utils.data.Dataset):
         x0 = random.uniform(0, w - src) if w > src else -random.uniform(0, src - w)
         y0 = random.uniform(0, h - src) if h > src else -random.uniform(0, src - h)
         M = np.array([[s, 0, -x0 * s], [0, s, -y0 * s]], dtype=np.float32)
+        if random.random() < self.rot_prob:
+            # angled walls: rotate the crop about its centre (the 90-degree turns / flips below add the rest,
+            # so 30 also covers 120, 210, 300 and with the flip -30 ...). Corners outside the plan stay
+            # white paper and are ignored in the loss.
+            a = random.choice(ROT_ANGLES) + random.uniform(-3, 3) if random.random() < 0.7 else random.uniform(0, 90)
+            R = cv2.getRotationMatrix2D((S / 2, S / 2), a, 1.0).astype(np.float32)
+            M = (np.vstack([R, [0, 0, 1]]) @ np.vstack([M, [0, 0, 1]]))[:2].astype(np.float32)
         interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
         img = cv2.warpAffine(img, M, (S, S), flags=interp, borderMode=cv2.BORDER_CONSTANT,
                              borderValue=(255, 255, 255))
@@ -115,8 +162,8 @@ class CachedFloorplans(torch.utils.data.Dataset):
                               borderMode=cv2.BORDER_CONSTANT, borderValue=IGNORE)
         if len(pts):
             pts = pts.copy()
-            pts[:, 0] = (pts[:, 0] - x0) * s
-            pts[:, 1] = (pts[:, 1] - y0) * s
+            xy = pts[:, :2] @ M[:, :2].T + M[:, 2]
+            pts[:, 0], pts[:, 1] = xy[:, 0], xy[:, 1]
         # rotations / flips (all heads are orientation-free, so labels stay valid)
         k = random.randint(0, 3)
         for _ in range(k):  # 90 deg counter-clockwise
@@ -194,6 +241,10 @@ def focal_ce(logits, target, gamma=2.0, ignore=IGNORE):
 
 
 def heat_focal(logits, gt, alpha=2.0, beta=4.0):
+    keep = gt[:, 0, 0, 0] >= 0                     # samples whose source labels junctions (else target is -1)
+    if not keep.any():
+        return logits.sum() * 0.0
+    logits, gt = logits[keep], gt[keep]
     pred = torch.sigmoid(logits).clamp(1e-4, 1 - 1e-4)
     pos = gt.ge(0.999).float()
     neg = 1 - pos
@@ -210,7 +261,12 @@ class MultiTaskLoss(nn.Module):
 
     def forward(self, out, room, icon, heat):
         r, i, h = [t.float() for t in split_logits(out)]
+        not_wall = room == NOT_WALL
+        room = torch.where(not_wall, torch.full_like(room, IGNORE), room)
         l_room = F.cross_entropy(r, room, ignore_index=IGNORE) + dice_loss(r, room, N_ROOM)
+        if not_wall.any():                          # "not a wall, room type unknown": push only P(wall) down
+            p_wall = torch.softmax(r, 1)[:, ROOM_CLASSES.index("Wall")]
+            l_room = l_room + (-torch.log((1 - p_wall[not_wall]).clamp(min=1e-6))).mean()
         l_icon = focal_ce(i, icon) + dice_loss(i, icon, N_ICON)
         l_heat = heat_focal(h, heat)
         total = self.w[0] * l_room + self.w[1] * l_icon + self.w[2] * l_heat
@@ -219,7 +275,7 @@ class MultiTaskLoss(nn.Module):
 
 # ----------------------------------------------------------------------------- metrics
 def update_confusion(cm, pred, target, n_cls, ignore=IGNORE):
-    valid = target != ignore
+    valid = (target != ignore) & (target != NOT_WALL)
     idx = target[valid] * n_cls + pred[valid]
     cm += torch.bincount(idx, minlength=n_cls * n_cls).reshape(n_cls, n_cls)
     return cm
@@ -253,3 +309,36 @@ class EMA:
                 v.mul_(d).add_(msd[k].detach(), alpha=1 - d)
             else:
                 v.copy_(msd[k])
+
+
+class SourceWeightedSampler(torch.utils.data.Sampler):
+    """Each epoch draws `num_samples` items with per-source shares (e.g. CubiCasa 0.4, ResPlan 0.25, synthetic
+    angled 0.2, FloorPlanCAD 0.15), so a big source does not drown the others; sharded across DDP ranks."""
+
+    def __init__(self, ds, weights, num_samples, rank=0, world=1, seed=0):
+        self.groups = {}
+        for i in range(len(ds)):
+            self.groups.setdefault(ds.source_of(i), []).append(i)
+        w = {k: float(weights.get(k, 0.0)) for k in self.groups}
+        tot = sum(w.values()) or 1.0
+        self.share = {k: v / tot for k, v in w.items() if v > 0}
+        self.num_samples = num_samples - num_samples % world
+        self.rank, self.world, self.seed, self.epoch = rank, world, seed, 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = random.Random(self.seed + self.epoch)
+        picks = []
+        for k, sh in self.share.items():
+            n = int(round(sh * self.num_samples))
+            pool = self.groups[k]
+            picks += [pool[g.randrange(len(pool))] for _ in range(n)] if n > len(pool) else g.sample(pool, n)
+        g.shuffle(picks)
+        picks = picks[:self.num_samples]
+        picks += picks[:self.num_samples - len(picks)]
+        return iter(picks[self.rank::self.world])
+
+    def __len__(self):
+        return self.num_samples // self.world

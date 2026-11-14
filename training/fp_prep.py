@@ -340,3 +340,90 @@ def prepare_data(cache_root, work_dir, parser_dir, max_side, api, dataset_repo, 
     if api is not None:
         upload_cache(api, dataset_repo, max_side, cache_root, token)
     return index
+
+
+# ----------------------------------------------------------------------------- extra sources
+EXTRA_VERSION = "v1"
+RESPLAN_GIT = "https://github.com/m-agour/ResPlan"
+
+
+def extra_name(max_side, sources):
+    return "extra_{}_side{}_{}.tar".format("-".join(sorted(sources)), max_side, EXTRA_VERSION)
+
+
+def _merge_index(cache_root, extra):
+    path = os.path.join(cache_root, "index.json")
+    index = json.load(open(path))
+    for split, items in extra.items():
+        have = {it["id"] for it in index.get(split, [])}
+        index.setdefault(split, []).extend(it for it in items if it["id"] not in have)
+    index.setdefault("meta", {})["extra_sources"] = sorted({it["source"] for v in extra.values() for it in v})
+    json.dump(index, open(path, "w"))
+    return index
+
+
+def prepare_extra(cache_root, work_dir, max_side, api, dataset_repo, token,
+                  sources=("resplan", "synthetic", "floorplancad"), n_synthetic=3000, fpcad_doors=False):
+    """Add ResPlan, synthetic angled plans and FloorPlanCAD to the cache (after prepare_data).
+    Restored from the HF dataset repo when an earlier run already built them."""
+    from huggingface_hub import hf_hub_download
+    sources = sorted(sources)
+    name = extra_name(max_side, sources)
+    data_dir = os.path.join(cache_root, "data")
+    listing = os.path.join(cache_root, "extra_index.json")
+    if os.path.exists(listing):
+        return _merge_index(cache_root, json.load(open(listing)))
+    try:
+        if api is not None and name in api.list_repo_files(dataset_repo, repo_type="dataset", token=token):
+            log(f"Restoring extra training data ({name}) from HF ...")
+            p = hf_hub_download(dataset_repo, name, repo_type="dataset", token=token,
+                                local_dir=os.path.join(work_dir, "hf_dl_extra"))
+            with tarfile.open(p) as t:
+                t.extractall(cache_root)
+            os.remove(p)
+            return _merge_index(cache_root, json.load(open(listing)))
+    except Exception as e:
+        log(f"Extra data restore failed ({e}); building it.")
+    import fp_render
+    extra = {"train": [], "val": [], "test": []}
+    if "resplan" in sources or "synthetic" in sources:
+        rp_dir = os.path.join(work_dir, "ResPlan")
+        if not os.path.exists(os.path.join(rp_dir, "ResPlan.zip")):
+            subprocess.run(["git", "clone", "-q", "--depth", "1", RESPLAN_GIT, rp_dir], check=True)
+        with zipfile.ZipFile(os.path.join(rp_dir, "ResPlan.zip")) as z:
+            z.extractall(rp_dir)
+        log("Rendering ResPlan + synthetic angled plans ...")
+        got = fp_render.build_rendered(cache_root, os.path.join(rp_dir, "ResPlan.pkl"),
+                                       os.path.join(rp_dir, "split.json"),
+                                       n_synthetic=n_synthetic if "synthetic" in sources else 0,
+                                       max_side=max_side, log=log)
+        for k, v in got.items():
+            extra[k] += [it for it in v if it["source"] in sources]
+    if "floorplancad" in sources:
+        import fp_extra_fpcad
+        log("Converting FloorPlanCAD (walls, windows, stairs, sanitary) ...")
+        try:
+            got = fp_extra_fpcad.build_fpcad(cache_root, max_side, teach_doors=fpcad_doors, log=log)
+            for k, v in got.items():
+                extra[k] += v
+        except Exception as e:
+            log(f"WARNING: FloorPlanCAD skipped ({type(e).__name__}: {e}); training continues without it.")
+    json.dump(extra, open(listing, "w"))
+    for k in extra:
+        log(f"  extra {k}: " + ", ".join(f"{s} {sum(it['source'] == s for it in extra[k])}" for s in sources))
+    if api is not None:
+        tar_path = os.path.join(work_dir, name)
+        ids = {it["id"] for v in extra.values() for it in v}
+        with tarfile.open(tar_path, "w") as t:
+            t.add(listing, arcname="extra_index.json")
+            for f in os.listdir(data_dir):
+                if f.rsplit("_", 1)[0] in ids:
+                    t.add(os.path.join(data_dir, f), arcname="data/" + f)
+        try:
+            api.upload_file(path_or_fileobj=tar_path, path_in_repo=name, repo_id=dataset_repo,
+                            repo_type="dataset", token=token, commit_message="Extra training data " + name)
+            log("Extra data uploaded to HF.")
+        except Exception as e:
+            log(f"WARNING: extra data upload failed ({e}); next run rebuilds it.")
+        os.remove(tar_path)
+    return _merge_index(cache_root, extra)

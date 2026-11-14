@@ -41,7 +41,10 @@ def export_floorplan(ckpt_path, out_path):
     import onnx
     m = onnx.load(out_path)
     info = "epoch {}, val score {:.3f}".format(ck.get("epoch", -1) + 1, ck.get("metrics", {}).get("score", float("nan")))
-    for k, v in {"info": info, "encoder": ck.get("encoder", "tu-efficientnet_b3")}.items():
+    meta = {"info": info, "encoder": ck.get("encoder", "tu-efficientnet_b3"),
+            # trained on plans turned by 30 / 45 / 60 degrees: the engine then reads each plan once
+            "rotation_trained": "1" if ck.get("rotation_trained") else "0"}
+    for k, v in meta.items():
         e = m.metadata_props.add(); e.key, e.value = k, v
     onnx.save(m, out_path)
     # same answers as PyTorch?

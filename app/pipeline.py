@@ -265,7 +265,8 @@ def _load_model(force_check=False):
             return _MODEL["net"], _MODEL["dev"]
         sess = _onnx_session(paths["checkpoints/model.onnx"])
         meta = sess.get_modelmeta().custom_metadata_map
-        _MODEL.update(net=sess, dev="onnx", rev=rev, info="{}, ONNX Runtime".format(meta.get("info", "")))
+        _MODEL.update(net=sess, dev="onnx", rev=rev, info="{}, ONNX Runtime".format(meta.get("info", "")),
+                      rotation_trained=meta.get("rotation_trained") == "1")
         print("model loaded (ONNX): revision", rev)
         return sess, "onnx"
     local = "/kaggle/working/checkpoints/best.pt"
@@ -289,7 +290,7 @@ def _load_model(force_check=False):
                    decoder_attention_type="scse")
     net.load_state_dict(ck["ema"]); net.to(dev).eval()
     info = "epoch {}, val score {:.3f}".format(ck.get("epoch", -1) + 1, ck.get("metrics", {}).get("score", float("nan")))
-    _MODEL.update(net=net, dev=dev, rev=rev, info=info)
+    _MODEL.update(net=net, dev=dev, rev=rev, info=info, rotation_trained=bool(ck.get("rotation_trained")))
     print("model loaded: revision", rev)
     return net, dev
 
@@ -319,8 +320,9 @@ def predict(image_src):
     h, w = img.shape[:2]
     room_p, icon_p = _net_probs(net, dev, img, FLIP_TTA)
     views = 1
-    if ROTATE_TTA:
-        # the model learned from plans drawn square to the page: show it extra copies rotated so each family
+    if ROTATE_TTA and not _MODEL.get("rotation_trained"):
+        # a model trained with rotated plans reads angled walls in one pass; older models learned from plans
+        # drawn square to the page: show it extra copies rotated so each family
         # of angled walls lies flat, rotate its answers back and combine (rooms averaged, objects: most sure view).
         # Angles come from the walls the model found in the first pass, not from the ink: dimension ticks, hatching,
         # stair and furniture lines are diagonal too and would cost a full extra pass each.

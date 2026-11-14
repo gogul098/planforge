@@ -18,6 +18,12 @@ Architects then only add elevations and detailing, which cuts most of the manual
   from the dimension strings and room sizes written on the plan, read by OCR and solved by least squares.
 - **Floor-plan model:** a multitask U-Net (EfficientNet-B3, 768 px) segments 12 room classes and 12 icon
   classes (walls, doors, windows, stairs, fixtures). Best validation score 0.747.
+- **Training data (v2):** CubiCasa5K, plus [ResPlan](https://github.com/m-agour/ResPlan) (17,000 South Asian
+  plans, rendered as drawings in varied styles), synthetic buildings with wings at 30°, 45° and 60° and curved
+  fronts, and the walls / windows / stairs / fixtures of FloorPlanCAD. Every crop can be turned by 30 / 45 / 60
+  degrees or any angle, so a rotation-trained model reads angled walls in **one pass**: the engine then skips
+  the extra rotated reads automatically (flag stored in the ONNX file). Validation also scores plans rotated by
+  30° and 60°.
 - **Furniture detector:** YOLO11m-OBB trained on FloorPlanCAD (18 classes, mAP50 ≈ 0.87). It keeps the exact
   rotation, checks each object against the room it sits in, and snaps it back against the nearest wall.
 - **Vectorisation = projection:** the model's wall mask becomes centre-line walls exactly where and as thick as the
@@ -109,3 +115,5 @@ runtime with `HF_TOKEN`, and the deploy workflow refuses to build if any weight 
 
 Code: MIT. Models trained on [CubiCasa5K](https://github.com/CubiCasa/CubiCasa5k) and
 [FloorPlanCAD](https://floorplancad.github.io/) (CC BY-NC 4.0): non-commercial use only.
+[ResPlan](https://github.com/m-agour/ResPlan) (CC BY 4.0, Abouagour & Garyfallidis 2025) is used for rendered
+training plans; it is loaded with a restricted unpickler that allows only shapely / numpy constructors.
