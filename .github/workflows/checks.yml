@@ -24,7 +24,7 @@ jobs:
         run: python kaggle/bundle_app.py --check
       - name: Python files compile
         run: python -m py_compile app/server.py app/pipeline.py app/build_in_revit.py kaggle/*.py pipeline/assemble.py
-      - name: Converter projects the model's walls (no added / removed wall)
+      - name: Tests (walls projected faithfully, sunken steps, stair edits)
         run: |
-          pip install -q pytest numpy opencv-python-headless scikit-image scipy shapely matplotlib
+          pip install -q -r app/requirements.txt pytest httpx      # the engine's own packages (no PyTorch)
           pytest -q tests

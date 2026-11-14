@@ -276,3 +276,9 @@ h4 {
   .toast { bottom: 20px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+.stair-edit { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); display: grid; gap: 8px; }
+.stair-edit .seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.stair-edit .seg .btn { justify-content: center; padding: 0 6px; }
+.stair-edit label { display: grid; gap: 4px; }
+.stair-edit input { width: 100%; }

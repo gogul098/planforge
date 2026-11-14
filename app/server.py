@@ -332,6 +332,103 @@ def export(job: str, body: dict):
     return {"ok": True, "furniture": len(plan["furniture"])}
 
 
+# ----------------------------------------------------------------------------- stair edits
+def apply_stair_edit(plan, sid, mode, depth=None):
+    """The architect's call for one stair area: 'down' = steps go down from the floor to open ground (the
+    ground beside them is cut out of the floor and plinth), 'up' = raised seating on the floor, 'flat' = no
+    steps (plain floor), 'stair' = back to a stair to the floor above. depth = metres between floor and the
+    low level (None = keep / plinth)."""
+    sts = plan.get("stairs", [])
+    st = next((x for x in sts if x.get("id") == sid), None)
+    if st is None:
+        raise HTTPException(404, "unknown stair")
+    counted = "written" in str(st.get("sources", {}).get("risers", "")) or \
+        "counted" in str(st.get("sources", {}).get("risers", ""))
+
+    def reslice(tiers):
+        """Step count was only estimated (for a full stair): cut the area into realistic steps instead."""
+        from shapely.geometry import Polygon
+        a, b = np.array(st["start"], float), np.array(st["end"], float)
+        L = float(np.linalg.norm(b - a))
+        if L < 1e-6 or tiers < 1:
+            return
+        d = (b - a) / L
+        polys = [p for p in P._slice(Polygon(st["outline"]).buffer(0), (a + b) / 2, d, L, tiers) if p is not None]
+        if polys:
+            st["treads"] = [{"polygon": P._poly_list(p), "z0": 0.0, "z1": 0.0} for p in polys]
+            st["tread"] = round(L / len(polys), 4)
+            st["sources"] = dict(st.get("sources", {}), risers="re-cut for your edit at about 150 mm per step")
+    st.setdefault("warnings", [])
+    st["edited"] = mode
+    if mode == "flat":
+        plan["stairs"] = [x for x in sts if x is not st]
+        plan.setdefault("stairs_removed", []).append(st)
+    elif mode == "down":
+        st["kind"], st["sunken"] = "terrace", True
+        if depth:
+            st["depth_user"] = float(depth)
+        if not counted:
+            dp = float(depth) if depth else float(plan.get("levels", {}).get("plinth") or 0.45)
+            reslice(max(1, int(round(dp / 0.15)) - 1))           # n tiers between floor and pit = n + 1 risers
+        st["sources"] = dict(st.get("sources", {}), direction="set by you: goes down")
+    elif mode in ("up", "stair"):
+        st["sunken"] = False
+        st.pop("depth_user", None)
+        if not counted:
+            dp = float(depth) if depth else (0.45 if mode == "up" else P.WALL_HEIGHT)
+            reslice(max(1, int(round(dp / (0.15 if mode == "up" else 0.17))) - (0 if mode == "up" else 1)))
+        n = max(1, len(st.get("treads", [])))
+        if mode == "up":
+            st["kind"] = "terrace"
+            total = float(depth) if depth else float(st.get("riser", 0.15)) * n
+            rise = total / n
+            for r, tr in enumerate(st.get("treads", [])):
+                tr["z0"], tr["z1"] = 0.0, round(rise * (r + 1), 4)
+            st["direction"] = "rises from the floor (raised seating, set by you)"
+        else:
+            st["kind"] = "interior"
+            total = float(depth) if depth else P.WALL_HEIGHT
+            rise = total / (n + 1)
+            for r, tr in enumerate(st.get("treads", [])):
+                tr["z0"], tr["z1"] = 0.0, round(rise * (r + 1), 4)
+            st["direction"] = "stair to the floor above (set by you)"
+        st["riser"], st["base_z"], st["top_z"] = round(rise, 4), 0.0, round(total, 4)
+        st["sources"] = dict(st.get("sources", {}), direction="set by you: " + mode)
+    else:
+        raise HTTPException(400, "mode must be down, up, flat or stair")
+    plan["floor"]["holes"] = P.open_ground(plan)
+    return plan
+
+
+def _rebuild(work, out, plan):
+    jp = os.path.join(out, "plan.json")
+    json.dump(plan, open(jp, "w"), indent=1)
+    fmesh = P.furniture_meshes(plan["furniture"]) if plan.get("furniture") else {}
+    P.build_glb(plan, os.path.join(out, "model.glb"), extra=fmesh)
+    _shell_glb(plan, out)
+    try:
+        P.build_ifc(plan, os.path.join(out, "model.ifc"))
+    except Exception as e:
+        print("IFC export failed:", e)
+    _package(work, out)
+
+
+@app.post("/api/stair/{job}")
+def stair_edit(job: str, body: dict):
+    work = os.path.join(JOBS, os.path.basename(job))
+    out = os.path.join(work, "out")
+    jp = os.path.join(out, "plan.json")
+    if not os.path.exists(jp):
+        raise HTTPException(404, "unknown job")
+    plan = json.load(open(jp))
+    depth = body.get("depth")
+    with LOCK:
+        plan = apply_stair_edit(plan, int(body.get("id", -1)), str(body.get("mode", "")),
+                                float(depth) if depth not in (None, "") else None)
+        _rebuild(work, out, plan)
+    return {"ok": True, "stairs": len(plan.get("stairs", [])), "holes": len(plan["floor"].get("holes", []))}
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}

@@ -437,6 +437,24 @@ def build_stairs(v, toks, room, plan, original=None):
             stair_px[st["oy"]:st["oy"] + st["mask"].shape[0], st["ox"]:st["ox"] + st["mask"].shape[1]] |= st["mask"]
     all_st = list(v["stairs"]) + extra
     indoor = ~np.isin(room, (0, 1)) & (room != WALL) & ~stair_px
+    # open ground INSIDE the building, as the model marks it (background / outdoor within the outline): a sandpit,
+    # sunken court, amphitheatre floor. Steps beside it go down into it - the model decides, nothing is guessed.
+    open_inside, oi_lab = None, None
+    if footprint is not None and not footprint.is_empty:
+        from shapely import contains_xy
+        op = np.isin(room, (0, 1)) & ~walls_px & ~stair_px
+        ys_o, xs_o = np.nonzero(op)
+        if len(xs_o):
+            inside = contains_xy(footprint.buffer(-0.05), mx(xs_o.astype(float)), my(ys_o.astype(float)))
+            open_inside = np.zeros(room.shape, np.uint8)
+            open_inside[ys_o[inside], xs_o[inside]] = 1
+            n_oi, oi_lab, oi_st, _ = cv2.connectedComponentsWithStats(open_inside)
+            min_px = 1.0 / (mpp * mpp)                                # under 1 m2: a speck, not a pit
+            for l_ in range(1, n_oi):
+                if oi_st[l_, cv2.CC_STAT_AREA] < min_px:
+                    open_inside[oi_lab == l_] = 0
+                    oi_lab[oi_lab == l_] = 0
+            open_inside = open_inside > 0
 
     infos = []
     for st in all_st:
@@ -477,6 +495,18 @@ def build_stairs(v, toks, room, plan, original=None):
         # inside it leads to the next floor. Stepped areas (sunken / raised) only with the "stepped_areas" helper.
         stepped = "stepped_areas" in ASSIST and (shape == "irregular" or st.get("drawn"))
         kind = "entrance" if outside else ("terrace" if stepped else "interior")
+        pit_lab = []
+        if not outside and open_inside is not None:
+            r_ = max(int(round(0.6 / mpp)), int(T), 3)
+            Hr, Wr = room.shape
+            y0r, y1r, x0r, x1r = max(oy - r_, 0), min(oy + h + r_, Hr), max(ox - r_, 0), min(ox + w + r_, Wr)
+            cw = np.zeros((y1r - y0r, x1r - x0r), np.uint8)
+            cw[oy - y0r:oy - y0r + h, ox - x0r:ox - x0r + w] = comp
+            ring = (cv2.dilate(cw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_ + 1,) * 2)) > 0) & (cw == 0)
+            oi = open_inside[y0r:y1r, x0r:x1r]
+            if ring.sum() and (oi & ring).sum() >= 0.15 * ring.sum():
+                kind = "terrace"
+                pit_lab = [int(l_) for l_ in np.unique(oi_lab[y0r:y1r, x0r:x1r][oi & ring]) if l_]
         # distance (model px) to the HIGH side of the stair
         wx0, wy0, wx1, wy1 = _window(room.shape, ox, oy, ox + w, oy + h, pad)
         cx_px, cy_px = float(xs.mean() + ox), float(ys.mean() + oy)
@@ -491,6 +521,9 @@ def build_stairs(v, toks, room, plan, original=None):
         if kind == "entrance":
             anchor = indoor[wy0:wy1, wx0:wx1]
             direction = "rises towards the building"
+        elif kind == "terrace" and pit_lab:
+            anchor = indoor[wy0:wy1, wx0:wx1]                    # high side = the floor, low side = the open ground
+            direction = "goes DOWN to the open area beside it (the model marks it as open ground)"
         elif kind == "terrace":
             anchor = walls_px[wy0:wy1, wx0:wx1]
             direction = "rises towards the walls (assumed for a stepped area)"
@@ -579,7 +612,17 @@ def build_stairs(v, toks, room, plan, original=None):
             sources["run"] = "measured"
         if counted is None and st.get("n_lines"):
             counted = (max(2, st["n_lines"] - 1), None, None)    # tiers between the lines read from the drawing
+        pits = []
+        for l_ in pit_lab:                                          # the open ground it leads to, in metres
+            cs_, _ = cv2.findContours((oi_lab == l_).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cs_:
+                cpts = max(cs_, key=cv2.contourArea)[:, 0].astype(float)
+                pg = Polygon(np.stack([mx(cpts[:, 0]), my(cpts[:, 1])], 1)).buffer(0)
+                if pg.area >= 1.0:
+                    pits.append(pg)
+        down = bool(pits) or (kind == "terrace" and STEPPED_AREAS == "down")
         infos.append(dict(kind=kind, shape=shape, hull=hull_m, centre=centre, d=d, run=run, width=width,
+                          down=down, pits=pits,
                           width_low=width_low, width_high=width_high,
                           notes=notes, counted=counted, sources=sources, warnings=warnings, direction=direction,
                           lo=lo_m, hi=hi_m))
@@ -638,17 +681,17 @@ def build_stairs(v, toks, room, plan, original=None):
                 i["sources"]["risers"] = "assumed"
                 w.append("tiers could not be counted: 3 assumed")
             total = r * i["n"]
-            base = -total if STEPPED_AREAS == "down" else 0.0
-            if STEPPED_AREAS == "down" and plinth > 0.01:
+            base = -total if i["down"] else 0.0
+            if i["down"] and plinth > 0.01:
                 # steps going down lead to the open ground: they drop the full plinth height
                 total, base = plinth, -plinth
                 rsrc = "plinth: " + psrc + " split over the drawn steps"
-            if not (STEPPED_AREAS == "down" and plinth > 0.01):
+            if not (i["down"] and plinth > 0.01):
                 rsrc = "riser note" if "riser" in i["notes"] else "assumed {:.0f} mm per tier".format(r * 1000)
-            i["direction"] = ("goes DOWN from the raised floor to the open ground (floor and plinth cut out)" if STEPPED_AREAS == "down"
+            i["direction"] = ("goes DOWN from the raised floor to the open ground (floor and plinth cut out)" if i["down"]
                               else "rises towards the walls (raised seating)")
             w.append("stepped area going {}: tier height {}; check".format(
-                STEPPED_AREAS, "written" if "riser" in i["notes"] else "assumed"))
+                "down" if i["down"] else "up", "written" if "riser" in i["notes"] else "assumed"))
         n = int(i["n"])
         riser = total / n if n else 0.0
         if kind != "terrace" and not (0.10 <= riser <= 0.22):
@@ -680,7 +723,7 @@ def build_stairs(v, toks, room, plan, original=None):
         for j, p in enumerate(polys):
             if p is None:
                 continue
-            if kind == "terrace" and STEPPED_AREAS == "down":
+            if kind == "terrace" and i["down"]:
                 top = -riser * (j + 1)                         # first tier (atrium side) one step down
             else:
                 top = base + riser * (j + 1)
@@ -706,8 +749,9 @@ def build_stairs(v, toks, room, plan, original=None):
             "width": round(i["width"], 4), "width_low": round(i["width_low"], 4),
             "width_high": round(i["width_high"], 4), "run": round(L, 4),
             "risers": n, "riser": round(riser, 4), "tread": round(tread, 4),
-            "base_z": round(base, 4), "top_z": round(0.0 if (kind == "terrace" and STEPPED_AREAS == "down") else base + total, 4),
-            "sunken": bool(kind == "terrace" and STEPPED_AREAS == "down"),
+            "base_z": round(base, 4), "top_z": round(0.0 if (kind == "terrace" and i["down"]) else base + total, 4),
+            "sunken": bool(kind == "terrace" and i["down"]),
+            "pit": [_poly_list(pg) for pg in i.get("pits", [])],      # the open ground the model marked beside it
             "direction": i["direction"],
             "sources": dict(i["sources"], rise=rsrc),
             "treads": treads, "warnings": w,
