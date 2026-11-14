@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from fp_common import (CachedFloorplans, MultiTaskLoss, EMA, build_model, split_logits,
+from fp_common import (CachedFloorplans, SourceWeightedSampler, MultiTaskLoss, EMA, build_model, split_logits,
                        update_confusion, iou_from_confusion, ROOM_CLASSES, ICON_CLASSES,
                        N_ROOM, N_ICON)
 
@@ -102,7 +102,12 @@ def atomic_save(obj, path):
 
 def signature(cfg):
     return {k: cfg[k] for k in ("encoder", "crop", "max_side", "sigma")} | {
-        "n_room": N_ROOM, "n_icon": N_ICON}
+        "n_room": N_ROOM, "n_icon": N_ICON, "data_version": cfg.get("data_version", "v1")}
+
+
+def _same_arch(a, b):
+    return {k: v for k, v in (a or {}).items() if k != "data_version"} == \
+           {k: v for k, v in (b or {}).items() if k != "data_version"}
 
 
 def make_optimizer(model, cfg):
@@ -228,10 +233,27 @@ def main():
         return t.item()
 
     # data
-    train_ds = CachedFloorplans(cfg["cache_root"], "train", True, cfg["crop"], cfg["sigma"])
-    val_ds = CachedFloorplans(cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"])
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        train_ds, num_replicas=world, rank=rank, shuffle=True, seed=cfg["seed"], drop_last=True)
+    aug = {"scale_range": tuple(cfg.get("scale_range", (0.6, 1.8))), "rot_prob": cfg.get("rot_prob", 0.6)}
+    train_ds = CachedFloorplans(cfg["cache_root"], "train", True, cfg["crop"], cfg["sigma"], **aug)
+    # the best-model score stays on CubiCasa5K val: comparable with earlier runs whatever data is added
+    val_ds = CachedFloorplans(cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], sources=["cubicasa"])
+    extra_val = {}                                    # reported every few epochs, not used to pick the best
+    for ang in cfg.get("rotated_val_angles", [30, 60]):
+        extra_val["cubicasa_rot{}".format(ang)] = CachedFloorplans(
+            cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], fixed_angle=ang, sources=["cubicasa"],
+            limit=cfg.get("extra_val_limit", 100))
+    for src in ("resplan", "synthetic", "floorplancad"):
+        d_ = CachedFloorplans(cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], sources=[src],
+                              limit=cfg.get("extra_val_limit", 100))
+        if len(d_):
+            extra_val[src] = d_
+    weights = cfg.get("source_weights")
+    if weights and len({train_ds.source_of(i) for i in range(len(train_ds))}) > 1:
+        sampler = SourceWeightedSampler(train_ds, weights, cfg.get("epoch_samples") or len(train_ds),
+                                        rank=rank, world=world, seed=cfg["seed"])
+    else:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            train_ds, num_replicas=world, rank=rank, shuffle=True, seed=cfg["seed"], drop_last=True)
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=cfg["batch_per_gpu"], sampler=sampler, num_workers=cfg["workers"],
         pin_memory=dev.type == "cuda", drop_last=True, persistent_workers=True, prefetch_factor=4,
@@ -243,15 +265,28 @@ def main():
     last_path = os.path.join(cfg["ckpt_dir"], "last.pt")
     best_path = os.path.join(cfg["ckpt_dir"], "best.pt")
     ckpt = None
+    init_weights = None
     if os.path.exists(last_path):
         ckpt = torch.load(last_path, map_location="cpu", weights_only=False)
         if ckpt.get("signature") != signature(cfg):
-            raise RuntimeError(f"Checkpoint config {ckpt.get('signature')} != current "
-                               f"{signature(cfg)}. Use a new HF repo name or matching settings.")
-    pretrained = None if (ckpt or os.environ.get("FP_NO_PRETRAIN")) else "imagenet"
+            if _same_arch(ckpt.get("signature"), signature(cfg)):
+                # same network, new training data (e.g. rotation + extra datasets): a new run that starts
+                # from the previous run's weights instead of from ImageNet
+                init_weights = ckpt["ema"]
+                ckpt = None
+                log("Previous run used other training data: starting a new run from its weights") \
+                    if rank == 0 else None
+            else:
+                raise RuntimeError(f"Checkpoint config {ckpt.get('signature')} != current "
+                                   f"{signature(cfg)}. Use a new HF repo name or matching settings.")
+    if ckpt is None and init_weights is None and cfg.get("init_from") and os.path.exists(cfg["init_from"]):
+        init_weights = torch.load(cfg["init_from"], map_location="cpu", weights_only=False)["ema"]
+    pretrained = None if (ckpt or init_weights or os.environ.get("FP_NO_PRETRAIN")) else "imagenet"
     model = build_model(cfg["encoder"], pretrained)
     if ckpt:
         model.load_state_dict(ckpt["model"])
+    elif init_weights:
+        model.load_state_dict(init_weights)
     if world > 1 and dev.type == "cuda":
         from timm.layers import convert_sync_batchnorm
         model = convert_sync_batchnorm(model)
@@ -260,6 +295,8 @@ def main():
     if ckpt:
         ema.module.load_state_dict(ckpt["ema"])
         ema.updates = ckpt.get("ema_updates", 0)
+    elif init_weights:
+        ema.module.load_state_dict(init_weights)
     ddp = (nn.parallel.DistributedDataParallel(
         model, device_ids=[local] if dev.type == "cuda" else None, gradient_as_bucket_view=True)
         if world > 1 else model)
@@ -348,6 +385,14 @@ def main():
             if is_main:
                 log(f"ep {epoch + 1}: training done in {_hms(time.time() - t_ep)}, validating {len(val_ds)} plans ...")
             metrics = validate(ema.module, val_ds, rank, world, dev)
+            every = cfg.get("extra_val_every", 5)
+            if extra_val and (epoch % every == every - 1 or epoch == total_epochs - 1):
+                for name, d_ in extra_val.items():
+                    m_ = validate(ema.module, d_, rank, world, dev)
+                    metrics["val_" + name] = {"room_mIoU": round(m_["room_mIoU"], 4),
+                                              "icon_mIoU": round(m_["icon_mIoU"], 4),
+                                              "wall": m_["room_IoU"]["Wall"], "door": m_["icon_IoU"]["Door"],
+                                              "window": m_["icon_IoU"]["Window"]}
         epoch_secs = time.time() - t_ep
 
         # ---- adapt the cosine schedule to the time budget (fresh runs, after epoch 0)
@@ -376,6 +421,10 @@ def main():
                     f"{metrics['icon_mIoU']:.4f} | wall {metrics['room_IoU']['Wall']:.3f} "
                     f"door {metrics['icon_IoU']['Door']:.3f} window {metrics['icon_IoU']['Window']:.3f} "
                     f"stairs {metrics['icon_IoU']['Stairs']:.3f} {'*BEST*' if improved else ''}")
+                for k_, v_ in metrics.items():
+                    if k_.startswith("val_"):
+                        log(f"    {k_[4:]:18s} wall {v_['wall']:.3f} door {v_['door']:.3f} "
+                            f"window {v_['window']:.3f} | room mIoU {v_['room_mIoU']:.3f}")
             history.append(rec)
             state = {"model": model.state_dict() if world == 1 else _unsync_state(model),
                      "ema": ema.module.state_dict(), "ema_updates": ema.updates,
@@ -388,6 +437,7 @@ def main():
             if improved:
                 atomic_save({"ema": ema.module.state_dict(), "epoch": epoch, "metrics": metrics,
                              "signature": signature(cfg), "room_classes": ROOM_CLASSES,
+                             "rotation_trained": cfg.get("rot_prob", 0) > 0,
                              "icon_classes": ICON_CLASSES, "encoder": cfg["encoder"]}, best_path)
                 files.append((best_path, "checkpoints/best.pt"))
             mpath = os.path.join(cfg["ckpt_dir"], "metrics.json")

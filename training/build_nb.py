@@ -1,6 +1,7 @@
+import os
 import nbformat as nbf
 
-SRC = "/home/claude/fp/"
+SRC = os.path.dirname(os.path.abspath(__file__)) + "/"   # training/ (run: python training/build_nb.py)
 nb = nbf.v4.new_notebook()
 cells = []
 md = lambda s: cells.append(nbf.v4.new_markdown_cell(s))
@@ -40,6 +41,16 @@ SIGMA     = 3.0               # junction heatmap gaussian (px)
 LR        = 1e-3              # decoder/head LR; encoder uses LR * 0.5
 SEED      = 42
 
+# ---- data beyond CubiCasa5K + rotation (v2). The first run renders / converts them once (~20-30 min) and
+# stores them in the HF dataset repo; later runs restore them in minutes.
+DATA_VERSION  = "v2"          # changing this starts a new run FROM the current model's weights
+EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad"]   # remove any you do not want
+N_SYNTHETIC   = 3000          # synthetic angled buildings (wings at 30 / 45 / 60 degrees, curved fronts)
+FPCAD_DOORS   = False         # FloorPlanCAD door openings rebuilt from strokes are ~75% right: off by default
+SOURCE_WEIGHTS = {"cubicasa": 0.40, "resplan": 0.25, "synthetic": 0.20, "floorplancad": 0.15}
+ROT_PROB      = 0.6           # share of crops turned by 30 / 45 / 60 degrees (+-3) or any angle
+SCALE_RANGE   = [0.6, 1.8]    # zoom range of training crops
+
 SRC_DIR   = "/kaggle/working/fp_src"
 CKPT_DIR  = "/kaggle/working/checkpoints"
 BIG_DIR   = "/tmp/fp"            # large scratch (not saved as notebook output)
@@ -47,10 +58,10 @@ CACHE_DIR = f"{BIG_DIR}/cache"
 os.makedirs(SRC_DIR, exist_ok=True); os.makedirs(CKPT_DIR, exist_ok=True); os.makedirs(BIG_DIR, exist_ok=True)
 print("config ok")''')
 
-code('''!pip install -q "segmentation-models-pytorch==0.6.0" "timm==1.0.31" "huggingface_hub>=0.25" svgpathtools 2>&1 | grep -v "already satisfied" | tail -3
+code('''!pip install -q "segmentation-models-pytorch==0.6.0" "timm==1.0.31" "huggingface_hub>=0.25" svgpathtools shapely 2>&1 | grep -v "already satisfied" | tail -3
 !pip install -q hf_xet 2>&1 | tail -1 || true''')
 
-for fn in ["fp_common.py", "fp_prep.py", "train.py", "viz.py", "ddp_check.py"]:
+for fn in ["fp_common.py", "fp_prep.py", "fp_render.py", "fp_extra_fpcad.py", "train.py", "viz.py", "ddp_check.py"]:
     body = open(SRC + fn).read()
     code(f"%%writefile {{SRC_DIR}}/{fn}\n".replace("{SRC_DIR}", "/kaggle/working/fp_src") + body)
 
@@ -144,6 +155,13 @@ import fp_prep
 t0 = time.time()
 index = fp_prep.prepare_data(CACHE_DIR, f"{BIG_DIR}/work", f"{BIG_DIR}/parser", MAX_SIDE,
                              api, DATASET_REPO, HF_TOKEN)
+if EXTRA_SOURCES:
+    os.makedirs(f"{BIG_DIR}/work", exist_ok=True)
+    index = fp_prep.prepare_extra(CACHE_DIR, f"{BIG_DIR}/work", MAX_SIDE, api, DATASET_REPO, HF_TOKEN,
+                                  EXTRA_SOURCES, N_SYNTHETIC, FPCAD_DOORS)
+import collections
+for split in ("train", "val"):
+    print(split, dict(collections.Counter(it.get("source", "cubicasa") for it in index[split])))
 print({k: len(v) for k, v in index.items() if k != "meta"}, "| meta:",
       {k: v for k, v in index["meta"].items() if k != "failures"},
       "| failed:", len(index["meta"]["failures"]))
@@ -184,7 +202,9 @@ cfg = {"cache_root": CACHE_DIR, "ckpt_dir": CKPT_DIR, "encoder": ENCODER, "crop"
        "max_epochs": MAX_EPOCHS, "force_total_epochs": force_total, "ema_decay": 0.999,
        "grad_clip": 1.0, "loss_weights": [1.0, 1.0, 1.0], "val_every": 1, "log_every": 50,
        "seed": SEED, "final_margin_s": 900, "probe_batches": [8, 6, 5, 4, 3, 2],
-       "deadline_ts": NOTEBOOK_START + TIME_BUDGET_HOURS * 3600, "hf_repo": MODEL_REPO}
+       "deadline_ts": NOTEBOOK_START + TIME_BUDGET_HOURS * 3600, "hf_repo": MODEL_REPO,
+       "data_version": DATA_VERSION, "source_weights": SOURCE_WEIGHTS, "rot_prob": ROT_PROB,
+       "scale_range": SCALE_RANGE, "rotated_val_angles": [30, 60], "extra_val_every": 5, "extra_val_limit": 100}
 CFG_PATH = f"{SRC_DIR}/run_config.json"
 json.dump(cfg, open(CFG_PATH, "w"), indent=1)
 r = subprocess.run([sys.executable, f"{SRC_DIR}/train.py", "--config", CFG_PATH, "--probe"],
@@ -234,5 +254,5 @@ nb["cells"] = cells
 nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                   "language_info": {"name": "python"},
                   "kaggle": {"accelerator": "nvidiaTeslaT4", "isInternetEnabled": True, "isGpuEnabled": True}}
-nbf.write(nb, "/home/claude/floorplan_multitask_kaggle.ipynb")
+nbf.write(nb, os.path.join(SRC, "floorplan_multitask_kaggle.ipynb"))
 print("cells:", len(cells))
