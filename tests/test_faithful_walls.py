@@ -166,3 +166,29 @@ def test_angled_walls_are_one_wall_each(noise):
         assert wall_through(walls, *mid)
     added, missed = added_missed(room, icon, walls)
     assert missed <= 0.01 * (room == 2).sum()
+
+
+def test_walls_each_at_their_own_angle():
+    """A photographed / hand-drawn plan: every wing at a slightly different angle (26-33 and 58-64 degrees)."""
+    room = np.full((1100, 1400), 3, np.uint8)
+    rs = np.random.RandomState(1)
+    lines = []
+    for k, ang in enumerate([26.5, 29.0, 31.5, 33.0, 58.5, 61.0, 62.5, 64.0, 151.0, 118.5]):
+        cx, cy = 200 + (k % 5) * 250, 300 + (k // 5) * 450
+        d = np.array([np.cos(np.radians(ang)), np.sin(np.radians(ang))]) * 110
+        a, b = np.array([cx, cy]) - d, np.array([cx, cy]) + d
+        cv2.line(room, tuple(np.round(a).astype(int)), tuple(np.round(b).astype(int)), 2, 10)
+        lines.append((a, b))
+    m = room == 2
+    edge = (cv2.dilate(m.astype(np.uint8), K3) > 0) & ~(cv2.erode(m.astype(np.uint8), K3) > 0)
+    flip = edge & (rs.rand(*room.shape) < 0.3)
+    room[flip & m] = 3
+    room[flip & ~m] = 2
+    walls = convert(room, np.zeros_like(room))
+    for a, b in lines:
+        d = (b - a) / np.linalg.norm(b - a)
+        along = [w for w in walls if abs(abs((w[1] - w[0]) @ d) / max(np.linalg.norm(w[1] - w[0]), 1e-9) - 1) < 2e-3
+                 and abs(((w[0] + w[1]) / 2 - a) @ np.array([-d[1], d[0]])) < 6]
+        assert len(along) == 1, "wall at {:.1f} deg came out as {} pieces".format(
+            np.degrees(np.arctan2(d[1], d[0])) % 180, len(along))
+        assert np.linalg.norm(along[0][1] - along[0][0]) > 0.85 * np.linalg.norm(b - a)

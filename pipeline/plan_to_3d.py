@@ -836,6 +836,87 @@ def vectorise(room, icon, image=None):
             segs.append(sg)
             cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                      1, max(1, int(round(sg["t"] + T))))
+    # walls at their OWN angle: a photographed or hand-drawn plan has each wing at a slightly different angle
+    # (26-33 and 59-64 degrees on one real plan), so one pass per main angle reads a 32 degree wall in the
+    # 29 degree frame as a staircase. Every long straight wall line in the mask that no piece above follows is
+    # read again in a small window turned to exactly its angle.
+    n_local = 0
+    sk_s = skeletonize(cv2.medianBlur(full.astype(np.uint8) * 255, 5) > 127).astype(np.uint8) * 255
+    hl = cv2.HoughLinesP(sk_s, 1, np.pi / 720, threshold=max(20, int(3 * T)), minLineLength=max(int(5 * T), 30),
+                         maxLineGap=max(int(1.2 * T), 4))
+    groups = []
+    for x0_, y0_, x1_, y1_ in (hl.reshape(-1, 4) if hl is not None else []):
+        q0, q1 = np.array([x0_, y0_], float), np.array([x1_, y1_], float)
+        ln = np.linalg.norm(q1 - q0)
+        ang_ = float(np.degrees(np.arctan2(q1[1] - q0[1], q1[0] - q0[0])) % 180)
+        tilt = ang_ % 90
+        if min(tilt, 90 - tilt) < 0.75:                    # straight walls: the axis pass reads them
+            continue
+        d_ = (q1 - q0) / ln
+        n_ = np.array([-d_[1], d_[0]])
+        covered = 0.0
+        for sg in segs:                                    # already followed by one piece at this angle?
+            a_s, b_s = np.array(sg["p0"], float), np.array(sg["p1"], float)
+            ls = np.linalg.norm(b_s - a_s)
+            if ls < 1:
+                continue
+            ds = (b_s - a_s) / ls
+            if abs(abs(ds @ d_) - 1) > 1.4e-5:             # more than ~0.3 degree apart (photos bend walls a
+                continue                                   # little: a near miss is not "already read")
+            if abs((a_s - q0) @ n_) > T / 2 or abs((b_s - q0) @ n_) > T / 2:
+                continue
+            u = sorted([(a_s - q0) @ d_, (b_s - q0) @ d_])
+            covered = max(covered, (min(u[1], ln) - max(u[0], 0)) / ln)
+        if covered >= 0.9:
+            continue
+        for g in groups:                                   # same wall line as a group already found?
+            if abs(abs(g["d"] @ d_) - 1) < 3e-4 and abs((q0 - g["q0"]) @ g["n"]) < T and abs((q1 - g["q0"]) @ g["n"]) < T:
+                g["pts"] += [q0, q1]
+                g["w"] += ln
+                break
+        else:
+            groups.append({"d": d_, "n": n_, "q0": q0, "pts": [q0, q1], "w": ln, "ang": ang_})
+    groups.sort(key=lambda g: -g["w"])
+    Hh0, Ww0 = full.shape
+    for gi, g in enumerate(groups[:48]):
+        P_ = np.array(g["pts"])
+        pad = int(2 * T + 10)
+        x0_, y0_ = max(int(P_[:, 0].min()) - pad, 0), max(int(P_[:, 1].min()) - pad, 0)
+        x1_, y1_ = min(int(P_[:, 0].max()) + pad + 1, Ww0), min(int(P_[:, 1].max()) + pad + 1, Hh0)
+        sub = full[y0_:y1_, x0_:x1_].astype(np.uint8)
+        M, Mi, size = _rot_frame(sub.shape, g["ang"])
+        rf = cv2.warpAffine(sub, M, size, flags=cv2.INTER_NEAREST) > 0
+        ro = cv2.warpAffine(openings_any[y0_:y1_, x0_:x1_].astype(np.uint8), M, size, flags=cv2.INTER_NEAREST) > 0
+        ri = cv2.warpAffine(icon[y0_:y1_, x0_:x1_].astype(np.uint8), M, size, flags=cv2.INTER_NEAREST)
+        fsegs, fops = _frame_walls(rf, ro, ri, T)
+        back = lambda pt, Mi=Mi, x0_=x0_, y0_=y0_: [float(Mi[0, 0] * pt[0] + Mi[0, 1] * pt[1] + Mi[0, 2] + x0_),
+                                                   float(Mi[1, 0] * pt[0] + Mi[1, 1] * pt[1] + Mi[1, 2] + y0_)]
+        key = "line{}".format(gi)
+        keep = {}
+        for k_, sg in enumerate(fsegs):
+            e0 = sg["j0"][0] if "j0" in sg else sg["a0"]
+            e1 = sg["j1"][0] if "j1" in sg else sg["a1"]
+            p0_, p1_ = np.array(back(_hv_point(sg["o"], sg["c"], e0))), np.array(back(_hv_point(sg["o"], sg["c"], e1)))
+            ls = np.linalg.norm(p1_ - p0_)
+            if ls < 1.5 * T or abs(abs((p1_ - p0_) / ls @ g["d"]) - 1) > 3.5e-4:
+                continue                                   # only pieces along this wall line
+            mid = (p0_ + p1_) / 2
+            if abs((mid - g["q0"]) @ g["n"]) > T:
+                continue
+            sg.update({"frame": key, "p0": list(p0_), "p1": list(p1_), "o": "a",
+                       "j0_hv": "j0" in sg, "j1_hv": "j1" in sg})
+            keep[k_] = len(segs)
+            segs.append(sg)
+            n_local += 1
+        for o in fops:
+            if o["wall"] in keep:
+                fs = fsegs[o["wall"]]
+                merged.append(dict(o, wall=keep[o["wall"]], q0=back(_hv_point(fs["o"], fs["c"], o["u0"])),
+                                   q1=back(_hv_point(fs["o"], fs["c"], o["u1"]))))
+        if keep:
+            done_angles.append(g["ang"] % 90)
+    if n_local:
+        print("  walls read at their own angle: {}".format(n_local))
     # the same wall found in two frames (a straight angled wall + staircase stubs of it, a square column read as
     # a diamond in a 45 degree frame, ...): the piece whose band lies best on the model's wall pixels wins, then
     # the longer one; a piece mostly inside an already accepted wall of another frame is a duplicate
@@ -855,7 +936,9 @@ def vectorise(room, icon, image=None):
             m = band(sg)
             sg["_fit"] = float((m & full_d).sum() / max(1, m.sum()))
         bands = {}
-        for sg in sorted(segs, key=lambda sg: (-round(sg["_fit"], 2), -seg_len(sg))):
+        # pieces that lie well on the mask (>= 90 %) first, longest first: one long wall beats a chain of short
+        # pieces that each fit their few pixels perfectly (a wall read in a slightly-off angle frame)
+        for sg in sorted(segs, key=lambda sg: (-(sg["_fit"] >= 0.9), -seg_len(sg), -sg["_fit"])):
             if sg["frame"] != 0 and (sg["_fit"] < 0.9 or sg["t"] <= 2):   # or a rotation sliver
                 sg["drop"] = True        # a chord across a curve, not a straight wall: the tracer follows it
                 continue
