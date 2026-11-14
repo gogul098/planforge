@@ -90,3 +90,48 @@ def test_stair_note_beside_the_flight_is_read(job):
     assert "risers" not in far
     assert near["risers"] == 16 and near["riser"] == pytest.approx(0.15) and near["tread"] == pytest.approx(0.30)
     assert near["up"]
+
+
+def _rerun(S, name, toks):
+    P = S.P
+    orig = P.ocr_full_res
+    P.ocr_full_res = lambda *a, **k: [dict(t) for t in toks]
+    try:
+        os.makedirs(os.path.join(S.JOBS, name), exist_ok=True)
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            S.run_job(name, os.path.join(os.path.dirname(S.JOBS), "plan.png"), ".png",
+                      {"furniture": "none", "plinth": "0.6"})
+    finally:
+        P.ocr_full_res = orig
+    assert S.STATUS[name]["state"] == "done", S.STATUS[name].get("msg")
+    return json.load(open(os.path.join(S.JOBS, name, "out", "plan.json")))
+
+
+def test_open_ground_with_a_room_size_is_a_room_not_a_pit(job):
+    """The model left part of a room unclassified (open ground) and a room size is written in it: its floor
+    stays and the steps beside it are not turned into tiers going down."""
+    S, _ = job
+    # the size of the whole floor at the sheet's own scale (so the written size does not change the scale)
+    size = {"kind": "size", "value": [16.267, 11.267], "text": "16267 x 11267", "raw": "16267 x 11267",
+            "x": 640.0, "y": 500.0, "h": 13.0}
+    plan = _rerun(S, "named", [size])
+    assert plan["stairs"], "the steps themselves are still built"
+    assert not [s for s in plan["stairs"] if s.get("sunken")], [(s["kind"], s.get("direction")) for s in plan["stairs"]]
+    assert not plan["floor"].get("holes")
+    # ... unless its name says it is a pit
+    pit = {"kind": "label", "text": "SANDPIT", "raw": "SANDPIT", "x": 640.0, "y": 470.0, "h": 13.0}
+    plan = _rerun(S, "sandpit", [size, pit])
+    assert [s for s in plan["stairs"] if s.get("sunken")]
+
+
+def test_axis_without_grid_lines_does_not_crash(job):
+    """Every wall at an angle: no vertical (or horizontal) grid line at all - the solver keeps one anchor."""
+    S, _ = job
+    P = S.P
+    toks = [{"kind": "num", "value": 8000.0, "text": "8000", "x": 300.0, "y": 50.0, "h": 13.0},
+            {"kind": "num", "value": 4000.0, "text": "4000", "x": 30.0, "y": 300.0, "h": 13.0}]
+    sol = P.solve([], [100.0, 500.0], (100, 100, 900, 500), toks)
+    assert sol is not None and sol["axes"]["x"]["px"] == [100.0]
+    f = P.make_mapper(sol, "x")
+    assert float(f(300.0)) == pytest.approx(200.0 * sol["scale_m_per_px"])

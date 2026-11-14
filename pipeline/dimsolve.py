@@ -183,6 +183,11 @@ def solve(grid_x, grid_y, bbox, toks, struct=None, segs=None, T=6.0):
     """Exact grid positions from written dimension chains and room-size labels.
     Conflicting measurements are rejected instead of distorting the model."""
     grids = {"x": list(grid_x), "y": list(grid_y)}
+    # a plan with no vertical (or no horizontal) wall at all - every wall at an angle - has no grid lines on
+    # that axis: one anchor at the building's edge, the measured scale everywhere (no per-grid corrections)
+    for ax, lo in (("x", bbox[0]), ("y", bbox[1])):
+        if not grids[ax]:
+            grids[ax] = [float(lo)]
     cons = []
     # ---- (a) dimension chains written outside the building
     nums = [t for t in toks if t["kind"] == "num" and t["value"] > 0]
