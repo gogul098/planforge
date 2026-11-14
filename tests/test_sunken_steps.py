@@ -75,3 +75,18 @@ def test_architect_switches_stairs(job):
         assert c.post("/api/stair/t", json={"id": sid, "mode": "flat"}).status_code == 200
         assert all(s["id"] != sid for s in json.load(open(jp))["stairs"])
         assert c.post("/api/stair/t", json={"id": 999, "mode": "down"}).status_code == 404
+
+
+def test_stair_note_beside_the_flight_is_read(job):
+    """'16R @ 150, T 300' written beside a flight: its centre is further than the search radius from the stair's
+    centre, but the text is next to the flight, so it counts (risers, riser height and tread)."""
+    S, _ = job
+    P = S.P
+    toks = [{"kind": "label", "text": "16R @ 150, T 300", "raw": "16R @ 150, T 300", "x": 483.0, "y": 679.0, "h": 13.0},
+            {"kind": "label", "text": "UP", "raw": "UP", "x": 433.0, "y": 771.0, "h": 13.0}]
+    box = (410, 700, 460, 760)
+    far = P._stair_notes(toks, 435, 730, 57)                         # old: from the centre -> the note is missed
+    near = P._stair_notes(toks, 435, 730, 57, box=box)
+    assert "risers" not in far
+    assert near["risers"] == 16 and near["riser"] == pytest.approx(0.15) and near["tread"] == pytest.approx(0.30)
+    assert near["up"]

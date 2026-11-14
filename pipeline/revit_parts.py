@@ -1209,7 +1209,11 @@ def main(img=None, room=None, icon=None, original=None):
     sol = None if (METERS_PER_PIXEL or BUILDING_WIDTH_M) else solve(
         gx, gy, (xs_.min(), ys_.min(), xs_.max(), ys_.max()), toks, struct=v["full"], segs=v["walls"], T=v["T"])
     if sol is None and BUILDING_WIDTH_M:
-        s = BUILDING_WIDTH_M / (gx[-1] - gx[0])
+        # overall width = the extent of ALL the model's walls (angled and curved included); the grid lines
+        # come from straight walls only, which on an angled / round building span a fraction of it
+        xs_w = np.nonzero((v["model_wall"] | v["full"]).any(0))[0]
+        span = float(xs_w.max() - xs_w.min() + 1) if len(xs_w) else float(gx[-1] - gx[0])
+        s = BUILDING_WIDTH_M / max(span, 1.0)
         sol = {"scale_m_per_px": s, "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
                                              "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
                "report": [], "fallback": True}
