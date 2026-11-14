@@ -1807,6 +1807,7 @@ import re
 #   >  your setting (PLINTH_HEIGHT)  >  standard assumption (flagged in "warnings")
 _N_RISERS = re.compile(r"\b(\d{1,2})\s*(?:NOS?\.?\s*)?(?:R|RISERS?)\b", re.I)
 _N_STEPS = re.compile(r"\b(\d{1,2})\s*(?:NOS?\.?\s*)?(?:STEPS?|TREADS?)\b", re.I)
+_TREAD_MM = re.compile(r"\bT(?:READ|D)?\s*[@=:]?\s*(\d{3})\b", re.I)
 _RISER_MM = re.compile(r"(?:\bR(?:ISER)?\s*[@=:]?\s*|@\s*)(\d{2,3})\b", re.I)
 _LEVEL = re.compile(r"(?:^|[\s(])\+\s*(\d+(?:\.\d+)?)")
 _LEVEL_WORDS = re.compile(r"PLINTH|\bP\.?L\b|F\.?F\.?L|FLOOR\s*LEVEL|LVL", re.I)
@@ -1832,9 +1833,17 @@ def _plinth_from_levels(toks):
     return float(np.median(worded or [v for _, v in cands]))
 
 
-def _stair_notes(toks, cx, cy, r_px):
-    """Notes written next to a stair: riser count, riser height, UP / DN labels."""
-    near = [t for t in toks if np.hypot(t["x"] - cx, t["y"] - cy) <= r_px]
+def _stair_notes(toks, cx, cy, r_px, box=None):
+    """Notes written next to a stair: riser count, riser height, UP / DN labels.
+    box = (x0, y0, x1, y1) of the stair: distance is measured to its outline, not its centre, so a long note
+    ("16R @ 150, T 300") written beside or across the flight counts even when its centre is further away."""
+    def dist(t):
+        if box is None:
+            return np.hypot(t["x"] - cx, t["y"] - cy)
+        dx = max(box[0] - t["x"], 0.0, t["x"] - box[2])
+        dy = max(box[1] - t["y"], 0.0, t["y"] - box[3])
+        return np.hypot(dx, dy)
+    near = [t for t in toks if dist(t) <= r_px]
     text = " ".join(dict.fromkeys(_raw(t) for t in near))
     out = {}
     m = _N_RISERS.search(text) or _N_STEPS.search(text)
@@ -1843,6 +1852,9 @@ def _stair_notes(toks, cx, cy, r_px):
     for m in _RISER_MM.finditer(text):
         if 100 <= int(m.group(1)) <= 220:
             out["riser"] = int(m.group(1)) / 1000.0
+    for m in _TREAD_MM.finditer(text):
+        if 200 <= int(m.group(1)) <= 400:
+            out["tread"] = int(m.group(1)) / 1000.0
     out["up"] = [(t["x"], t["y"]) for t in near if _raw(t).strip().upper().rstrip(".") == "UP"]
     out["dn"] = [(t["x"], t["y"]) for t in near if _raw(t).strip().upper().rstrip(".") in ("DN", "DOWN")]
     return out
@@ -2310,7 +2322,7 @@ def build_stairs(v, toks, room, plan, original=None):
         # distance (model px) to the HIGH side of the stair
         wx0, wy0, wx1, wy1 = _window(room.shape, ox, oy, ox + w, oy + h, pad)
         cx_px, cy_px = float(xs.mean() + ox), float(ys.mean() + oy)
-        notes = _stair_notes(toks, cx_px, cy_px, max(pad, 0.6 * max(h, w)))
+        notes = _stair_notes(toks, cx_px, cy_px, max(pad, 0.6 * max(h, w)), box=(ox, oy, ox + w, oy + h))
         warnings, direction = [], None
         ends_px = []                                                # the two run ends (model px)
         bx = np.array(box, float)
@@ -2463,6 +2475,13 @@ def build_stairs(v, toks, room, plan, original=None):
         elif kind == "interior" and "chain_base" in i:
             base, total = i["chain_base"], i["chain_total"]
             rsrc = "storey height shared by {} connected flights".format(i["chain_size"])
+        elif kind == "interior" and i["n"] and "riser" in i["notes"]:
+            # count AND height written ("16R @ 150"): the plan says how high the flight climbs
+            base, total = 0.0, i["n"] * i["notes"]["riser"]
+            rsrc = "written: {} risers x {:.0f} mm".format(i["n"], i["notes"]["riser"] * 1000)
+            if abs(total - WALL_HEIGHT) > 0.05:
+                w.append("written risers climb {:.2f} m, the storey height setting is {:.2f} m: check (a landing / "
+                         "second flight, or another storey height)".format(total, WALL_HEIGHT))
         elif kind == "interior":
             base, total, rsrc = 0.0, WALL_HEIGHT, "storey height (wall height setting)"
             if "fix_treads" in ASSIST and i["n"] and not (0.12 <= total / i["n"] <= 0.21) \
@@ -2529,7 +2548,11 @@ def build_stairs(v, toks, room, plan, original=None):
                 top = base + riser * (j + 1)
             treads.append({"polygon": _poly_list(p), "z0": round(base, 4), "z1": round(top, 4)})
         tread = i["run"] / blocks
-        if kind != "terrace" and not (0.22 <= tread <= 0.45):
+        if "tread" in i["notes"] and abs(tread - i["notes"]["tread"]) > 0.03:
+            w.append("tread written as {:.0f} mm, the drawn run gives {:.0f} mm: the model marked {:.2f} m of the "
+                     "flight; check its length".format(i["notes"]["tread"] * 1000, tread * 1000, i["run"]))
+            i["sources"]["tread"] = "written {:.0f} mm".format(i["notes"]["tread"] * 1000)
+        if kind != "terrace" and not (0.22 <= tread <= 0.45) and "tread" not in i["notes"]:
             w.append("tread works out to {:.0f} mm: check".format(tread * 1000))
         outline = i["hull"] if i["shape"] != "straight" else None
         if outline is None:
@@ -3772,7 +3795,11 @@ def main(img=None, room=None, icon=None, original=None):
     sol = None if (METERS_PER_PIXEL or BUILDING_WIDTH_M) else solve(
         gx, gy, (xs_.min(), ys_.min(), xs_.max(), ys_.max()), toks, struct=v["full"], segs=v["walls"], T=v["T"])
     if sol is None and BUILDING_WIDTH_M:
-        s = BUILDING_WIDTH_M / (gx[-1] - gx[0])
+        # overall width = the extent of ALL the model's walls (angled and curved included); the grid lines
+        # come from straight walls only, which on an angled / round building span a fraction of it
+        xs_w = np.nonzero((v["model_wall"] | v["full"]).any(0))[0]
+        span = float(xs_w.max() - xs_w.min() + 1) if len(xs_w) else float(gx[-1] - gx[0])
+        s = BUILDING_WIDTH_M / max(span, 1.0)
         sol = {"scale_m_per_px": s, "axes": {"x": {"px": gx, "m": [(g - gx[0]) * s for g in gx], "n_dims": 0},
                                              "y": {"px": gy, "m": [(g - gy[0]) * s for g in gy], "n_dims": 0}},
                "report": [], "fallback": True}
