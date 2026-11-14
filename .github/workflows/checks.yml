@@ -26,6 +26,5 @@ jobs:
         run: python -m py_compile app/server.py app/pipeline.py app/build_in_revit.py kaggle/*.py pipeline/assemble.py
       - name: Tests (walls projected faithfully, sunken steps, stair edits)
         run: |
-          pip install -q pytest numpy opencv-python-headless scikit-image scipy shapely matplotlib \
-            fastapi httpx python-multipart trimesh mapbox-earcut ifcopenshell
+          pip install -q -r app/requirements.txt pytest httpx      # the engine's own packages (no PyTorch)
           pytest -q tests
