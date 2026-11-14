@@ -134,3 +134,35 @@ def test_doors_windows_and_open_sides():
     assert not wall_through(walls, 1295, 425), "an open side the model left open was walled over"
     added, missed = added_missed(room, icon, walls)
     assert added == 0 and missed == 0
+
+
+def _hexagon(noise):
+    """A building with 30 / 60 degree walls whose mask edges are ragged (as from a JPEG / phone photo)."""
+    room = np.full((1000, 1300), 3, np.uint8)
+    c, R = np.array([650, 500]), 380
+    pts = [c + R * np.array([np.cos(np.radians(a)), np.sin(np.radians(a))]) for a in range(0, 360, 60)]
+    lines = [(pts[i], pts[(i + 1) % 6]) for i in range(6)]
+    lines += [(c, c + 0.85 * R * np.array([np.cos(np.radians(a)), np.sin(np.radians(a))])) for a in (30, 150)]
+    for a, b in lines:
+        cv2.line(room, tuple(np.round(a).astype(int)), tuple(np.round(b).astype(int)), 2, 10)
+    if noise:
+        rs = np.random.RandomState(0)
+        m = room == 2
+        edge = (cv2.dilate(m.astype(np.uint8), K3) > 0) & ~(cv2.erode(m.astype(np.uint8), K3) > 0)
+        flip = edge & (rs.rand(*room.shape) < noise)
+        room[flip & m] = 3
+        room[flip & ~m] = 2
+    return room, lines
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.3])
+def test_angled_walls_are_one_wall_each(noise):
+    room, lines = _hexagon(noise)
+    icon = np.zeros_like(room)
+    walls = convert(room, icon)
+    assert len(walls) == len(lines), "{} walls for {} drawn 30/60 degree walls".format(len(walls), len(lines))
+    for a, b in lines:
+        mid = (np.array(a) + np.array(b)) / 2
+        assert wall_through(walls, *mid)
+    added, missed = added_missed(room, icon, walls)
+    assert missed <= 0.01 * (room == 2).sum()
