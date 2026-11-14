@@ -21,9 +21,8 @@ def job(tmp_path_factory):
     sys.path.insert(0, APP)
     import server as S
     S.JOBS = str(d / "jobs")
-    sys.path.insert(0, os.path.join(os.path.dirname(APP), "training"))
-    import fp_common as C
-    R = {n: i for i, n in enumerate(C.ROOM_CLASSES)}
+    P = S.P                                                         # engine class ids (no PyTorch needed)
+    R = {n: i for i, n in enumerate(P.ROOMS)}
     H, W = 900, 1200
     room = np.full((H, W), R["Background"], np.uint8)
     icon = np.zeros((H, W), np.uint8)
@@ -31,7 +30,7 @@ def job(tmp_path_factory):
     for y0, y1, x0, x1 in ((100, 112, 100, 1100), (788, 800, 100, 1100), (100, 800, 100, 112), (100, 800, 1088, 1100)):
         room[y0:y1, x0:x1] = R["Wall"]
     room[400:600, 520:760] = R["Background"]                       # the sandpit: open ground inside the building
-    icon[400:600, 420:520] = C.ICON_CLASSES.index("Stairs")        # tiers beside it
+    icon[400:600, 420:520] = P.STAIRS                              # tiers beside it
     img = np.full((H, W, 3), 255, np.uint8)
     img[room == R["Wall"]] = 0
     for x in range(430, 520, 18):                                  # drawn tread lines
