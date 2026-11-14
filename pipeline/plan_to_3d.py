@@ -495,16 +495,21 @@ def _frame_walls(full, openings_any, icon, T):
 
 
 def _wall_angles(full, T):
-    """Dominant wall directions (degrees, mod 90) other than the image axes, e.g. 30 / 60 for a hexagonal plan."""
-    edges = cv2.Canny(full.astype(np.uint8) * 255, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=max(20, int(3 * T)),
-                            minLineLength=max(int(4 * T), 20), maxLineGap=int(T))
-    if lines is None:
+    """Dominant wall directions (degrees, mod 90) other than the image axes, e.g. 30 / 60 for a hexagonal plan.
+    Measured from the direction of the mask's edges after smoothing over about a wall thickness, so ragged mask
+    edges (JPEG / phone photos) still give clean peaks; straight-edge (Hough) detection breaks up on them."""
+    m = full.astype(np.float32)
+    sig = max(1.0, T / 2)
+    m = cv2.GaussianBlur(m, (0, 0), sig)
+    gx = cv2.Sobel(m, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(m, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    sel = mag > 0.25 * mag.max() if mag.max() > 0 else mag > 0
+    if not sel.any():
         return []
-    hist = np.zeros(90)
-    for x0, y0, x1, y1 in lines.reshape(-1, 4):
-        ang = np.degrees(np.arctan2(y1 - y0, x1 - x0)) % 90
-        hist[int(round(ang)) % 90] += np.hypot(x1 - x0, y1 - y0)
+    # edge normal -> wall direction (+90); weight by edge strength
+    ang_all = (np.degrees(np.arctan2(gy[sel], gx[sel])) + 90.0) % 90.0
+    hist = np.bincount(np.round(ang_all).astype(int) % 90, weights=mag[sel], minlength=90)[:90]
     sm = np.array([hist[[(i + k) % 90 for k in (-2, -1, 0, 1, 2)]].sum() for i in range(90)])
     out = []
     total = sm.sum()
@@ -761,9 +766,14 @@ def _trace_leftovers(model_wall, segs, T):
 def vectorise(room, icon, image=None):
     wall = room == WALL
     openings_any = np.isin(icon, [WIN, DOOR])
-    # typical wall thickness T (px) from the medial axis
-    dist = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 5)
-    sk = skeletonize(wall)
+    # typical wall thickness T (px) from the medial axis. Measured on a lightly smoothed copy: ragged edges
+    # (JPEG / phone plans, stair-stepped angled walls) give the raw skeleton many spurs near the edges, which
+    # dragged T down to ~1/3 and broke every threshold that scales with it. Only T uses the smoothed copy.
+    smooth = cv2.medianBlur(wall.astype(np.uint8) * 255, 5) > 127
+    if smooth.sum() < 0.5 * wall.sum():                         # very thin walls: the filter would erase them
+        smooth = wall
+    dist = cv2.distanceTransform(smooth.astype(np.uint8), cv2.DIST_L2, 5)
+    sk = skeletonize(smooth)
     T = float(np.clip(2 * np.median(dist[sk]) if sk.any() else 6, 3, 60))
     model_wall = wall.copy()
     # the model's wall mask is trusted: only 1-2 px specks are removed (no thickness filtering,
@@ -797,12 +807,12 @@ def vectorise(room, icon, image=None):
         cv2.line(claimed, tuple(int(round(v_)) for v_ in sg["p0"]), tuple(int(round(v_)) for v_ in sg["p1"]),
                  1, max(1, int(round(sg["t"] + T))))
     done_angles = []
-    for _round_ in range(6):                                   # find angles in what is still unexplained
-        angles = [a_ for a_ in _wall_angles(full & ~(claimed > 0), T)
-                  if all(min(abs(a_ - b_), 90 - abs(a_ - b_)) > 2 for b_ in done_angles)]
-        if not angles:
-            break
-        ang = angles[0]
+    # angles from the WHOLE wall mask: the straight pass above already covers a 30 / 60 degree wall with
+    # horizontal / vertical stubs (a 30 degree wall is 2x its thickness wide), so "what is still unexplained"
+    # hides exactly the walls we are looking for. The duplicate check below keeps the clean angled wall.
+    for ang in _wall_angles(full, T)[:6]:
+        if any(min(abs(ang - b_), 90 - abs(ang - b_)) <= 2 for b_ in done_angles):
+            continue
         done_angles.append(ang)
         M, Mi, size = _rot_frame(full.shape, ang)
         rest = full.astype(np.uint8)          # whole mask: frame 0 may have chopped this wall into stubs
@@ -861,6 +871,18 @@ def vectorise(room, icon, image=None):
                 continue
             bm = bands.setdefault(sg["frame"], np.zeros(full.shape, np.uint8))
             bm |= band(sg, T)
+        # straight-pass slivers along the stair-stepped edge of an angled wall (1-2 px thick, so they "fit"
+        # perfectly and were accepted first): inside an accepted angled wall's band they are part of that wall
+        ang_band = np.zeros(full.shape, np.uint8)
+        for fr, bm in bands.items():
+            if fr != 0:
+                ang_band |= bm
+        for sg in segs:
+            if sg.get("drop") or sg["frame"] != 0 or sg["t"] > 0.5 * T:
+                continue
+            m = band(sg)
+            if m.sum() and (m & ang_band).sum() / m.sum() > 0.6:
+                sg["drop"] = True
         for sg in segs:
             sg.pop("_fit", None)
     # every wall must run ON wall pixels for most of its length: a thick wall seen from a slightly different
