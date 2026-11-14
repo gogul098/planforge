@@ -764,6 +764,8 @@ def build_ifc(plan, path):
         ifc_walls[w["id"]] = (e, start, d, w)
 
     op_types = {}
+    IFC_DOOR_OPERATION = {"single_door": "SINGLE_SWING", "double_door": "DOUBLE_DOOR_SINGLE_SWING",
+                          "sliding_door": "SLIDING", "parent_child_door": "UNEQUAL_DOUBLE_SWING"}
     for o in plan["openings"]:
         e_wall, start, d, w = ifc_walls[o["wall"]]
         org = np.array(w["start"]) + d * (o["offset"] - o["width"] / 2)
@@ -774,12 +776,19 @@ def build_ifc(plan, path):
         geometry.edit_object_placement(f, product=op, matrix=M(org, d, o["sill"]))
         feature.add_feature(f, feature=op, element=e_wall)
         cls = "IfcDoor" if o["type"] == "door" else "IfcWindow"
-        key = (cls, int(o["width"] * 1000), int(o["height"] * 1000))
+        key = (cls, int(o["width"] * 1000), int(o["height"] * 1000), o.get("door_type") or "")
         if key not in op_types:
-            op_types[key] = root.create_entity(f, ifc_class=cls + "Type",
-                                               name="{} {} x {}".format(cls[3:], key[1], key[2]))
+            op_types[key] = root.create_entity(f, ifc_class=cls + "Type", name="{}{} {} x {}".format(
+                cls[3:], " " + key[3].replace("_door", "").replace("_", "-") if key[3] else "", key[1], key[2]))
         fill = root.create_entity(f, ifc_class=cls, name="{} {}".format(cls[3:], o["id"]))
         fill.OverallWidth, fill.OverallHeight = o["width"], o["height"]
+        if cls == "IfcDoor" and o.get("door_type"):
+            # the hinge side is not known from the symbol class alone: user-defined where IFC needs a side
+            op_ = IFC_DOOR_OPERATION.get(o["door_type"])
+            if op_ in ("DOUBLE_DOOR_SINGLE_SWING",):
+                fill.OperationType = op_
+            elif op_:
+                fill.OperationType, fill.UserDefinedOperationType = "USERDEFINED", op_
         ifctype.assign_type(f, related_objects=[fill], relating_type=op_types[key])
         geometry.assign_representation(f, product=fill, representation=geometry.add_wall_representation(
             f, context=body, length=o["width"], height=o["height"], thickness=0.05, offset=-0.025))
@@ -1291,6 +1300,10 @@ def main(img=None, room=None, icon=None, original=None):
         plan["furniture"] = inside_
         for k_, fu in enumerate(plan["furniture"]):
             fu["id"] = k_
+        dt_ = assign_door_types(plan)
+        if dt_:
+            print("  door kinds (detector symbol on each door): " + ", ".join(
+                "{} {}".format(k_.replace("_", " "), n_) for k_, n_ in sorted(dt_.items())))
     else:
         plan["furniture"] = []
     _lap("furniture")

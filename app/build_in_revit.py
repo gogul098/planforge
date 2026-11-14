@@ -146,9 +146,15 @@ def wall_type(thk_m):
 _sym_cache = {}
 
 
-def opening_symbol(kind, width_m, height_m):
-    """Duplicate a loaded door/window type at the exact size. Returns None if no family is loaded."""
-    key = (kind, int(round(width_m * 1000)), int(round(height_m * 1000)))
+# door kind (from the detector's symbol) -> words to look for in the loaded door family names
+DOOR_FAMILY_WORDS = {"single_door": ("single", "flush"), "double_door": ("double",),
+                     "sliding_door": ("sliding", "slider", "slide"), "parent_child_door": ("unequal", "double")}
+
+
+def opening_symbol(kind, width_m, height_m, door_type=None):
+    """Duplicate a loaded door/window type at the exact size. Returns None if no family is loaded.
+    door_type picks the family (single / double / sliding / unequal double) when such a family is loaded."""
+    key = (kind, int(round(width_m * 1000)), int(round(height_m * 1000)), door_type or "")
     if key in _sym_cache:
         return _sym_cache[key]
     cat = BuiltInCategory.OST_Doors if kind == "door" else BuiltInCategory.OST_Windows
@@ -156,9 +162,12 @@ def opening_symbol(kind, width_m, height_m):
     if not syms:
         _sym_cache[key] = None
         return None
-    pref = ("single", "flush") if kind == "door" else ("fixed", "casement", "window")
+    pref = DOOR_FAMILY_WORDS.get(door_type, ("single", "flush")) if kind == "door" else ("fixed", "casement", "window")
     syms.sort(key=lambda s: 0 if any(p in s.Family.Name.lower() for p in pref) else 1)
     base = syms[0]
+    if door_type and not any(p in base.Family.Name.lower() for p in pref):
+        print("  no '{}' door family loaded - using '{}' (load one and rerun)".format(
+            door_type.replace("_", " "), base.Family.Name))
     tname = "{} x {}".format(key[1], key[2])
     sym = None
     for s in syms:
@@ -442,7 +451,7 @@ def build(plan):
         if host is None:
             continue
         try:
-            sym = opening_symbol(o["type"], o["width"], o["height"])
+            sym = opening_symbol(o["type"], o["width"], o["height"], o.get("door_type"))
             if sym is not None:
                 inst = doc.Create.NewFamilyInstance(P(o["center"], z0), sym, host, lvl,
                                                     StructuralType.NonStructural)

@@ -69,11 +69,22 @@ def convert(img_rgb, dets, ppm, teach_doors=False):
     strokes = {}
     for label, bbox, mask in dets:
         strokes.setdefault(norm(label), []).append(_full_mask(bbox, mask, W, H))
+    return convert_strokes(strokes, H, W, ppm, teach_doors)
+
+
+def convert_strokes(strokes, H, W, ppm, teach_doors=False, solid=(), glass=()):
+    """strokes: {label: [boolean stroke mask of one instance (or one drawn element)]}.
+    solid: labels drawn as an outline that is all wall (columns) -> filled outline = Wall.
+    glass: labels for glazing drawn along a wall line (curtain walls, glass) -> closed like a wall = Window.
+    Returns (room, icon) label maps."""
     k = max(3, int(round(0.35 * ppm))) | 1                     # bridges a wall's two lines (walls < 35 cm)
     wall_st = np.zeros((H, W), bool)
     for m in strokes.get("wall", []):
         wall_st |= m
     wall = cv2.morphologyEx(wall_st.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) > 0
+    for lab in solid:
+        for m in strokes.get(lab, []):
+            wall |= _hull(m)
     room = np.full((H, W), NOT_WALL, np.uint8)
     room[wall] = WALL
     for m in strokes.get("railing", []):
@@ -82,9 +93,17 @@ def convert(img_rgb, dets, ppm, teach_doors=False):
     room[edge] = IGNORE
     icon = np.full((H, W), I["NoIcon"], np.uint8)
     for lab, ms in strokes.items():
+        if lab == "wall":
+            continue
         for m in ms:
-            hull = _hull(m)
-            if lab in WINDOW:
+            hull = _hull(m) if lab not in glass else None
+            if lab in glass:
+                band = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) > 0
+                icon[band] = I["Window"]
+                room[band] = IGNORE
+            elif lab in solid:
+                continue
+            elif lab in WINDOW:
                 icon[hull] = I["Window"]
                 room[hull] = IGNORE
             elif lab in DOOR:

@@ -367,7 +367,7 @@ def prepare_extra(cache_root, work_dir, max_side, api, dataset_repo, token,
     """Add ResPlan, synthetic angled plans and FloorPlanCAD to the cache (after prepare_data).
     Restored from the HF dataset repo when an earlier run already built them."""
     from huggingface_hub import hf_hub_download
-    sources = sorted(sources)
+    sources = sorted(s_ for s_ in sources if s_ != "archcad")    # ArchCAD has its own cache: prepare_archcad
     name = extra_name(max_side, sources)
     data_dir = os.path.join(cache_root, "data")
     listing = os.path.join(cache_root, "extra_index.json")
@@ -427,3 +427,49 @@ def prepare_extra(cache_root, work_dir, max_side, api, dataset_repo, token,
             log(f"WARNING: extra data upload failed ({e}); next run rebuilds it.")
         os.remove(tar_path)
     return _merge_index(cache_root, extra)
+
+
+ARCHCAD_VERSION = "v1"
+
+
+def prepare_archcad(cache_root, work_dir, max_side, api, dataset_repo, token, limit=None, teach_doors=False):
+    """Add ArchCAD-400K slices (gated HF dataset, CC BY-NC 4.0) to the cache, in a cache of its own so the
+    other extra sources are not rebuilt. Restored from the HF dataset repo when an earlier run built it."""
+    from huggingface_hub import hf_hub_download
+    name = "extra_archcad_side{}_n{}_{}.tar".format(max_side, limit or "all", ARCHCAD_VERSION)
+    listing = os.path.join(cache_root, "archcad_index.json")
+    data_dir = os.path.join(cache_root, "data")
+    if os.path.exists(listing):
+        return _merge_index(cache_root, json.load(open(listing)))
+    try:
+        if api is not None and name in api.list_repo_files(dataset_repo, repo_type="dataset", token=token):
+            log(f"Restoring ArchCAD training data ({name}) from HF ...")
+            p = hf_hub_download(dataset_repo, name, repo_type="dataset", token=token,
+                                local_dir=os.path.join(work_dir, "hf_dl_archcad"))
+            with tarfile.open(p) as t:
+                t.extractall(cache_root)
+            os.remove(p)
+            return _merge_index(cache_root, json.load(open(listing)))
+    except Exception as e:
+        log(f"ArchCAD restore failed ({e}); building it.")
+    import fp_extra_archcad
+    log("Converting ArchCAD (walls, columns, glass, stairs; axis lines / beams / text taught as not wall) ...")
+    got = fp_extra_archcad.build_archcad(cache_root, work_dir, token, max_side, limit=limit,
+                                         teach_doors=teach_doors, log=log)
+    json.dump(got, open(listing, "w"))
+    if api is not None:
+        tar_path = os.path.join(work_dir, name)
+        ids = {it["id"] for v in got.values() for it in v}
+        with tarfile.open(tar_path, "w") as t:
+            t.add(listing, arcname="archcad_index.json")
+            for f in os.listdir(data_dir):
+                if f.rsplit("_", 1)[0] in ids:
+                    t.add(os.path.join(data_dir, f), arcname="data/" + f)
+        try:
+            api.upload_file(path_or_fileobj=tar_path, path_in_repo=name, repo_id=dataset_repo,
+                            repo_type="dataset", token=token, commit_message="ArchCAD training data " + name)
+            log("ArchCAD data uploaded to HF.")
+        except Exception as e:
+            log(f"WARNING: ArchCAD upload failed (training continues): {e}")
+        os.remove(tar_path)
+    return _merge_index(cache_root, got)

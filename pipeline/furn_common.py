@@ -6,10 +6,14 @@ import os
 import cv2
 import numpy as np
 
-# FloorPlanCAD classes we train on (doors / windows / stairs / walls come from the floor-plan model)
+# FloorPlanCAD classes we train on (where doors / windows / stairs / walls are comes from the floor-plan model)
 FURN_CLASSES = ["bed", "sofa", "chair", "table", "bedside_cupboard", "tv_cabinet", "half_height_cabinet",
                 "high_cabinet", "wardrobe", "sink", "bath", "bath_tub", "toilet", "squat_toilet", "urinal",
                 "gas_stove", "refrigerator", "washing_machine"]
+# door kinds the same detector learns (FloorPlanCAD + ArchCAD symbols). The floor-plan model says where a door
+# is and how wide; the detector box on that door says which kind (picks the Revit family / IFC operation type)
+DOOR_TYPES = ["single_door", "double_door", "sliding_door", "parent_child_door"]
+DET_CLASSES = FURN_CLASSES + DOOR_TYPES
 ZOOM_FACTORS = (0.75, 1.0, 1.4)
 # typical real sizes (long side, metres) used to measure the drawing scale of the dataset
 TYPICAL_LONG_M = {"bed": 2.0, "toilet": 0.7, "bath_tub": 1.7, "sofa": 2.0, "refrigerator": 0.7}
@@ -67,10 +71,10 @@ def write_sample(img_path, dets, out_img, out_lbl, stats):
     lines = []
     for label, bbox, mask in dets:
         lab = norm_label(label)
-        if lab not in FURN_CLASSES:
+        if lab not in DET_CLASSES:
             continue
         corners, rect = det_to_obb(bbox, mask, W, H)
-        lines.append(obb_line(FURN_CLASSES.index(lab), corners, W, H))
+        lines.append(obb_line(DET_CLASSES.index(lab), corners, W, H))
         stats.setdefault(lab, []).append(max(rect[1]))
     cv2.imwrite(out_img, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     with open(out_lbl, "w") as f:

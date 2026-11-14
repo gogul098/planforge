@@ -1,4 +1,9 @@
+import os
+
 import nbformat as nbf
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
 
 cells = []
 md = lambda s: cells.append(nbf.v4.new_markdown_cell(s))
@@ -6,7 +11,7 @@ code = lambda s: cells.append(nbf.v4.new_code_cell(s))
 
 md("""# Furniture detector (rotated boxes) — FloorPlanCAD · YOLO11m-OBB · 2×T4
 
-Detects **bed, sofa, chair, table, wardrobe, cabinets, TV unit, toilet, sink, bath, stove, fridge, washing machine** with their **rotation**, so drawn furniture can be copied exactly into the 3D / Revit model.
+Detects **bed, sofa, chair, table, wardrobe, cabinets, TV unit, toilet, sink, bath, stove, fridge, washing machine** with their **rotation**, so drawn furniture can be copied exactly into the 3D / Revit model, and the **kind of each door symbol** (single, double, sliding, unequal double) so the engine picks the right Revit door family.
 
 **Before running (one time):** Accelerator **GPU T4 x2** · Internet **On** · Add-ons → Secrets → `HF_TOKEN` (write) attached ·
 then **Save Version → Save & Run All (Commit)** (runs in the background; you can close the browser).
@@ -14,7 +19,8 @@ then **Save Version → Save & Run All (Commit)** (runs in the background; you c
 * First run converts the dataset (~30–45 min) and caches it to your private HF dataset repo; later runs skip that.
 * Checkpoints (`last.pt`, `best.pt`, `results.csv`) are pushed to your private HF model repo every epoch.
 * If a run is cut off, run the notebook again — it resumes from `last.pt`. A finished run is not retrained.
-* Data: FloorPlanCAD (Voxel51 mirror, CC BY-NC 4.0 — non-commercial).
+* Data: FloorPlanCAD (Voxel51 mirror) + ArchCAD-400K door / furniture symbols (gated: accept its access agreement once at https://huggingface.co/datasets/jackluoluo/ArchCAD with the HF_TOKEN account). Both CC BY-NC 4.0 — non-commercial.
+* A run with a new `DATA_VERSION` (new classes) starts from the previous detector's weights instead of resuming.
 """)
 
 code('''# ===================== CONFIG =====================
@@ -27,6 +33,9 @@ IMGSZ, BATCH    = 1024, 16                           # 16 = 8 per GPU; auto-retr
 MAX_EPOCHS      = 300                                # upper bound; the time budget decides the real length
 TIME_BUDGET_HOURS = 11.25
 VAL_FRACTION, SEED = 0.1, 42
+DATA_VERSION    = "v2-doortypes"                     # v2: + door kinds (single / double / sliding / unequal double)
+USE_ARCHCAD     = True                               # + ArchCAD-400K door / furniture symbols
+ARCHCAD_LIMIT   = 15000                              # slices to convert (None = all ~40K)
 DS_DIR   = "/tmp/furn_ds"                            # converted dataset (not saved as notebook output)
 RUNS_DIR = "/tmp/furn_runs"
 RUN_NAME = "obb"
@@ -36,7 +45,9 @@ print("config ok")''')
 
 code('''!pip install -q "ultralytics==8.3.253" "huggingface_hub>=0.25" 2>&1 | grep -v "already satisfied" | tail -2''')
 
-code("%%writefile /kaggle/working/furn_src/furn_common.py\n" + open("/home/claude/fp/furn_common.py").read())
+code("%%writefile /kaggle/working/furn_src/furn_common.py\n" + open(os.path.join(REPO, "pipeline", "furn_common.py")).read())
+for fn in ("fp_common.py", "fp_extra_fpcad.py", "fp_extra_archcad.py"):      # ArchCAD SVG reader / renderer
+    code(f"%%writefile /kaggle/working/furn_src/{fn}\n" + open(os.path.join(HERE, fn)).read())
 
 code('''%%writefile /kaggle/working/furn_src/train_furn.py
 import json, sys
@@ -89,7 +100,7 @@ if free < 15: fail("Need ~15 GB free disk.")''')
 code('''# ===================== DATA: HF cache -> else FloorPlanCAD via FiftyOne =====================
 sys.path.insert(0, SRC_DIR)
 import furn_common as F, random, tarfile, collections
-CACHE_NAME = "floorplancad_obb_v1.tar"
+CACHE_NAME = f"floorplancad_obb_{DATA_VERSION}{'_archcad' + str(ARCHCAD_LIMIT) if USE_ARCHCAD else ''}.tar"
 META_PATH = os.path.join(DS_DIR, "furniture_meta.json")
 
 def restore_cache():
@@ -104,6 +115,42 @@ def restore_cache():
         return os.path.exists(META_PATH)
     except Exception as e:
         print("cache restore failed:", e); return False
+
+def add_archcad(ppm, rng, stats):
+    """ArchCAD door / furniture symbols, rendered at the FloorPlanCAD drawing scale (so one detector scale)."""
+    import cv2, numpy as np
+    import fp_extra_archcad as A
+    try:
+        svgs = A.download("/tmp/archcad_dl", HF_TOKEN)
+        A.probe(svgs)
+    except Exception as e:
+        print("WARNING: ArchCAD skipped:", e); return
+    rng.shuffle(svgs)
+    size = int(round(A.SLICE_M * (ppm or 60.0)))
+    n_img = n_obj = 0
+    for k, p in enumerate(svgs[:ARCHCAD_LIMIT or None]):
+        try:
+            got = A.detector_boxes(p, size)
+        except Exception:
+            got = None
+        if not got or not got[1]:
+            continue
+        rgb, boxes = got
+        H, W = rgb.shape[:2]
+        split = "val" if rng.random() < VAL_FRACTION else "train"
+        stem = f"ac{k:06d}"
+        cv2.imwrite(os.path.join(DS_DIR, f"images/{split}/{stem}.jpg"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+        lines = []
+        for lab, corners in boxes:
+            lines.append(F.obb_line(F.DET_CLASSES.index(lab), np.asarray(corners), W, H))
+            stats.setdefault(lab, []).append(float(max(np.linalg.norm(corners[1] - corners[0]),
+                                                       np.linalg.norm(corners[2] - corners[1]))))
+        open(os.path.join(DS_DIR, f"labels/{split}/{stem}.txt"), "w").write("\\n".join(lines) + "\\n")
+        n_img += 1; n_obj += len(lines)
+        if (k + 1) % 2000 == 0:
+            print(f"  archcad {k+1}: {n_img} images, {n_obj} objects", flush=True)
+    print(f"ArchCAD added: {n_img} images, {n_obj} objects")
 
 def build_from_fiftyone():
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "fiftyone"], check=True)
@@ -121,9 +168,9 @@ def build_from_fiftyone():
         for d in (s[field].detections if s[field] else []):
             all_labels[F.norm_label(d.label)] += 1
     print("labels in dataset:", dict(all_labels.most_common()))
-    hit = [c for c in F.FURN_CLASSES if all_labels.get(c)]
+    hit = [c for c in F.DET_CLASSES if all_labels.get(c)]
     if len(hit) < 3: raise RuntimeError(f"Class names do not match. Dataset labels: {list(all_labels)}")
-    missing = [c for c in F.FURN_CLASSES if c not in hit]
+    missing = [c for c in F.DET_CLASSES if c not in hit]
     if missing: print("note: classes with no examples:", missing)
     for sub in ("images/train", "images/val", "labels/train", "labels/val"):
         os.makedirs(os.path.join(DS_DIR, sub), exist_ok=True)
@@ -143,8 +190,12 @@ def build_from_fiftyone():
         if (k + 1) % 500 == 0 or k + 1 == len(samples):
             el = time.time() - t0
             print(f"  converted {k+1}/{len(samples)} ({el/(k+1)*(len(samples)-k-1)/60:.1f} min left), {n_obj} objects")
-    meta = {"classes": F.FURN_CLASSES, "train_px_per_m": F.dataset_px_per_m(stats),
-            "counts": {c: len(v) for c, v in stats.items()}, "imgsz": IMGSZ, "source": "Voxel51/FloorPlanCAD"}
+    ppm = F.dataset_px_per_m(stats)
+    if USE_ARCHCAD:
+        add_archcad(ppm, rng, stats)
+    meta = {"classes": F.DET_CLASSES, "train_px_per_m": ppm, "data_version": DATA_VERSION,
+            "counts": {c: len(v) for c, v in stats.items()}, "imgsz": IMGSZ,
+            "source": "Voxel51/FloorPlanCAD" + (" + ArchCAD-400K" if USE_ARCHCAD else "")}
     json.dump(meta, open(META_PATH, "w"), indent=1)
     print("objects per class:", meta["counts"], "| drawing scale px/m:", meta["train_px_per_m"])
     print("Uploading converted dataset to HF (so future runs skip this) ...")
@@ -163,7 +214,7 @@ if not restore_cache():
     build_from_fiftyone()
 open(os.path.join(DS_DIR, "data.yaml"), "w").write(
     f"path: {DS_DIR}\\ntrain: images/train\\nval: images/val\\nnames:\\n" +
-    "".join(f"  {i}: {c}\\n" for i, c in enumerate(F.FURN_CLASSES)))
+    "".join(f"  {i}: {c}\\n" for i, c in enumerate(json.load(open(META_PATH))["classes"])))
 meta = json.load(open(META_PATH))
 n_tr = len(os.listdir(os.path.join(DS_DIR, "images/train"))); n_va = len(os.listdir(os.path.join(DS_DIR, "images/val")))
 print(f"data ready in {(time.time()-t0)/60:.1f} min: {n_tr} train / {n_va} val images | scale {meta['train_px_per_m']} px/m")''')
@@ -183,6 +234,20 @@ if "checkpoints/results.csv" in remote:
     shutil.copyfile(hf_hub_download(MODEL_REPO, "checkpoints/results.csv", token=HF_TOKEN, local_dir="/tmp/hf_ck"),
                     os.path.join(RUNS_DIR, RUN_NAME, "results.csv"))
 last = os.path.join(W_DIR, "last.pt")
+init_from = None
+try:                                     # the detector on HF was trained for other classes: start from its weights
+    rmeta = json.load(open(hf_hub_download(MODEL_REPO, "furniture_meta.json", token=HF_TOKEN, local_dir="/tmp/hf_ck")))
+except Exception:
+    rmeta = {}
+if os.path.exists(last) and rmeta.get("data_version") != DATA_VERSION:
+    best_old = os.path.join(W_DIR, "best.pt")
+    init_from = "/tmp/prev_best.pt"
+    shutil.copyfile(best_old if os.path.exists(best_old) else last, init_from)
+    for f_ in ("last.pt", "best.pt"):
+        if os.path.exists(os.path.join(W_DIR, f_)): os.remove(os.path.join(W_DIR, f_))
+    rc_ = os.path.join(RUNS_DIR, RUN_NAME, "results.csv")
+    if os.path.exists(rc_): os.remove(rc_)
+    print(f"new classes ({rmeta.get('data_version', 'v1')} -> {DATA_VERSION}): new run starting from the previous weights")
 if os.path.exists(last):
     ck = torch.load(last, map_location="cpu", weights_only=False)
     if ck.get("epoch", -1) == -1:
@@ -235,7 +300,7 @@ code('''# ===================== TRAIN on both T4s =====================
 def run_training(batch):
     hours = (NOTEBOOK_START + TIME_BUDGET_HOURS * 3600 - time.time()) / 3600 - 0.35
     if hours < 0.5: print("Not enough time left in this session."); return 0, ""
-    cfg = {"model": BASE_MODEL, "data": os.path.join(DS_DIR, "data.yaml"), "imgsz": IMGSZ, "epochs": MAX_EPOCHS,
+    cfg = {"model": init_from or BASE_MODEL, "data": os.path.join(DS_DIR, "data.yaml"), "imgsz": IMGSZ, "epochs": MAX_EPOCHS,
            "hours": round(hours, 2), "batch": batch, "device": [0, 1], "workers": 4, "project": RUNS_DIR,
            "name": RUN_NAME, "resume_from": resume_from}
     json.dump(cfg, open(os.path.join(SRC_DIR, "run.json"), "w"))
@@ -281,5 +346,5 @@ nb["cells"] = cells
 nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                   "language_info": {"name": "python"},
                   "kaggle": {"accelerator": "nvidiaTeslaT4", "isInternetEnabled": True, "isGpuEnabled": True}}
-nbf.write(nb, "/home/claude/furniture_detector_kaggle.ipynb")
+nbf.write(nb, os.path.join(HERE, "furniture_detector_kaggle.ipynb"))
 print("cells", len(cells))

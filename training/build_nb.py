@@ -43,11 +43,15 @@ SEED      = 42
 
 # ---- data beyond CubiCasa5K + rotation (v2). The first run renders / converts them once (~20-30 min) and
 # stores them in the HF dataset repo; later runs restore them in minutes.
-DATA_VERSION  = "v2"          # changing this starts a new run FROM the current model's weights
-EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad"]   # remove any you do not want
+DATA_VERSION  = "v3"          # changing this starts a new run FROM the current model's weights
+EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad", "archcad"]   # remove any you do not want
+# ArchCAD-400K: real CAD drawings (schools, offices, public buildings); teaches columns, glass, and that axis lines,
+# beams and text are NOT walls. Gated on Hugging Face: open https://huggingface.co/datasets/jackluoluo/ArchCAD
+# with the account of HF_TOKEN and accept the access agreement once. Licence CC BY-NC 4.0 (non-commercial).
+ARCHCAD_LIMIT = None          # None = all public slices (~40K); e.g. 15000 for a faster first build
 N_SYNTHETIC   = 3000          # synthetic angled buildings (wings at 30 / 45 / 60 degrees, curved fronts)
 FPCAD_DOORS   = False         # FloorPlanCAD door openings rebuilt from strokes are ~75% right: off by default
-SOURCE_WEIGHTS = {"cubicasa": 0.40, "resplan": 0.25, "synthetic": 0.20, "floorplancad": 0.15}
+SOURCE_WEIGHTS = {"cubicasa": 0.35, "resplan": 0.20, "synthetic": 0.15, "floorplancad": 0.12, "archcad": 0.18}
 ROT_PROB      = 0.6           # share of crops turned by 30 / 45 / 60 degrees (+-3) or any angle
 SCALE_RANGE   = [0.6, 1.8]    # zoom range of training crops
 
@@ -61,7 +65,8 @@ print("config ok")''')
 code('''!pip install -q "segmentation-models-pytorch==0.6.0" "timm==1.0.31" "huggingface_hub>=0.25" svgpathtools shapely 2>&1 | grep -v "already satisfied" | tail -3
 !pip install -q hf_xet 2>&1 | tail -1 || true''')
 
-for fn in ["fp_common.py", "fp_prep.py", "fp_render.py", "fp_extra_fpcad.py", "train.py", "viz.py", "ddp_check.py"]:
+for fn in ["fp_common.py", "fp_prep.py", "fp_render.py", "fp_extra_fpcad.py", "fp_extra_archcad.py", "train.py",
+           "viz.py", "ddp_check.py"]:
     body = open(SRC + fn).read()
     code(f"%%writefile {{SRC_DIR}}/{fn}\n".replace("{SRC_DIR}", "/kaggle/working/fp_src") + body)
 
@@ -159,6 +164,12 @@ if EXTRA_SOURCES:
     os.makedirs(f"{BIG_DIR}/work", exist_ok=True)
     index = fp_prep.prepare_extra(CACHE_DIR, f"{BIG_DIR}/work", MAX_SIDE, api, DATASET_REPO, HF_TOKEN,
                                   EXTRA_SOURCES, N_SYNTHETIC, FPCAD_DOORS)
+if "archcad" in EXTRA_SOURCES:
+    try:
+        index = fp_prep.prepare_archcad(CACHE_DIR, f"{BIG_DIR}/work", MAX_SIDE, api, DATASET_REPO, HF_TOKEN,
+                                        ARCHCAD_LIMIT, FPCAD_DOORS)
+    except Exception as e:
+        print(f"WARNING: ArchCAD skipped ({type(e).__name__}: {e}); training continues without it.")
 import collections
 for split in ("train", "val"):
     print(split, dict(collections.Counter(it.get("source", "cubicasa") for it in index[split])))

@@ -242,7 +242,7 @@ def main():
         extra_val["cubicasa_rot{}".format(ang)] = CachedFloorplans(
             cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], fixed_angle=ang, sources=["cubicasa"],
             limit=cfg.get("extra_val_limit", 100))
-    for src in ("resplan", "synthetic", "floorplancad"):
+    for src in ("resplan", "synthetic", "floorplancad", "archcad"):
         d_ = CachedFloorplans(cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], sources=[src],
                               limit=cfg.get("extra_val_limit", 100))
         if len(d_):
