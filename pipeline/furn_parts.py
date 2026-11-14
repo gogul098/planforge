@@ -109,8 +109,7 @@ def detector_furniture(img, mpp, roi=None):
             _YOLO.update(w=w, net=_onnx_session(w))
         dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
                                 conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)
-        return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
-                for d in dets if d["cls"] in FURN_SPEC]
+        return _split_doors(dets)
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
     os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/yolo")
@@ -123,8 +122,62 @@ def detector_furniture(img, mpp, roi=None):
         _YOLO.update(w=w, net=YOLO(w))
     dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
                             conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)   # weak hits are checked against the rooms later
+    return _split_doors(dets)
+
+
+def _split_doors(dets):
+    """Detector hits -> furniture items (returned) and door-kind hits (kept for assign_door_types)."""
+    _YOLO["doors"] = [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"]}
+                      for d in dets if d["cls"] in DOOR_TYPES]
     return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
             for d in dets if d["cls"] in FURN_SPEC]
+
+
+DOOR_TYPE_CONF = 0.4
+
+
+def assign_door_types(plan):
+    """Each door opening the floor-plan model found takes the kind of the detector's door symbol drawn on it
+    (the symbol box touches the opening). No symbol box on a door -> its kind stays unknown: nothing guessed.
+    Returns {kind: count}."""
+    from shapely.geometry import Polygon, LineString
+    dets = _YOLO.get("doors") or []
+    if not dets:
+        return {}                                   # detector without door kinds (or none drawn): say nothing
+    mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    boxes = []
+    for d in dets:
+        if d["conf"] < DOOR_TYPE_CONF:
+            continue
+        poly = Polygon([[float(mx(x)), float(my(y))] for x, y in d["corners"]]).buffer(0)
+        if poly.area > 0.05:
+            boxes.append((poly, d))
+    walls = {w["id"]: w for w in plan["walls"]}
+    counts = {}
+    for o in plan["openings"]:
+        if o["type"] != "door":
+            continue
+        w = walls.get(o["wall"])
+        if w is None:
+            continue
+        a, d_, _, _ = wall_frame(w)
+        c = np.array(o["center"], float)
+        seg = LineString([c - d_ * o["width"] / 2, c + d_ * o["width"] / 2])
+        best = None
+        for poly, det in boxes:
+            if poly.distance(seg) > 0.15:
+                continue
+            # the symbol spans the opening: most of the opening lies along the box
+            cover = poly.buffer(0.15).intersection(seg).length / max(seg.length, 1e-6)
+            if cover < 0.6:
+                continue
+            if best is None or det["conf"] > best["conf"]:
+                best = det
+        kind = best["type"] if best else "unknown"
+        if best:
+            o["door_type"], o["door_type_conf"] = best["type"], best["conf"]
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
 
 
 def build_furniture(items_px, plan):

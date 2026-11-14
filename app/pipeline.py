@@ -1536,10 +1536,14 @@ def make_mapper(sol, axis):
 
 
 # ----------------------------------------------------------------------------- furniture detector helpers
-# FloorPlanCAD classes we train on (doors / windows / stairs / walls come from the floor-plan model)
+# FloorPlanCAD classes we train on (where doors / windows / stairs / walls are comes from the floor-plan model)
 FURN_CLASSES = ["bed", "sofa", "chair", "table", "bedside_cupboard", "tv_cabinet", "half_height_cabinet",
                 "high_cabinet", "wardrobe", "sink", "bath", "bath_tub", "toilet", "squat_toilet", "urinal",
                 "gas_stove", "refrigerator", "washing_machine"]
+# door kinds the same detector learns (FloorPlanCAD + ArchCAD symbols). The floor-plan model says where a door
+# is and how wide; the detector box on that door says which kind (picks the Revit family / IFC operation type)
+DOOR_TYPES = ["single_door", "double_door", "sliding_door", "parent_child_door"]
+DET_CLASSES = FURN_CLASSES + DOOR_TYPES
 ZOOM_FACTORS = (0.75, 1.0, 1.4)
 # typical real sizes (long side, metres) used to measure the drawing scale of the dataset
 TYPICAL_LONG_M = {"bed": 2.0, "toilet": 0.7, "bath_tub": 1.7, "sofa": 2.0, "refrigerator": 0.7}
@@ -1597,10 +1601,10 @@ def write_sample(img_path, dets, out_img, out_lbl, stats):
     lines = []
     for label, bbox, mask in dets:
         lab = norm_label(label)
-        if lab not in FURN_CLASSES:
+        if lab not in DET_CLASSES:
             continue
         corners, rect = det_to_obb(bbox, mask, W, H)
-        lines.append(obb_line(FURN_CLASSES.index(lab), corners, W, H))
+        lines.append(obb_line(DET_CLASSES.index(lab), corners, W, H))
         stats.setdefault(lab, []).append(max(rect[1]))
     cv2.imwrite(out_img, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     with open(out_lbl, "w") as f:
@@ -1838,8 +1842,7 @@ def detector_furniture(img, mpp, roi=None):
             _YOLO.update(w=w, net=_onnx_session(w))
         dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
                                 conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)
-        return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
-                for d in dets if d["cls"] in FURN_SPEC]
+        return _split_doors(dets)
     if not os.environ.get("P3D_NO_INSTALL"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ultralytics==8.3.253"], check=False)
     os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/yolo")
@@ -1852,8 +1855,62 @@ def detector_furniture(img, mpp, roi=None):
         _YOLO.update(w=w, net=YOLO(w))
     dets = detect_furniture(_YOLO["net"], img, plan_px_per_m=1.0 / mpp, train_px_per_m=meta.get("train_px_per_m"),
                             conf=FURNITURE_LOW_CONF, zooms=FURNITURE_ZOOMS, roi=roi)   # weak hits are checked against the rooms later
+    return _split_doors(dets)
+
+
+def _split_doors(dets):
+    """Detector hits -> furniture items (returned) and door-kind hits (kept for assign_door_types)."""
+    _YOLO["doors"] = [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"]}
+                      for d in dets if d["cls"] in DOOR_TYPES]
     return [{"type": d["cls"], "conf": round(d["conf"], 3), "corners": d["corners"], "source": "furniture detector"}
             for d in dets if d["cls"] in FURN_SPEC]
+
+
+DOOR_TYPE_CONF = 0.4
+
+
+def assign_door_types(plan):
+    """Each door opening the floor-plan model found takes the kind of the detector's door symbol drawn on it
+    (the symbol box touches the opening). No symbol box on a door -> its kind stays unknown: nothing guessed.
+    Returns {kind: count}."""
+    from shapely.geometry import Polygon, LineString
+    dets = _YOLO.get("doors") or []
+    if not dets:
+        return {}                                   # detector without door kinds (or none drawn): say nothing
+    mx, my = make_mapper(plan["mapping"], "x"), make_mapper(plan["mapping"], "y")
+    boxes = []
+    for d in dets:
+        if d["conf"] < DOOR_TYPE_CONF:
+            continue
+        poly = Polygon([[float(mx(x)), float(my(y))] for x, y in d["corners"]]).buffer(0)
+        if poly.area > 0.05:
+            boxes.append((poly, d))
+    walls = {w["id"]: w for w in plan["walls"]}
+    counts = {}
+    for o in plan["openings"]:
+        if o["type"] != "door":
+            continue
+        w = walls.get(o["wall"])
+        if w is None:
+            continue
+        a, d_, _, _ = wall_frame(w)
+        c = np.array(o["center"], float)
+        seg = LineString([c - d_ * o["width"] / 2, c + d_ * o["width"] / 2])
+        best = None
+        for poly, det in boxes:
+            if poly.distance(seg) > 0.15:
+                continue
+            # the symbol spans the opening: most of the opening lies along the box
+            cover = poly.buffer(0.15).intersection(seg).length / max(seg.length, 1e-6)
+            if cover < 0.6:
+                continue
+            if best is None or det["conf"] > best["conf"]:
+                best = det
+        kind = best["type"] if best else "unknown"
+        if best:
+            o["door_type"], o["door_type_conf"] = best["type"], best["conf"]
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
 
 
 def build_furniture(items_px, plan):
@@ -3552,6 +3609,8 @@ def build_ifc(plan, path):
         ifc_walls[w["id"]] = (e, start, d, w)
 
     op_types = {}
+    IFC_DOOR_OPERATION = {"single_door": "SINGLE_SWING", "double_door": "DOUBLE_DOOR_SINGLE_SWING",
+                          "sliding_door": "SLIDING", "parent_child_door": "UNEQUAL_DOUBLE_SWING"}
     for o in plan["openings"]:
         e_wall, start, d, w = ifc_walls[o["wall"]]
         org = np.array(w["start"]) + d * (o["offset"] - o["width"] / 2)
@@ -3562,12 +3621,19 @@ def build_ifc(plan, path):
         geometry.edit_object_placement(f, product=op, matrix=M(org, d, o["sill"]))
         feature.add_feature(f, feature=op, element=e_wall)
         cls = "IfcDoor" if o["type"] == "door" else "IfcWindow"
-        key = (cls, int(o["width"] * 1000), int(o["height"] * 1000))
+        key = (cls, int(o["width"] * 1000), int(o["height"] * 1000), o.get("door_type") or "")
         if key not in op_types:
-            op_types[key] = root.create_entity(f, ifc_class=cls + "Type",
-                                               name="{} {} x {}".format(cls[3:], key[1], key[2]))
+            op_types[key] = root.create_entity(f, ifc_class=cls + "Type", name="{}{} {} x {}".format(
+                cls[3:], " " + key[3].replace("_door", "").replace("_", "-") if key[3] else "", key[1], key[2]))
         fill = root.create_entity(f, ifc_class=cls, name="{} {}".format(cls[3:], o["id"]))
         fill.OverallWidth, fill.OverallHeight = o["width"], o["height"]
+        if cls == "IfcDoor" and o.get("door_type"):
+            # the hinge side is not known from the symbol class alone: user-defined where IFC needs a side
+            op_ = IFC_DOOR_OPERATION.get(o["door_type"])
+            if op_ in ("DOUBLE_DOOR_SINGLE_SWING",):
+                fill.OperationType = op_
+            elif op_:
+                fill.OperationType, fill.UserDefinedOperationType = "USERDEFINED", op_
         ifctype.assign_type(f, related_objects=[fill], relating_type=op_types[key])
         geometry.assign_representation(f, product=fill, representation=geometry.add_wall_representation(
             f, context=body, length=o["width"], height=o["height"], thickness=0.05, offset=-0.025))
@@ -4079,6 +4145,10 @@ def main(img=None, room=None, icon=None, original=None):
         plan["furniture"] = inside_
         for k_, fu in enumerate(plan["furniture"]):
             fu["id"] = k_
+        dt_ = assign_door_types(plan)
+        if dt_:
+            print("  door kinds (detector symbol on each door): " + ", ".join(
+                "{} {}".format(k_.replace("_", " "), n_) for k_, n_ in sorted(dt_.items())))
     else:
         plan["furniture"] = []
     _lap("furniture")
