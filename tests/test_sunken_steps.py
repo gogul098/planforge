@@ -21,8 +21,8 @@ def job(tmp_path_factory):
     sys.path.insert(0, APP)
     import server as S
     S.JOBS = str(d / "jobs")
-    P = S.P                                                         # engine class ids (no PyTorch needed)
-    R = {n: i for i, n in enumerate(P.ROOMS)}
+    P = S.P
+    R = {"Background": 0, "Outdoor": 1, "Wall": P.WALL, "OtherRoom": 11}   # room-head ids (CubiCasa5K order)
     H, W = 900, 1200
     room = np.full((H, W), R["Background"], np.uint8)
     icon = np.zeros((H, W), np.uint8)
