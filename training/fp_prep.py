@@ -435,7 +435,8 @@ def prepare_extra(cache_root, work_dir, max_side, api, dataset_repo, token,
 ARCHCAD_VERSION = "v1"
 
 
-def prepare_archcad(cache_root, work_dir, max_side, api, dataset_repo, token, limit=None, teach_doors=False):
+def prepare_archcad(cache_root, work_dir, max_side, api, dataset_repo, token, limit=None, teach_doors=False,
+                    archcad_token=None):
     """Add ArchCAD-400K slices (gated HF dataset, CC BY-NC 4.0) to the cache, in a cache of its own so the
     other extra sources are not rebuilt. Restored from the HF dataset repo when an earlier run built it."""
     from huggingface_hub import hf_hub_download
@@ -457,7 +458,7 @@ def prepare_archcad(cache_root, work_dir, max_side, api, dataset_repo, token, li
         log(f"ArchCAD restore failed ({e}); building it.")
     import fp_extra_archcad
     log("Converting ArchCAD (walls, columns, glass, stairs; axis lines / beams / text taught as not wall) ...")
-    got = fp_extra_archcad.build_archcad(cache_root, work_dir, token, max_side, limit=limit,
+    got = fp_extra_archcad.build_archcad(cache_root, work_dir, archcad_token or token, max_side, limit=limit,
                                          teach_doors=teach_doors, log=log)
     json.dump(got, open(listing, "w"))
     if api is not None:
