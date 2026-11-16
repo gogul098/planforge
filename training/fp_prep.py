@@ -278,6 +278,9 @@ def try_download_cache(api, repo, max_side, cache_root, token):
         log(f"Could not list dataset repo ({e}); will build cache.")
         return False
     if name not in files:
+        tars = [f for f in files if f.endswith(".tar")]
+        log(f"No CubiCasa5K cache '{name}' in HF dataset repo {repo} (tar files there: {tars or 'none'}). "
+            f"Building it (attach a Kaggle copy of CubiCasa5K to skip the 5.5 GB Zenodo download).")
         return False
     log(f"Found cached data on HF ({name}); downloading ...")
     for attempt in range(3):
