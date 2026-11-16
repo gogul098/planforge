@@ -48,6 +48,7 @@ EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad", "archcad"]   # remove a
 # ArchCAD-400K: real CAD drawings (schools, offices, public buildings); teaches columns, glass, and that axis lines,
 # beams and text are NOT walls. Gated on Hugging Face: open https://huggingface.co/datasets/jackluoluo/ArchCAD
 # with the account of HF_TOKEN and accept the access agreement once. Licence CC BY-NC 4.0 (non-commercial).
+# Approved on another HF account? Add its token as Kaggle Secret ARCHCAD_HF_TOKEN (used only for the download).
 ARCHCAD_LIMIT = None          # None = all public slices (~40K); e.g. 15000 for a faster first build
 N_SYNTHETIC   = 3000          # synthetic angled buildings (wings at 30 / 45 / 60 degrees, curved fronts)
 FPCAD_DOORS   = False         # FloorPlanCAD door openings rebuilt from strokes are ~75% right: off by default
@@ -93,6 +94,19 @@ except Exception as e:
 HF_TOKEN = HF_TOKEN or os.environ.get("HF_TOKEN")
 if not HF_TOKEN: fail("Add a Kaggle Secret named HF_TOKEN (Add-ons -> Secrets) and attach it to this notebook.")
 os.environ["HF_TOKEN"] = HF_TOKEN
+from huggingface_hub import HfApi
+# ArchCAD may be approved on another HF account: its token (Kaggle Secret ARCHCAD_HF_TOKEN) is used ONLY to
+# download ArchCAD; checkpoints and caches stay on the HF_TOKEN account.
+ARCHCAD_TOKEN = None
+try:
+    ARCHCAD_TOKEN = UserSecretsClient().get_secret("ARCHCAD_HF_TOKEN")
+except Exception:
+    pass
+ARCHCAD_TOKEN = ARCHCAD_TOKEN or os.environ.get("ARCHCAD_HF_TOKEN") or HF_TOKEN
+try:
+    print("ArchCAD download account:", HfApi(token=ARCHCAD_TOKEN).whoami()["name"])
+except Exception as e:
+    print("ArchCAD token not usable:", e)
 
 from huggingface_hub import HfApi
 api = HfApi(token=HF_TOKEN)
@@ -167,7 +181,7 @@ if EXTRA_SOURCES:
 if "archcad" in EXTRA_SOURCES:
     try:
         index = fp_prep.prepare_archcad(CACHE_DIR, f"{BIG_DIR}/work", MAX_SIDE, api, DATASET_REPO, HF_TOKEN,
-                                        ARCHCAD_LIMIT, FPCAD_DOORS)
+                                        ARCHCAD_LIMIT, FPCAD_DOORS, archcad_token=ARCHCAD_TOKEN)
     except Exception as e:
         print(f"WARNING: ArchCAD skipped ({type(e).__name__}: {e}); training continues without it.")
 import collections

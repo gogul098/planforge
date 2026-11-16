@@ -83,6 +83,18 @@ HF_TOKEN = HF_TOKEN or os.environ.get("HF_TOKEN")
 if not HF_TOKEN: fail("Add Kaggle Secret HF_TOKEN (Add-ons -> Secrets) and attach it to this notebook.")
 os.environ["HF_TOKEN"] = HF_TOKEN
 from huggingface_hub import HfApi, hf_hub_download
+# ArchCAD may be approved on another HF account: its token (Kaggle Secret ARCHCAD_HF_TOKEN) is used ONLY to
+# download ArchCAD; checkpoints and caches stay on the HF_TOKEN account.
+ARCHCAD_TOKEN = None
+try:
+    ARCHCAD_TOKEN = UserSecretsClient().get_secret("ARCHCAD_HF_TOKEN")
+except Exception:
+    pass
+ARCHCAD_TOKEN = ARCHCAD_TOKEN or os.environ.get("ARCHCAD_HF_TOKEN") or HF_TOKEN
+try:
+    print("ArchCAD download account:", HfApi(token=ARCHCAD_TOKEN).whoami()["name"])
+except Exception as e:
+    print("ArchCAD token not usable:", e)
 api = HfApi(token=HF_TOKEN)
 HF_USER = api.whoami()["name"]
 MODEL_REPO, DATA_REPO = f"{HF_USER}/{MODEL_REPO_NAME}", f"{HF_USER}/{DATA_REPO_NAME}"
@@ -121,7 +133,7 @@ def add_archcad(ppm, rng, stats):
     import cv2, numpy as np
     import fp_extra_archcad as A
     try:
-        svgs = A.download("/tmp/archcad_dl", HF_TOKEN)
+        svgs = A.download("/tmp/archcad_dl", ARCHCAD_TOKEN)
         A.probe(svgs)
     except Exception as e:
         print("WARNING: ArchCAD skipped:", e); return
