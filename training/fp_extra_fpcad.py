@@ -72,6 +72,23 @@ def convert(img_rgb, dets, ppm, teach_doors=False):
     return convert_strokes(strokes, H, W, ppm, teach_doors)
 
 
+class Crop:
+    """A stroke mask kept as its bounding-box crop (instances are small; full-size masks would not fit in RAM)."""
+    __slots__ = ("y0", "x0", "m")
+
+    def __init__(self, y0, x0, m):
+        self.y0, self.x0, self.m = y0, x0, m
+
+    def full(self, H, W):
+        out = np.zeros((H, W), bool)
+        out[self.y0:self.y0 + self.m.shape[0], self.x0:self.x0 + self.m.shape[1]] = self.m
+        return out
+
+
+def _full(m, H, W):
+    return m.full(H, W) if isinstance(m, Crop) else m
+
+
 def convert_strokes(strokes, H, W, ppm, teach_doors=False, solid=(), glass=()):
     """strokes: {label: [boolean stroke mask of one instance (or one drawn element)]}.
     solid: labels drawn as an outline that is all wall (columns) -> filled outline = Wall.
@@ -80,11 +97,11 @@ def convert_strokes(strokes, H, W, ppm, teach_doors=False, solid=(), glass=()):
     k = max(3, int(round(0.35 * ppm))) | 1                     # bridges a wall's two lines (walls < 35 cm)
     wall_st = np.zeros((H, W), bool)
     for m in strokes.get("wall", []):
-        wall_st |= m
+        wall_st |= _full(m, H, W)
     wall = cv2.morphologyEx(wall_st.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) > 0
     for lab in solid:
         for m in strokes.get(lab, []):
-            wall |= _hull(m)
+            wall |= _hull(_full(m, H, W))
     room = np.full((H, W), NOT_WALL, np.uint8)
     room[wall] = WALL
     for m in strokes.get("railing", []):
@@ -96,6 +113,7 @@ def convert_strokes(strokes, H, W, ppm, teach_doors=False, solid=(), glass=()):
         if lab == "wall":
             continue
         for m in ms:
+            m = _full(m, H, W)
             hull = _hull(m) if lab not in glass else None
             if lab in glass:
                 band = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) > 0

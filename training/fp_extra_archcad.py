@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 
 from fp_common import IGNORE
-from fp_extra_fpcad import convert_strokes
+from fp_extra_fpcad import Crop, convert_strokes
 
 HF_REPO = "jackluoluo/ArchCAD"
 SLICE_M = 14.0
@@ -295,12 +295,16 @@ def render(elements, box, size_px, line_px=1, rng=None):
     s = size_px / max(w, h)
     W, H = max(8, int(round(w * s))), max(8, int(round(h * s)))
     img = np.full((H, W), 255, np.uint8)
+    # one full mask per class for elements without an instance (walls, glass, grid ...); countable objects
+    # are drawn on a mask of their own and kept as a bounding-box crop (thousands of full masks = no RAM)
     inst_masks, inst_pts = {}, {}
     for lab, ins, arrs, text in elements:
-        key = (lab, ins if ins is not None else id(arrs))
+        key = (lab, ins)
         m = inst_masks.get(key)
         if m is None:
             m = inst_masks[key] = np.zeros((H, W), np.uint8)
+        elif isinstance(m, Crop):                          # more strokes of an instance cropped early
+            m = inst_masks[key] = m.full(H, W).astype(np.uint8)
         pts_all = []
         for a in arrs:
             q = np.round((a - [minx, miny]) * s).astype(np.int32)
@@ -319,13 +323,29 @@ def render(elements, box, size_px, line_px=1, rng=None):
             cv2.polylines(img, [q], False, 0, line_px, cv2.LINE_AA)
             cv2.polylines(m, [q], False, 1, max(1, line_px), cv2.LINE_8)
         inst_pts.setdefault(key, []).extend(pts_all)
+        if ins is not None and len(inst_masks) > 64:      # keep RAM bounded: crop finished instances early
+            _crop_done(inst_masks)
+    _crop_done(inst_masks, final=True)
     strokes, points = {}, {}
     for (lab, _), m in inst_masks.items():
-        strokes.setdefault(lab, []).append(m > 0)
+        strokes.setdefault(lab, []).append(m if isinstance(m, Crop) else m > 0)
     for (lab, _), pts in inst_pts.items():
         points.setdefault(lab, []).append(np.concatenate(pts) if pts else np.zeros((0, 2)))
     rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     return rgb, strokes, points, size_px / SLICE_M
+
+
+def _crop_done(inst_masks, final=False):
+    """Replace full-size instance masks (keys with an instance id) by their bounding-box crops."""
+    for key, m in list(inst_masks.items()):
+        if key[1] is None or isinstance(m, Crop):
+            continue
+        ys, xs = np.nonzero(m)
+        if not len(ys):
+            inst_masks[key] = Crop(0, 0, np.zeros((1, 1), bool))
+            continue
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        inst_masks[key] = Crop(y0, x0, m[y0:y1, x0:x1] > 0)
 
 
 def convert_sample(svg, size_px=1400, teach_doors=False, line_px=1):
@@ -342,7 +362,7 @@ def convert_sample(svg, size_px=1400, teach_doors=False, line_px=1):
     room, icon = convert_strokes(fp, H, W, ppm, teach_doors, solid=SOLID, glass=GLASS)
     for lab in UNSURE:                                        # neither taught nor denied
         for m in strokes.get(lab, []):
-            ys, xs = np.nonzero(m)
+            ys, xs = np.nonzero(m.full(H, W) if isinstance(m, Crop) else m)
             if len(xs) >= 3:
                 hull = np.zeros((H, W), np.uint8)
                 cv2.fillPoly(hull, [cv2.convexHull(np.stack([xs, ys], 1).astype(np.int32))], 1)
@@ -422,6 +442,21 @@ def probe(svgs, n=5, log=print):
                            "{}".format(dict(c.most_common(15))))
 
 
+def _convert_job(job):
+    """Worker: one slice -> cache entry. Returns (k, written?)."""
+    from fp_render import write_entry
+    k, p, data_dir, max_side, teach_doors, line_px = job
+    try:
+        got = convert_sample(p, size_px=min(max_side, 1400), teach_doors=teach_doors, line_px=line_px)
+    except Exception:
+        got = None
+    if got is None:
+        return k, False
+    rgb, room, icon = got
+    write_entry(data_dir, "archcad{:06d}".format(k), rgb, room, icon, max_side)
+    return k, True
+
+
 def build_archcad(cache_root, work_dir, token, max_side=1536, limit=None, val_fraction=0.05, seed=0,
                   teach_doors=False, log=print):
     """Download, convert and write cache entries. Returns {"train": [...], "val": [...]}."""
@@ -437,21 +472,17 @@ def build_archcad(cache_root, work_dir, token, max_side=1536, limit=None, val_fr
     os.makedirs(data_dir, exist_ok=True)
     out = {"train": [], "val": []}
     skipped = 0
-    for k, p in enumerate(svgs):
-        try:
-            got = convert_sample(p, size_px=min(max_side, 1400), teach_doors=teach_doors,
-                                 line_px=1 + int(rng.random() < 0.3))
-        except Exception:
-            got = None
-        if got is None:
-            skipped += 1
-            continue
-        rgb, room, icon = got
-        sid = "archcad{:06d}".format(k)
-        write_entry(data_dir, sid, rgb, room, icon, max_side)
-        out["val" if rng.random() < val_fraction else "train"].append({"id": sid, "source": "archcad"})
-        if (k + 1) % 1000 == 0:
-            log("  archcad converted {} / {} (skipped {})".format(k + 1, len(svgs), skipped))
+    jobs = [(k, p, data_dir, max_side, teach_doors, 1 + int(rng.random() < 0.3)) for k, p in enumerate(svgs)]
+    from multiprocessing import Pool
+    with Pool(max(1, (os.cpu_count() or 2))) as pool:             # ~0.16 s per slice per core
+        for n, (k, ok) in enumerate(pool.imap_unordered(_convert_job, jobs, chunksize=16)):
+            if not ok:
+                skipped += 1
+            else:
+                split = "val" if random.Random(seed * 1000003 + k).random() < val_fraction else "train"
+                out[split].append({"id": "archcad{:06d}".format(k), "source": "archcad"})
+            if (n + 1) % 2000 == 0:
+                log("  archcad converted {} / {} (skipped {})".format(n + 1, len(svgs), skipped))
     log("  archcad: {} train, {} val, {} skipped (structural / empty / unreadable)".format(
         len(out["train"]), len(out["val"]), skipped))
     return out
