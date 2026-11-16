@@ -99,3 +99,33 @@ def test_structural_slices_are_skipped(tmp_path):
     f = tmp_path / "f.svg"
     f.write_text(SVG.replace('semantic="21"', 'semantic="foundation"'))
     assert A.convert_sample(str(f), 700) is None
+
+
+REAL_FORMAT = """<?xml version="1.0" encoding="utf-8"?>
+<svg:svg height="980" version="1.1" viewBox="0 0 980 980" width="980" xmlns:svg="http://www.w3.org/2000/svg">
+ <svg:path d="M 70,140 L 910,140" semantic="20" stroke="black" stroke-width="1"/>
+ <svg:path d="M 70,157 L 910,157" semantic="20" stroke="black" stroke-width="1"/>
+ <svg:path d="M 560,490 L 595,490 L 595,525 L 560,525 L 560,490" semantic="21" instance="21_7" stroke="black"/>
+ <svg:path d="M 0,700 L 980,700" semantic="0" stroke="black" stroke-width="1"/>
+</svg:svg>"""
+
+
+def test_archcad_real_file_format(tmp_path):
+    """The released files: namespaced svg:path tags, numeric class ids, 980 units = 14 m."""
+    sys.path.insert(0, os.path.join(HERE, "..", "training"))
+    try:
+        import fp_extra_archcad as A
+        from fp_common import ROOM_CLASSES, NOT_WALL
+    except ImportError as e:
+        import pytest
+        pytest.skip(str(e))
+    f = tmp_path / "r.svg"
+    f.write_text(REAL_FORMAT)
+    els, box = A.parse_svg(str(f))
+    assert box == (0.0, 0.0, 980.0, 980.0)
+    assert sorted({e[0] for e in els}) == ["axis_grid", "concrete_column", "wall"]
+    rgb, room, icon = A.convert_sample(str(f), 980)
+    W = ROOM_CLASSES.index("Wall")
+    assert room[148, 500] == W                         # 17 units = 24 cm wall closed into a band
+    assert room[507, 577] == W                         # column filled
+    assert room[700, 300] == NOT_WALL                  # grid line
