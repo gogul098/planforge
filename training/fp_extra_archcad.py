@@ -384,12 +384,13 @@ def download(work_dir, token, log=print):
     from huggingface_hub import snapshot_download
     d = os.path.join(work_dir, "ArchCAD")
     try:
+        # the repo holds data/{svg,png,json,point,caption}.zip (2.6 GB); only the SVGs (311 MB) are needed
         snapshot_download(HF_REPO, repo_type="dataset", token=token, local_dir=d,
-                          allow_patterns=["*.svg", "*.zip", "*.tar", "*.tar.gz", "*.tgz", "*.json", "*.md"])
+                          allow_patterns=["data/svg.zip", "*.svg", "README.md"])
     except Exception as e:
         raise RuntimeError("ArchCAD download failed ({}: {}). It is a gated dataset: open "
                            "https://huggingface.co/datasets/{} with the account of this HF token and accept the "
-                           "access agreement.".format(type(e).__name__, e, HF_REPO))
+                           "access agreement (approval can take up to 3 business days).".format(type(e).__name__, e, HF_REPO))
     if not find_svgs(d):
         for dp, _, fs in os.walk(d):
             for f in fs:
