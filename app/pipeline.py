@@ -3963,12 +3963,31 @@ def dimension_line_scale(toks, original, img_w):
         med = np.median(sc)
         cands = [c for c in cands if 1 / 1.6 <= c[0] / med <= 1.6]   # drop misreads (wrong number for a line)
         sc = np.array([c[0] for c in cands])
-    agree = [(np.abs(sc / x - 1) < 0.04).sum() for x in sc]
-    i = int(np.argmax(agree))
-    group = sc[np.abs(sc / sc[i] - 1) < 0.04]
+    # each measured line votes with its length: a few pixels of error matter little over a long overall
+    # dimension and a lot over a short chain piece (and overall dimensions are the ones architects check)
+    ln = np.array([float(c[3]) for c in cands])
+    support = [ln[np.abs(sc / x - 1) < 0.04].sum() for x in sc]
+    i = int(np.argmax(support))
+    inn = np.abs(sc / sc[i] - 1) < 0.04
+    group, glen = sc[inn], ln[inn]
     if len(group) < 3:
         return None, len(group), cands
-    return float(np.median(group)), len(group), cands
+    o = np.argsort(group)
+    cw = np.cumsum(glen[o])
+    s_ = float(group[o][np.searchsorted(cw, cw[-1] / 2)])            # length-weighted median
+    # a second strong group that disagrees: the drawing's own dimensions contradict each other
+    rest = ~inn & (np.abs(sc / s_ - 1) > 0.10)
+    if rest.sum() >= 3:
+        sup2 = [ln[rest & (np.abs(sc / x - 1) < 0.04)].sum() if r else 0 for x, r in zip(sc, rest)]
+        j = int(np.argmax(sup2))
+        grp2 = rest & (np.abs(sc / sc[j] - 1) < 0.04)
+        if grp2.sum() >= 3 and ln[grp2].sum() >= 0.3 * glen.sum():
+            used = sorted({c[1] for c, k in zip(cands, inn) if k}, key=lambda t: -float(re.sub(r"[^0-9.]", "", t) or 0))
+            other = sorted({c[1] for c, k in zip(cands, grp2) if k}, key=lambda t: -float(re.sub(r"[^0-9.]", "", t) or 0))
+            print("  CHECK: the drawing's dimensions contradict each other: the {} lines give one scale, the {} "
+                  "lines one {:.0f}% different. Used the first group (longer lines); check the drawing.".format(
+                      "/".join(used[:4]), "/".join(other[:4]), abs(float(np.median(sc[grp2])) / s_ - 1) * 100))
+    return s_, len(group), cands
 
 
 def uniform_sol(v, s, source, report=()):
