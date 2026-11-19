@@ -66,3 +66,19 @@ docker run -p 8080:8080 -e HF_TOKEN=<your token> planforge-engine
 ```
 Health check: http://localhost:8080/api/health. Open the website with `?api=http://localhost:8080`.
 Without `AZURE_STORAGE_CONNECTION_STRING` the engine downloads the models straight from Hugging Face.
+
+## Optional: read the text with the DeepSeek OCR API
+
+By default the text on a plan (dimensions, room sizes, stair notes) is read on the server with RapidOCR.
+To send it to DeepSeek's OCR API instead, add these App Service settings (Configuration → Application settings):
+
+| Setting | Value |
+|---|---|
+| `PLANFORGE_OCR` | `deepseek` |
+| `DEEPSEEK_API_KEY` | your key from platform.deepseek.com (prepaid balance needed) |
+| `PLANFORGE_OCR_TIMEOUT` | optional, seconds per request (default 90) |
+| `PLANFORGE_OCR_TILE_FROM` | optional, longest side in px above which a sheet is sent as tiles (default 2600) |
+
+Cost: $0.225 per 1,000 pages, one page per image or tile. If the API fails or times out, that image is read
+with RapidOCR on the server, so a plan never fails because of the API. The zoomed re-reads around stairs
+(UP / DN) always stay local. Note: plan images are sent to DeepSeek's servers.

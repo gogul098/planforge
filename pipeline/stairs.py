@@ -71,7 +71,7 @@ def _zoom_labels(original, s, x0, y0, x1, y1):
     if big.ndim == 2:
         big = cv2.cvtColor(big, cv2.COLOR_GRAY2BGR)
     out = {"up": [], "dn": []}
-    for t in ocr_tokens(big):
+    for t in ocr_tokens(big, "local"):
         w = _raw(t).strip().upper().rstrip(".")
         pt = ((t["x"] / z + X0) / s, (t["y"] / z + Y0) / s)
         if w == "UP":

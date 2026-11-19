@@ -14,11 +14,103 @@ OCR_OVERLAP = 400        # image it sees (1.6 GB at 4000 px, all at once); text 
 OCR_TILE_FROM = 2600     # longest side above which tiles are used (normal uploads are read in one go)
 
 
+DEEPSEEK_OCR_URL = "https://api.deepseek.com/v1/tools/ocr"
+DEEPSEEK_REF = re.compile(r"<｜ref｜>(.*?)<｜/ref｜>\s*<｜box｜>\s*\[\[([^\]]*)\]\]\s*<｜/box｜>", re.S)
+
+
+def parse_deepseek_ocr(text, W, H):
+    """DeepSeek 'rich_layout_recognition' page text -> RapidOCR-style [(quad, text, conf)].
+    Each block is <｜ref｜>text<｜/ref｜><｜box｜>[[x1, y1, x2, y2]]<｜/box｜>, coordinates 0-1000 of the page.
+    A block holding several lines is split into one box per line (rows of equal height)."""
+    out = []
+    for m in DEEPSEEK_REF.finditer(text or ""):
+        nums = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", m.group(2))[:4]]
+        if len(nums) < 4:
+            continue
+        x1, y1, x2, y2 = nums[0] * W / 1000, nums[1] * H / 1000, nums[2] * W / 1000, nums[3] * H / 1000
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        lines = [ln.strip() for ln in re.sub(r"<[^>]+>", " ", m.group(1)).splitlines() if ln.strip()]
+        if not lines:
+            continue
+        vertical = (y2 - y1) > 1.6 * (x2 - x1) and len(lines) == 1
+        rows = 1 if vertical else len(lines)
+        for i, ln in enumerate(lines if rows > 1 else [" ".join(lines)]):
+            a, b = y1 + (y2 - y1) * i / rows, y1 + (y2 - y1) * (i + 1) / rows
+            out.append(([[x1, a], [x2, a], [x2, b], [x1, b]], ln, 0.9))
+    return out
+
+
+class DeepSeekOCR:
+    """The DeepSeek OCR API behind RapidOCR's call shape: ocr(bgr) -> ([(quad, text, conf)], None).
+    Any failure (no key, network, timeout, error body) reads that image with the local RapidOCR instead,
+    so a plan never fails because the API did."""
+    parallel = 6                                  # tiles of a big sheet are sent at once (account limit: 15)
+
+    def __init__(self, key, fallback, timeout=90, tile_from=OCR_TILE_FROM):
+        self.key, self.fallback, self.timeout, self.tile_from = key, fallback, timeout, tile_from
+        self.calls = self.failures = 0
+
+    def _post(self, png):
+        import json as _json
+        import urllib.request as _rq
+        import uuid as _uuid
+        bnd = "----planforge" + _uuid.uuid4().hex
+        body = ("--{b}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nrich_layout_recognition\r\n"
+                "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"plan.png\"\r\n"
+                "Content-Type: image/png\r\n\r\n").format(b=bnd).encode() + png + "\r\n--{}--\r\n".format(bnd).encode()
+        req = _rq.Request(DEEPSEEK_OCR_URL, data=body, method="POST",
+                          headers={"Authorization": "Bearer " + self.key,
+                                   "Content-Type": "multipart/form-data; boundary=" + bnd})
+        with _rq.urlopen(req, timeout=self.timeout) as r:
+            data = _json.loads(r.read().decode("utf-8").strip())
+        if "error" in data:
+            raise RuntimeError(data["error"].get("message", "OCR error"))
+        return data
+
+    def __call__(self, bgr):
+        import cv2 as _cv2
+        H, W = bgr.shape[:2]
+        self.calls += 1
+        try:
+            ok, png = _cv2.imencode(".png", bgr)
+            data = self._post(png.tobytes())
+            pages = data.get("pages") or []
+            return parse_deepseek_ocr(pages[0].get("text", "") if pages else "", W, H), None
+        except Exception as e:                    # noqa: BLE001 - any API trouble -> read it locally
+            self.failures += 1
+            print("  DeepSeek OCR failed ({}); reading with RapidOCR".format(str(e)[:120]))
+            return self.fallback()(bgr)
+
+
+def _rapid():
+    if not _OCR:                                  # one engine per process: creating it loads three ONNX models
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR.append(RapidOCR())
+    return _OCR[0]
+
+
+def default_ocr():
+    """PLANFORGE_OCR=deepseek (+ DEEPSEEK_API_KEY) sends the plan to the DeepSeek OCR API; anything else, or no
+    key, reads it with RapidOCR on this machine."""
+    import os as _os
+    key = _os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if _os.environ.get("PLANFORGE_OCR", "rapid").strip().lower() == "deepseek" and key:
+        if not _DS:
+            _DS.append(DeepSeekOCR(key, _rapid, float(_os.environ.get("PLANFORGE_OCR_TIMEOUT", "90")),
+                                   int(_os.environ.get("PLANFORGE_OCR_TILE_FROM", OCR_TILE_FROM))))
+        return _DS[0]
+    return _rapid()
+
+
+_DS = []
+
+
 def _ocr_tiled(ocr, bgr):
     """RapidOCR on the whole image, or tile by tile for big sheets. A text found in two tiles is kept from the
     tile whose core (the tile minus half the overlap) holds its centre."""
     H, W = bgr.shape[:2]
-    if max(H, W) <= OCR_TILE_FROM:
+    if max(H, W) <= getattr(ocr, "tile_from", OCR_TILE_FROM):
         res, _ = ocr(np.ascontiguousarray(bgr))
         return list(res or [])
     step = OCR_TILE - OCR_OVERLAP
@@ -28,33 +120,41 @@ def _ocr_tiled(ocr, bgr):
         xs.append(W - OCR_TILE)
     if ys[-1] + OCR_TILE < H:
         ys.append(H - OCR_TILE)
-    out = []
+    jobs = []
     for y0 in ys:
         for x0 in xs:
             tile = np.ascontiguousarray(bgr[y0:y0 + OCR_TILE, x0:x0 + OCR_TILE])
             if tile.min() > 200:                      # blank paper: nothing to read
                 continue
-            res, _ = ocr(tile)
-            h_, w_ = tile.shape[:2]
-            cx0 = x0 + (OCR_OVERLAP / 2 if x0 > 0 else 0)
-            cx1 = x0 + w_ - (OCR_OVERLAP / 2 if x0 + w_ < W else 0)
-            cy0 = y0 + (OCR_OVERLAP / 2 if y0 > 0 else 0)
-            cy1 = y0 + h_ - (OCR_OVERLAP / 2 if y0 + h_ < H else 0)
-            for box, txt, conf in res or []:
-                b = [[float(px) + x0, float(py) + y0] for px, py in box]
-                cx, cy = sum(q[0] for q in b) / 4, sum(q[1] for q in b) / 4
-                if cx0 <= cx < cx1 and cy0 <= cy < cy1:
-                    out.append((b, txt, conf))
+            jobs.append((x0, y0, tile))
+    if getattr(ocr, "parallel", 0) > 1 and len(jobs) > 1:      # a remote reader: send the tiles at once
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(min(ocr.parallel, len(jobs))) as ex:
+            results = list(ex.map(lambda j: ocr(j[2])[0], jobs))
+    else:
+        results = [ocr(j[2])[0] for j in jobs]
+    out = []
+    for (x0, y0, tile), res in zip(jobs, results):
+        h_, w_ = tile.shape[:2]
+        cx0 = x0 + (OCR_OVERLAP / 2 if x0 > 0 else 0)
+        cx1 = x0 + w_ - (OCR_OVERLAP / 2 if x0 + w_ < W else 0)
+        cy0 = y0 + (OCR_OVERLAP / 2 if y0 > 0 else 0)
+        cy1 = y0 + h_ - (OCR_OVERLAP / 2 if y0 + h_ < H else 0)
+        for box, txt, conf in res or []:
+            b = [[float(px) + x0, float(py) + y0] for px, py in box]
+            cx, cy = sum(q[0] for q in b) / 4, sum(q[1] for q in b) / 4
+            if cx0 <= cx < cx1 and cy0 <= cy < cy1:
+                out.append((b, txt, conf))
     return out
 
 
 def ocr_tokens(img_rgb, ocr=None):
-    """Run RapidOCR; split multi-number boxes ('5.00 11.00') into separate tokens with estimated centres."""
-    if ocr is None:                       # one engine per process: creating it loads three ONNX models
-        if not _OCR:
-            from rapidocr_onnxruntime import RapidOCR
-            _OCR.append(RapidOCR())
-        ocr = _OCR[0]
+    """Run the OCR (RapidOCR, or the DeepSeek API when set); split multi-number boxes ('5.00 11.00') into separate
+    tokens with estimated centres."""
+    if ocr is None:
+        ocr = default_ocr()
+    elif ocr == "local":                  # small re-reads (zoomed stair crops) stay on this machine
+        ocr = _rapid()
     res = _ocr_tiled(ocr, img_rgb[:, :, ::-1])
     toks = []
     res = list(res or [])
