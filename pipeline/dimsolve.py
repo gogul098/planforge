@@ -9,6 +9,45 @@ NUM = re.compile(r"\d+(?:[.,]\d+)?")
 _OCR = []
 
 
+OCR_TILE = 1600          # big sheets are read in overlapping tiles: the text detector's memory grows with the
+OCR_OVERLAP = 400        # image it sees (1.6 GB at 4000 px, all at once); text stays at full resolution
+OCR_TILE_FROM = 2600     # longest side above which tiles are used (normal uploads are read in one go)
+
+
+def _ocr_tiled(ocr, bgr):
+    """RapidOCR on the whole image, or tile by tile for big sheets. A text found in two tiles is kept from the
+    tile whose core (the tile minus half the overlap) holds its centre."""
+    H, W = bgr.shape[:2]
+    if max(H, W) <= OCR_TILE_FROM:
+        res, _ = ocr(np.ascontiguousarray(bgr))
+        return list(res or [])
+    step = OCR_TILE - OCR_OVERLAP
+    xs = list(range(0, max(W - OCR_TILE, 0) + 1, step)) or [0]
+    ys = list(range(0, max(H - OCR_TILE, 0) + 1, step)) or [0]
+    if xs[-1] + OCR_TILE < W:
+        xs.append(W - OCR_TILE)
+    if ys[-1] + OCR_TILE < H:
+        ys.append(H - OCR_TILE)
+    out = []
+    for y0 in ys:
+        for x0 in xs:
+            tile = np.ascontiguousarray(bgr[y0:y0 + OCR_TILE, x0:x0 + OCR_TILE])
+            if tile.min() > 200:                      # blank paper: nothing to read
+                continue
+            res, _ = ocr(tile)
+            h_, w_ = tile.shape[:2]
+            cx0 = x0 + (OCR_OVERLAP / 2 if x0 > 0 else 0)
+            cx1 = x0 + w_ - (OCR_OVERLAP / 2 if x0 + w_ < W else 0)
+            cy0 = y0 + (OCR_OVERLAP / 2 if y0 > 0 else 0)
+            cy1 = y0 + h_ - (OCR_OVERLAP / 2 if y0 + h_ < H else 0)
+            for box, txt, conf in res or []:
+                b = [[float(px) + x0, float(py) + y0] for px, py in box]
+                cx, cy = sum(q[0] for q in b) / 4, sum(q[1] for q in b) / 4
+                if cx0 <= cx < cx1 and cy0 <= cy < cy1:
+                    out.append((b, txt, conf))
+    return out
+
+
 def ocr_tokens(img_rgb, ocr=None):
     """Run RapidOCR; split multi-number boxes ('5.00 11.00') into separate tokens with estimated centres."""
     if ocr is None:                       # one engine per process: creating it loads three ONNX models
@@ -16,7 +55,7 @@ def ocr_tokens(img_rgb, ocr=None):
             from rapidocr_onnxruntime import RapidOCR
             _OCR.append(RapidOCR())
         ocr = _OCR[0]
-    res, _ = ocr(img_rgb[:, :, ::-1].copy())
+    res = _ocr_tiled(ocr, img_rgb[:, :, ::-1])
     toks = []
     res = list(res or [])
     used = set()

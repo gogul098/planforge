@@ -115,6 +115,9 @@ def _onnx_session(path):
     so.intra_op_num_threads = max(1, os.cpu_count() or 1)
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.enable_mem_pattern = False                      # inputs change size from plan to plan
+    # no memory pool: ONNX Runtime would keep ~1.2 GB of activation memory after every plan (an Azure B1 has
+    # 1.75 GB in total); without it the memory goes back after each plan, at the same speed
+    so.enable_cpu_mem_arena = False
     return ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
 
 
@@ -231,6 +234,8 @@ def _model_files(repo_name, files, revision=None, recheck=False):
 
 
 _MODEL = {"net": None, "dev": None, "rev": None, "checked": 0.0}
+ORIGINAL_MAX_SIDE = int(os.environ.get("PLANFORGE_ORIGINAL_MAX_SIDE", "4000"))   # OCR reads at most this size too
+LAST_SOURCE_W = None
 MODEL_REVISION = os.environ.get("PLANFORGE_MODEL_REV", "prod")   # HF tag/branch that is live; falls back to main
 MODEL_CHECK_S = float(os.environ.get("PLANFORGE_MODEL_CHECK_S", "0"))  # 0 = check for a new release only at (cold) start
 
@@ -307,14 +312,20 @@ def predict(image_src):
     else:
         img = cv2.imread(image_src, cv2.IMREAD_UNCHANGED)
     assert img is not None, "could not read IMAGE"
+    global LAST_ORIGINAL, LAST_SOURCE_W
+    LAST_SOURCE_W = img.shape[1]              # width of the file as uploaded (DXF scale is per pixel of it)
+    if max(img.shape[:2]) > ORIGINAL_MAX_SIDE:  # huge scans / 300 dpi A1 sheets: 70 MP would need 3-5 GB here
+        k = ORIGINAL_MAX_SIDE / max(img.shape[:2])
+        img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif img.shape[2] == 4:
-        a = img[:, :, 3:4] / 255.0
-        img = (img[:, :, :3] * a + 255 * (1 - a)).astype(np.uint8)
+    elif img.shape[2] == 4:                   # transparent PNG on white, in 16-bit integers (not float64)
+        a = img[:, :, 3:4].astype(np.uint16)
+        img = ((img[:, :, :3].astype(np.uint16) * a + 255 * (255 - a)) // 255).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = cv2.convertScaleAbs(img, alpha=255.0 / max(1, int(img.max())))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    global LAST_ORIGINAL
-    LAST_ORIGINAL = img                       # full-resolution copy for OCR (small text needs it)
+    LAST_ORIGINAL = img                       # full-resolution copy for OCR (small text needs it), <= 4000 px
     s = MAX_SIDE / max(img.shape[:2])
     img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
     h, w = img.shape[:2]
@@ -1228,6 +1239,45 @@ NUM = re.compile(r"\d+(?:[.,]\d+)?")
 _OCR = []
 
 
+OCR_TILE = 1600          # big sheets are read in overlapping tiles: the text detector's memory grows with the
+OCR_OVERLAP = 400        # image it sees (1.6 GB at 4000 px, all at once); text stays at full resolution
+OCR_TILE_FROM = 2600     # longest side above which tiles are used (normal uploads are read in one go)
+
+
+def _ocr_tiled(ocr, bgr):
+    """RapidOCR on the whole image, or tile by tile for big sheets. A text found in two tiles is kept from the
+    tile whose core (the tile minus half the overlap) holds its centre."""
+    H, W = bgr.shape[:2]
+    if max(H, W) <= OCR_TILE_FROM:
+        res, _ = ocr(np.ascontiguousarray(bgr))
+        return list(res or [])
+    step = OCR_TILE - OCR_OVERLAP
+    xs = list(range(0, max(W - OCR_TILE, 0) + 1, step)) or [0]
+    ys = list(range(0, max(H - OCR_TILE, 0) + 1, step)) or [0]
+    if xs[-1] + OCR_TILE < W:
+        xs.append(W - OCR_TILE)
+    if ys[-1] + OCR_TILE < H:
+        ys.append(H - OCR_TILE)
+    out = []
+    for y0 in ys:
+        for x0 in xs:
+            tile = np.ascontiguousarray(bgr[y0:y0 + OCR_TILE, x0:x0 + OCR_TILE])
+            if tile.min() > 200:                      # blank paper: nothing to read
+                continue
+            res, _ = ocr(tile)
+            h_, w_ = tile.shape[:2]
+            cx0 = x0 + (OCR_OVERLAP / 2 if x0 > 0 else 0)
+            cx1 = x0 + w_ - (OCR_OVERLAP / 2 if x0 + w_ < W else 0)
+            cy0 = y0 + (OCR_OVERLAP / 2 if y0 > 0 else 0)
+            cy1 = y0 + h_ - (OCR_OVERLAP / 2 if y0 + h_ < H else 0)
+            for box, txt, conf in res or []:
+                b = [[float(px) + x0, float(py) + y0] for px, py in box]
+                cx, cy = sum(q[0] for q in b) / 4, sum(q[1] for q in b) / 4
+                if cx0 <= cx < cx1 and cy0 <= cy < cy1:
+                    out.append((b, txt, conf))
+    return out
+
+
 def ocr_tokens(img_rgb, ocr=None):
     """Run RapidOCR; split multi-number boxes ('5.00 11.00') into separate tokens with estimated centres."""
     if ocr is None:                       # one engine per process: creating it loads three ONNX models
@@ -1235,7 +1285,7 @@ def ocr_tokens(img_rgb, ocr=None):
             from rapidocr_onnxruntime import RapidOCR
             _OCR.append(RapidOCR())
         ocr = _OCR[0]
-    res, _ = ocr(img_rgb[:, :, ::-1].copy())
+    res = _ocr_tiled(ocr, img_rgb[:, :, ::-1])
     toks = []
     res = list(res or [])
     used = set()
