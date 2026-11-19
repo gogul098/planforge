@@ -90,20 +90,169 @@ def _rapid():
     return _OCR[0]
 
 
+OCRSPACE_URL = "https://api.ocr.space/parse/image"
+OCRSPACE_MAX_BYTES = 1024 * 1024 - 2048      # free key: 1 MB per file (multipart overhead kept aside)
+
+
+def parse_ocrspace(data):
+    """OCR.space JSON (isOverlayRequired) -> RapidOCR-style [(quad, text, conf)].
+    A line is split where the gap between two words is wider than ~1.5 text heights, so two dimensions on one
+    row ('3600      4200') become two texts with their own boxes."""
+    out = []
+    for page in data.get("ParsedResults") or []:
+        for line in ((page.get("TextOverlay") or {}).get("Lines") or []):
+            words = sorted(line.get("Words") or [], key=lambda w: float(w.get("Left", 0)))
+            groups, cur = [], []
+            for w in words:
+                if not str(w.get("WordText", "")).strip():
+                    continue
+                if cur:
+                    p = cur[-1]
+                    gap = float(w["Left"]) - (float(p["Left"]) + float(p["Width"]))
+                    hgt = max(float(p["Height"]), float(w["Height"]), 1.0)
+                    if gap > 1.5 * hgt:
+                        groups.append(cur)
+                        cur = []
+                cur.append(w)
+            if cur:
+                groups.append(cur)
+            for g in groups:
+                x0 = min(float(w["Left"]) for w in g)
+                y0 = min(float(w["Top"]) for w in g)
+                x1 = max(float(w["Left"]) + float(w["Width"]) for w in g)
+                y1 = max(float(w["Top"]) + float(w["Height"]) for w in g)
+                txt = " ".join(str(w["WordText"]).strip() for w in g)
+                out.append(([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], txt, 0.85))
+    return out
+
+
+def _encode_under(bgr, limit):
+    """PNG if it fits, else JPEG at falling quality, else a smaller copy. Returns (bytes, name, factor)."""
+    import cv2 as _cv2
+    ok, buf = _cv2.imencode(".png", bgr, [_cv2.IMWRITE_PNG_COMPRESSION, 9])
+    if ok and len(buf) <= limit:
+        return buf.tobytes(), "plan.png", 1.0
+    gray = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    ok, buf = _cv2.imencode(".png", gray, [_cv2.IMWRITE_PNG_COMPRESSION, 9])
+    if ok and len(buf) <= limit:
+        return buf.tobytes(), "plan.png", 1.0
+    for q in (90, 80, 70, 60):
+        ok, buf = _cv2.imencode(".jpg", gray, [_cv2.IMWRITE_JPEG_QUALITY, q])
+        if ok and len(buf) <= limit:
+            return buf.tobytes(), "plan.jpg", 1.0
+    f = 0.8
+    while f > 0.3:
+        small = _cv2.resize(gray, None, fx=f, fy=f, interpolation=_cv2.INTER_AREA)
+        ok, buf = _cv2.imencode(".jpg", small, [_cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok and len(buf) <= limit:
+            return buf.tobytes(), "plan.jpg", f
+        f *= 0.8
+    raise ValueError("image does not fit the OCR.space size limit")
+
+
+class OCRSpaceOCR:
+    """The free OCR.space API behind RapidOCR's call shape: ocr(bgr) -> ([(quad, text, conf)], None).
+    Engine 2, word boxes on. The image is also read turned 90 degrees, so vertical dimension text is found;
+    those texts are kept only where the upright read found nothing. Any failure (no key, network, daily limit,
+    error reply) reads that image with the local RapidOCR instead."""
+    parallel = 3                                  # free key: 60 requests a minute
+
+    def __init__(self, key, fallback, timeout=60, tile_from=OCR_TILE_FROM, rotated=True, engine="2"):
+        self.key, self.fallback, self.timeout, self.tile_from = key, fallback, timeout, tile_from
+        self.rotated, self.engine = rotated, engine
+        self.calls = self.failures = 0
+
+    def _post(self, payload, name):
+        import json as _json
+        import urllib.request as _rq
+        import uuid as _uuid
+        bnd = "----planforge" + _uuid.uuid4().hex
+        fields = {"apikey": self.key, "OCREngine": self.engine, "isOverlayRequired": "true", "scale": "true",
+                  "detectOrientation": "false", "language": "eng"}
+        body = b"".join("--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n".format(bnd, k, v).encode()
+                        for k, v in fields.items())
+        body += ("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n"
+                 "Content-Type: application/octet-stream\r\n\r\n").format(bnd, name).encode()
+        body += payload + "\r\n--{}--\r\n".format(bnd).encode()
+        req = _rq.Request(OCRSPACE_URL, data=body, method="POST",
+                          headers={"Content-Type": "multipart/form-data; boundary=" + bnd})
+        with _rq.urlopen(req, timeout=self.timeout) as r:
+            raw = r.read().decode("utf-8", "replace").strip()
+        try:
+            data = _json.loads(raw)
+        except ValueError:                        # the daily-limit reply is plain text
+            raise RuntimeError(raw[:160])
+        if not isinstance(data, dict):
+            raise RuntimeError(str(data)[:160])
+        if data.get("IsErroredOnProcessing") or str(data.get("OCRExitCode")) not in ("1", "2"):
+            msg = data.get("ErrorMessage") or data.get("ErrorDetails") or "OCR error"
+            raise RuntimeError(" ".join(msg) if isinstance(msg, list) else str(msg))
+        return data
+
+    def _read(self, bgr):
+        payload, name, f = _encode_under(bgr, OCRSPACE_MAX_BYTES)
+        res = parse_ocrspace(self._post(payload, name))
+        if f != 1.0:
+            res = [([[x / f, y / f] for x, y in q], t, c) for q, t, c in res]
+        return res
+
+    def __call__(self, bgr):
+        H, W = bgr.shape[:2]
+        self.calls += 1
+        try:
+            res = self._read(bgr)
+            if self.rotated:
+                rot = np.ascontiguousarray(np.rot90(bgr, 1))          # counter-clockwise: text read bottom-up
+                taken = [(min(p[0] for p in q), min(p[1] for p in q), max(p[0] for p in q), max(p[1] for p in q))
+                         for q, _, _ in res]
+                for q, t, c in self._read(rot):
+                    # a point (u, v) of the turned image is (W - 1 - v, u) on the page
+                    pts = [[W - 1 - v, u] for u, v in q]
+                    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                    bx = (min(xs), min(ys), max(xs), max(ys))
+                    if (bx[3] - bx[1]) < 1.2 * (bx[2] - bx[0]):           # only texts that run up the page
+                        continue
+                    if any(bx[0] < b[2] and b[0] < bx[2] and bx[1] < b[3] and b[1] < bx[3] for b in taken):
+                        continue
+                    # corners listed so the box reads like RapidOCR's vertical boxes (tall, text bottom-up)
+                    res.append(([[bx[0], bx[1]], [bx[2], bx[1]], [bx[2], bx[3]], [bx[0], bx[3]]], t, c))
+            return res, None
+        except Exception as e:                    # noqa: BLE001 - any API trouble -> read it locally
+            self.failures += 1
+            print("  OCR.space failed ({}); reading with RapidOCR".format(str(e)[:120]))
+            return self.fallback()(bgr)
+
+
 def default_ocr():
-    """PLANFORGE_OCR=deepseek (+ DEEPSEEK_API_KEY) sends the plan to the DeepSeek OCR API; anything else, or no
-    key, reads it with RapidOCR on this machine."""
+    """PLANFORGE_OCR picks who reads the text on a plan:
+         ocrspace  (+ OCRSPACE_API_KEY)  the free OCR.space API
+         deepseek  (+ DEEPSEEK_API_KEY)  the DeepSeek OCR API
+         anything else, or no key        RapidOCR on this machine
+    Remote readers fall back to RapidOCR for any image they fail on."""
     import os as _os
-    key = _os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if _os.environ.get("PLANFORGE_OCR", "rapid").strip().lower() == "deepseek" and key:
-        if not _DS:
-            _DS.append(DeepSeekOCR(key, _rapid, float(_os.environ.get("PLANFORGE_OCR_TIMEOUT", "90")),
-                                   int(_os.environ.get("PLANFORGE_OCR_TILE_FROM", OCR_TILE_FROM))))
-        return _DS[0]
+    which = _os.environ.get("PLANFORGE_OCR", "rapid").strip().lower()
+    tile_from = int(_os.environ.get("PLANFORGE_OCR_TILE_FROM", OCR_TILE_FROM))
+    timeout = float(_os.environ.get("PLANFORGE_OCR_TIMEOUT", "60" if which == "ocrspace" else "90"))
+    if which == "ocrspace":
+        key = _os.environ.get("OCRSPACE_API_KEY", "").strip()
+        if key:
+            if not _REMOTE:
+                _REMOTE.append(OCRSpaceOCR(key, _rapid, timeout, tile_from,
+                                           _os.environ.get("PLANFORGE_OCR_ROTATED", "1") != "0",
+                                           _os.environ.get("PLANFORGE_OCRSPACE_ENGINE", "2")))
+                print("  OCR: OCR.space API (RapidOCR when it fails)")
+            return _REMOTE[0]
+    if which == "deepseek":
+        key = _os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if key:
+            if not _REMOTE:
+                _REMOTE.append(DeepSeekOCR(key, _rapid, timeout, tile_from))
+                print("  OCR: DeepSeek OCR API (RapidOCR when it fails)")
+            return _REMOTE[0]
     return _rapid()
 
 
-_DS = []
+_REMOTE = []
 
 
 def _ocr_tiled(ocr, bgr):
