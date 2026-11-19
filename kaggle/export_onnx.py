@@ -78,6 +78,9 @@ def publish(api, repo, local, path_in_repo, msg):
         api.delete_tag(repo, tag="prod")
         api.create_tag(repo, tag="prod", revision=sha)
         print("  moved tag prod ->", sha[:8])
+    elif os.environ.get("PLANFORGE_CREATE_PROD") == "1" and path_in_repo == "checkpoints/model.onnx":
+        api.create_tag(repo, tag="prod", revision=sha)      # pin the live model: later uploads to main stay offline
+        print("  created tag prod ->", sha[:8])
     print("  published", repo, path_in_repo, "@", sha[:8])
 
 
@@ -87,7 +90,10 @@ if __name__ == "__main__" and not os.environ.get("PF_EXPORT_TEST"):
     me = api.whoami()["name"]
     repo = "{}/{}".format(me, HF_REPO)
     rev = "prod" if "prod" in [t.name for t in api.list_repo_refs(repo).tags] else "main"
-    ck = hf_hub_download(repo, "checkpoints/best.pt", revision=rev, token=token)
+    which = os.environ.get("PLANFORGE_EXPORT_CKPT", "best")       # "best" (highest val score) or "last"
+    ck = hf_hub_download(repo, "checkpoints/{}.pt".format(which), revision="main" if which == "last" else rev,
+                         token=token)
+    print("exporting checkpoints/{}.pt".format(which))
     info = export_floorplan(ck, os.path.join(OUT, "model.onnx"))
     publish(api, repo, os.path.join(OUT, "model.onnx"), "checkpoints/model.onnx", "ONNX export ({})".format(info))
     if FURNITURE_REPO:
