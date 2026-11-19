@@ -82,3 +82,20 @@ To send it to DeepSeek's OCR API instead, add these App Service settings (Config
 Cost: $0.225 per 1,000 pages, one page per image or tile. If the API fails or times out, that image is read
 with RapidOCR on the server, so a plan never fails because of the API. The zoomed re-reads around stairs
 (UP / DN) always stay local. Note: plan images are sent to DeepSeek's servers.
+
+## Optional: read the text with the free OCR.space API
+
+Get a free key at ocr.space/ocrapi (email only, no card; 25,000 requests a month, 500 a day). Then add these
+App Service settings and restart:
+
+| Setting | Value |
+|---|---|
+| `PLANFORGE_OCR` | `ocrspace` |
+| `OCRSPACE_API_KEY` | your free key |
+| `PLANFORGE_OCR_ROTATED` | optional, `0` to skip the second read that finds vertical dimensions (halves requests) |
+| `PLANFORGE_OCRSPACE_ENGINE` | optional, `1` or `2` (default `2`) |
+
+A normal plan uses 2 requests (upright + turned 90 degrees for vertical dimension text), so the free key covers
+about 250 plans a day. Images are kept under the free 1 MB limit (PNG, else JPEG). If a request fails or the
+daily limit is reached, that image is read with RapidOCR on the server. The log shows `OCR.space failed (...)`
+when that happens. Plan images are sent to OCR.space's servers.
