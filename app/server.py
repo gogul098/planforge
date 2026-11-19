@@ -29,6 +29,8 @@ STATUS = {}                      # job -> {"state", "progress", "msg", ...}
 UNIT_M = {0: None, 1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 14: 0.1}   # DXF $INSUNITS -> metres
 OUT_FILES = ("plan.json", "model.ifc", "model.glb", "model_faithful.glb", "preview.png", "build_in_revit.py")
 MAX_UPLOAD = 50 * 2 ** 20                                   # bytes
+PDF_MAX_SIDE = int(os.environ.get("PLANFORGE_PDF_MAX_SIDE", "5000"))  # px of the rendered PDF page (long side)
+MAX_QUEUE = int(os.environ.get("PLANFORGE_MAX_QUEUE", "6"))  # plans waiting or running; more -> "busy, try again"
 JOB_TTL_S = float(os.environ.get("PLANFORGE_JOB_TTL_H", "24")) * 3600   # finished jobs are deleted after this
 
 app = FastAPI(title="PlanForge")
@@ -137,7 +139,9 @@ def load_input(path, ext, dxf_units):
     if ext == ".pdf":
         import pymupdf
         doc = pymupdf.open(path)
-        doc[0].get_pixmap(dpi=300).save(path + ".png")
+        r = doc[0].rect                                   # points (1/72 inch)
+        dpi = max(72, min(300, int(PDF_MAX_SIDE * 72 / max(r.width, r.height, 1))))   # A1 at 300 dpi = 70 MP
+        doc[0].get_pixmap(dpi=dpi).save(path + ".png")
         return path + ".png", None
     if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"):
         return path, None
@@ -206,7 +210,8 @@ def run_job(job, src, ext, opt):
                 else:
                     img, room, icon = P.predict(png)
                 if mpp_src:                                          # DXF: exact scale from the drawing units
-                    P.METERS_PER_PIXEL = mpp_src * P.LAST_ORIGINAL.shape[1] / img.shape[1]
+                    src_w = getattr(P, "LAST_SOURCE_W", None) or P.LAST_ORIGINAL.shape[1]
+                    P.METERS_PER_PIXEL = mpp_src * src_w / img.shape[1]
                 _set(job, progress=0.45, msg="Reading dimensions, solving geometry, furniture")
                 P.main(img, room, icon, original=P.LAST_ORIGINAL)
             plan = json.load(open(os.path.join(out, "plan.json")))
@@ -221,8 +226,17 @@ def run_job(job, src, ext, opt):
                  report=_clean(log.getvalue())[-4000:])
 
 
+def _queue():
+    """Jobs waiting or running, oldest first."""
+    q = [(v.get("queued_at", 0), j) for j, v in STATUS.items() if v.get("state") in ("queued", "running")]
+    return [j for _, j in sorted(q)]
+
+
 @app.post("/api/convert")
 async def convert(file: UploadFile = File(...), options: str = Form("{}")):
+    if len(_queue()) >= MAX_QUEUE:      # one plan at a time: a long queue only ends in timeouts / out of memory
+        raise HTTPException(503, "The engine is busy ({} plans in the queue). Please try again in a minute."
+                            .format(len(_queue())))
     ext = os.path.splitext(file.filename or "")[1].lower()
     job = uuid.uuid4().hex[:12]
     work = os.path.join(JOBS, job)
@@ -241,7 +255,9 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
                 raise HTTPException(413, "File is larger than 50 MB")
             f.write(chunk)
     opt = json.loads(options or "{}")
-    _set(job, state="queued", progress=0.0, msg="Waiting in queue", name=file.filename)
+    ahead = len(_queue())
+    _set(job, state="queued", progress=0.0, queued_at=time.time(), name=file.filename,
+         msg="Waiting in queue ({} plan{} ahead)".format(ahead, "" if ahead == 1 else "s") if ahead else "Starting")
     threading.Thread(target=run_job, args=(job, src, ext, opt), daemon=True).start()
     return {"job": job}
 
@@ -258,6 +274,11 @@ def status(job: str, wait: float = 0):
             STATUS[job].update(state="error", msg="Server restarted during conversion: please convert again")
     if job not in STATUS:
         raise HTTPException(404, "unknown job")
+    if STATUS[job].get("state") == "queued":                # tell the user where they are in the queue
+        q = _queue()
+        ahead = q.index(job) if job in q else 0
+        if ahead:
+            STATUS[job]["msg"] = "Waiting in queue ({} plan{} ahead)".format(ahead, "" if ahead == 1 else "s")
     before = json.dumps(STATUS[job], sort_keys=True, default=str)
     end = time.time() + min(max(wait, 0), 25)
     while time.time() < end and STATUS[job].get("state") not in ("done", "error"):
