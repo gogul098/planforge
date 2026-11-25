@@ -31,7 +31,8 @@ def hf_token():
 def export_floorplan(ckpt_path, out_path):
     """The multitask U-Net -> ONNX with free height/width (any multiple of 32)."""
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
+    n_out = int(ck.get("n_out") or ck["ema"]["segmentation_head.0.weight"].shape[0])   # 27 (v1) or 32 (v2 heads)
+    net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=n_out,
                    decoder_attention_type="scse")
     net.load_state_dict(ck["ema"])
     net.eval()
@@ -43,7 +44,7 @@ def export_floorplan(ckpt_path, out_path):
     info = "epoch {}, val score {:.3f}".format(ck.get("epoch", -1) + 1, ck.get("metrics", {}).get("score", float("nan")))
     meta = {"info": info, "encoder": ck.get("encoder", "tu-efficientnet_b3"),
             # trained on plans turned by 30 / 45 / 60 degrees: the engine then reads each plan once
-            "rotation_trained": "1" if ck.get("rotation_trained") else "0"}
+            "rotation_trained": "1" if ck.get("rotation_trained") else "0", "n_out": str(n_out)}
     for k, v in meta.items():
         e = m.metadata_props.add(); e.key, e.value = k, v
     onnx.save(m, out_path)

@@ -22,8 +22,20 @@ ICON_CLASSES = ["NoIcon", "Window", "Door", "Closet", "ElectricalAppliance", "To
 # Junction heatmaps (orientation-free so flips/rotations stay valid)
 HEAT_CLASSES = ["WallJunction", "OpeningEndpoint", "IconCorner"]
 
+# v2 heads (appended after the heatmaps, so channels 0-26 keep their meaning and older engines still read them)
+#   wall type: on wall pixels only. Learned from every source that labels the outside (rooms + background):
+#              a wall the outside touches is exterior. Unknown (IGNORE) elsewhere and for stroke-only sources.
+#   level:     on floor pixels only. CubiCasa5K marks raised floor ("Elevated") and voids over a lower floor
+#              ("OpenToBelow"); Structured3D floors are all normal. Unknown for the other sources.
+WALLTYPE_CLASSES = ["Interior", "Exterior"]
+LEVEL_CLASSES = ["Normal", "Raised", "OpenToBelow"]
+
 N_ROOM, N_ICON, N_HEAT = len(ROOM_CLASSES), len(ICON_CLASSES), len(HEAT_CLASSES)
-N_OUT = N_ROOM + N_ICON + N_HEAT
+N_WT, N_LV = len(WALLTYPE_CLASSES), len(LEVEL_CLASSES)
+N_BASE = N_ROOM + N_ICON + N_HEAT           # 27: the v1 model
+N_OUT = N_BASE + N_WT + N_LV                # 32
+# sources whose room labels include the outside (background / outdoor), so wall types can be derived
+WALLTYPE_SOURCES = {"cubicasa", "resplan", "synthetic", "structured3d"}
 IGNORE = 255
 NOT_WALL = 254       # room target: "known not wall, room type unknown" (sources that only label walls)
 # Rotation augmentation: plans with angled wings mostly use these angles; any angle is also trained
@@ -78,7 +90,8 @@ class CachedFloorplans(torch.utils.data.Dataset):
         return self.items[i].get("source", "cubicasa")
 
     def _load(self, i):
-        sid = self.items[i]["id"]
+        it = self.items[i]
+        sid = it["id"]
         img = cv2.imread(os.path.join(self.root, sid + "_img.png"), cv2.IMREAD_COLOR)
         lbl = cv2.imread(os.path.join(self.root, sid + "_lbl.png"), cv2.IMREAD_UNCHANGED)
         if img is None or lbl is None:
@@ -87,59 +100,61 @@ class CachedFloorplans(torch.utils.data.Dataset):
         pp = os.path.join(self.root, sid + "_pts.npy")
         # sources without junction labels have no _pts file: their heat target is "unknown", not "none"
         pts = np.load(pp).astype(np.float32).reshape(-1, 3) if os.path.exists(pp) else None
-        return img, lbl[:, :, 0].copy(), lbl[:, :, 1].copy(), pts
+        room, icon = lbl[:, :, 0].copy(), lbl[:, :, 1].copy()
+        # third label channel = floor level classes, only for entries written with it (index flag "level")
+        level = lbl[:, :, 2].copy() if it.get("level") else np.full(room.shape, IGNORE, np.uint8)
+        wtype = wall_type_labels(room) if it.get("source", "cubicasa") in WALLTYPE_SOURCES \
+            else np.full(room.shape, IGNORE, np.uint8)
+        return img, [room, icon, wtype, level], pts
 
     def __getitem__(self, i):
-        img, room, icon, pts = self._load(i)
+        img, maps, pts = self._load(i)
         has_heat = pts is not None
         if pts is None:
             pts = np.zeros((0, 3), np.float32)
         if self.train:
-            img, room, icon, pts = self._augment(img, room, icon, pts)
+            img, maps, pts = self._augment(img, maps, pts)
         elif self.fixed_angle is not None:
-            img, room, icon, pts = self._rotate_whole(img, room, icon, pts, self.fixed_angle)
-            img, room, icon = self._pad32(img, room, icon)
+            img, maps, pts = self._rotate_whole(img, maps, pts, self.fixed_angle)
+            img, maps = self._pad32(img, maps)
         else:
-            img, room, icon = self._pad32(img, room, icon)
-        h, w = room.shape
+            img, maps = self._pad32(img, maps)
+        h, w = maps[0].shape
         heat = render_heatmaps(pts, h, w, self.sigma) if has_heat else np.full((N_HEAT, h, w), -1.0, np.float32)
         x = (img.astype(np.float32) - MEAN) / STD
-        return (torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))),
-                torch.from_numpy(np.ascontiguousarray(room)).long(),
-                torch.from_numpy(np.ascontiguousarray(icon)).long(),
-                torch.from_numpy(heat))
+        t = [torch.from_numpy(np.ascontiguousarray(m)).long() for m in maps]
+        return (torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), t[0], t[1],
+                torch.from_numpy(heat), t[2], t[3])
 
     @staticmethod
-    def _pad32(img, room, icon):
-        h, w = room.shape
+    def _pad32(img, maps):
+        h, w = maps[0].shape
         ph, pw = (32 - h % 32) % 32, (32 - w % 32) % 32
         if ph or pw:
             img = cv2.copyMakeBorder(img, 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-            room = cv2.copyMakeBorder(room, 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=IGNORE)
-            icon = cv2.copyMakeBorder(icon, 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=IGNORE)
-        return img, room, icon
+            maps = [cv2.copyMakeBorder(m, 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=IGNORE) for m in maps]
+        return img, maps
 
     @staticmethod
-    def _rotate_whole(img, room, icon, pts, angle):
+    def _rotate_whole(img, maps, pts, angle):
         """Rotate a whole plan by `angle` degrees on a canvas that fits it (evaluation on rotated plans)."""
-        h, w = room.shape
+        h, w = maps[0].shape
         M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
         c, s_ = abs(M[0, 0]), abs(M[0, 1])
         W2, H2 = int(math.ceil(h * s_ + w * c)), int(math.ceil(h * c + w * s_))
         M[0, 2] += W2 / 2 - w / 2
         M[1, 2] += H2 / 2 - h / 2
         img = cv2.warpAffine(img, M, (W2, H2), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
-        room = cv2.warpAffine(room, M, (W2, H2), flags=cv2.INTER_NEAREST, borderValue=IGNORE)
-        icon = cv2.warpAffine(icon, M, (W2, H2), flags=cv2.INTER_NEAREST, borderValue=IGNORE)
+        maps = [cv2.warpAffine(m, M, (W2, H2), flags=cv2.INTER_NEAREST, borderValue=IGNORE) for m in maps]
         if len(pts):
             pts = pts.copy()
             xy = pts[:, :2] @ M[:, :2].T + M[:, 2]
             pts[:, 0], pts[:, 1] = xy[:, 0], xy[:, 1]
-        return img, room, icon, pts
+        return img, maps, pts
 
-    def _augment(self, img, room, icon, pts):
+    def _augment(self, img, maps, pts):
         S = self.crop
-        h, w = room.shape
+        h, w = maps[0].shape
         lo, hi = self.scale_range
         s = math.exp(random.uniform(math.log(lo), math.log(hi)))
         src = S / s  # crop size in source pixels
@@ -156,10 +171,8 @@ class CachedFloorplans(torch.utils.data.Dataset):
         interp = cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR
         img = cv2.warpAffine(img, M, (S, S), flags=interp, borderMode=cv2.BORDER_CONSTANT,
                              borderValue=(255, 255, 255))
-        room = cv2.warpAffine(room, M, (S, S), flags=cv2.INTER_NEAREST,
-                              borderMode=cv2.BORDER_CONSTANT, borderValue=IGNORE)
-        icon = cv2.warpAffine(icon, M, (S, S), flags=cv2.INTER_NEAREST,
-                              borderMode=cv2.BORDER_CONSTANT, borderValue=IGNORE)
+        maps = [cv2.warpAffine(m, M, (S, S), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT,
+                               borderValue=IGNORE) for m in maps]
         if len(pts):
             pts = pts.copy()
             xy = pts[:, :2] @ M[:, :2].T + M[:, 2]
@@ -167,11 +180,11 @@ class CachedFloorplans(torch.utils.data.Dataset):
         # rotations / flips (all heads are orientation-free, so labels stay valid)
         k = random.randint(0, 3)
         for _ in range(k):  # 90 deg counter-clockwise
-            img, room, icon = np.rot90(img), np.rot90(room), np.rot90(icon)
+            img, maps = np.rot90(img), [np.rot90(m) for m in maps]
             if len(pts):
                 pts[:, 0], pts[:, 1] = pts[:, 1].copy(), (S - 1) - pts[:, 0]
         if random.random() < 0.5:
-            img, room, icon = img[:, ::-1], room[:, ::-1], icon[:, ::-1]
+            img, maps = img[:, ::-1], [m[:, ::-1] for m in maps]
             if len(pts):
                 pts[:, 0] = (S - 1) - pts[:, 0]
         img = np.ascontiguousarray(img).astype(np.float32)
@@ -186,7 +199,33 @@ class CachedFloorplans(torch.utils.data.Dataset):
         if random.random() < 0.25:
             img = img + np.random.normal(0, random.uniform(2, 8), img.shape).astype(np.float32)
         img = np.clip(img, 0, 255).astype(np.uint8)
-        return img, np.ascontiguousarray(room), np.ascontiguousarray(icon), pts
+        return img, [np.ascontiguousarray(m) for m in maps], pts
+
+
+def wall_type_labels(room):
+    """Wall pixels -> 0 interior / 1 exterior; IGNORE off walls. A wall is exterior where the outside (background
+    connected to the page edge, or an outdoor area) lies within about one wall thickness of it."""
+    WALL, BG, OUT = ROOM_CLASSES.index("Wall"), ROOM_CLASSES.index("Background"), ROOM_CLASSES.index("Outdoor")
+    out = np.full(room.shape, IGNORE, np.uint8)
+    wall = room == WALL
+    if not wall.any():
+        return out
+    bg = (room == BG).astype(np.uint8)
+    n, cc = cv2.connectedComponents(bg, connectivity=4)
+    edge = np.unique(np.concatenate([cc[0], cc[-1], cc[:, 0], cc[:, -1]]))
+    outside = np.isin(cc, edge[edge > 0]) | (room == OUT)
+    if not outside.any():
+        out[wall] = IGNORE                       # a crop with no outside in it: no way to tell
+        return out
+    # local wall thickness at each pixel (twice the largest inscribed radius nearby) vs distance to the outside
+    dt = cv2.distanceTransform(wall.astype(np.uint8), cv2.DIST_L2, 3)
+    k = max(3, int(2 * np.percentile(dt[wall], 95)) * 2 + 1)
+    thick = 2.0 * cv2.dilate(dt, np.ones((k, k), np.uint8))
+    d_out = cv2.distanceTransform((~outside).astype(np.uint8), cv2.DIST_L2, 3)
+    near = d_out <= thick + 1.5
+    out[wall] = 0
+    out[wall & near] = 1
+    return out
 
 
 # ----------------------------------------------------------------------------- model
@@ -197,7 +236,7 @@ def build_model(encoder="tu-efficientnet_b3", weights="imagenet"):
     # focal-loss prior for heatmap logits (CenterNet init)
     head = [m for m in model.segmentation_head.modules() if isinstance(m, nn.Conv2d)][-1]
     with torch.no_grad():
-        head.bias[N_ROOM + N_ICON:].fill_(-2.19)
+        head.bias[N_ROOM + N_ICON:N_BASE].fill_(-2.19)
     # Some smp decoder blocks own parameters that never get gradients (e.g. the attention on
     # the missing skip of the last block). DDP aborts on those, so detect + freeze them.
     saved = {k: v.clone() for k, v in model.state_dict().items()}  # keep BN stats untouched
@@ -212,7 +251,27 @@ def build_model(encoder="tu-efficientnet_b3", weights="imagenet"):
 
 
 def split_logits(out):
-    return out[:, :N_ROOM], out[:, N_ROOM:N_ROOM + N_ICON], out[:, N_ROOM + N_ICON:]
+    return out[:, :N_ROOM], out[:, N_ROOM:N_ROOM + N_ICON], out[:, N_ROOM + N_ICON:N_BASE]
+
+
+def split_aux(out):
+    """v2 heads: (wall type logits, level logits)."""
+    return out[:, N_BASE:N_BASE + N_WT], out[:, N_BASE + N_WT:N_BASE + N_WT + N_LV]
+
+
+def expand_head(state, model):
+    """Weights of a model with fewer output channels (the 27-channel v1 model) -> this model's state dict:
+    every layer copied, the segmentation head's first channels copied and the new channels left as initialised.
+    Returns (state dict, number of channels copied) or (state, None) when nothing needed changing."""
+    own = model.state_dict()
+    out, grown = dict(state), None
+    for k, v in state.items():
+        if k in own and own[k].shape != v.shape and k.startswith("segmentation_head") and \
+                own[k].shape[1:] == v.shape[1:] and own[k].shape[0] > v.shape[0]:
+            w = own[k].clone()
+            w[:v.shape[0]] = v
+            out[k], grown = w, int(v.shape[0])
+    return out, grown
 
 
 # ----------------------------------------------------------------------------- losses
@@ -255,11 +314,11 @@ def heat_focal(logits, gt, alpha=2.0, beta=4.0):
 
 
 class MultiTaskLoss(nn.Module):
-    def __init__(self, w_room=1.0, w_icon=1.0, w_heat=1.0):
+    def __init__(self, w_room=1.0, w_icon=1.0, w_heat=1.0, w_wtype=0.5, w_level=0.5):
         super().__init__()
-        self.w = (w_room, w_icon, w_heat)
+        self.w = (w_room, w_icon, w_heat, w_wtype, w_level)
 
-    def forward(self, out, room, icon, heat):
+    def forward(self, out, room, icon, heat, wtype=None, level=None):
         r, i, h = [t.float() for t in split_logits(out)]
         not_wall = room == NOT_WALL
         room = torch.where(not_wall, torch.full_like(room, IGNORE), room)
@@ -270,7 +329,14 @@ class MultiTaskLoss(nn.Module):
         l_icon = focal_ce(i, icon) + dice_loss(i, icon, N_ICON)
         l_heat = heat_focal(h, heat)
         total = self.w[0] * l_room + self.w[1] * l_icon + self.w[2] * l_heat
-        return total, {"room": l_room.detach(), "icon": l_icon.detach(), "heat": l_heat.detach()}
+        parts = {"room": l_room.detach(), "icon": l_icon.detach(), "heat": l_heat.detach()}
+        if out.shape[1] >= N_OUT and wtype is not None:
+            wt, lv = [t.float() for t in split_aux(out)]
+            l_wt = focal_ce(wt, wtype)              # 0 when the batch has no labelled wall (IGNORE everywhere)
+            l_lv = focal_ce(lv, level) + (dice_loss(lv, level, N_LV) if (level != IGNORE).any() else lv.sum() * 0)
+            total = total + self.w[3] * l_wt + self.w[4] * l_lv
+            parts.update(wtype=l_wt.detach(), level=l_lv.detach())
+        return total, parts
 
 
 # ----------------------------------------------------------------------------- metrics

@@ -43,8 +43,13 @@ SEED      = 42
 
 # ---- data beyond CubiCasa5K + rotation (v2). The first run renders / converts them once (~20-30 min) and
 # stores them in the HF dataset repo; later runs restore them in minutes.
-DATA_VERSION  = "v3"          # changing this starts a new run FROM the current model's weights
-EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad", "archcad"]   # remove any you do not want
+DATA_VERSION  = "v4"          # changing this starts a new run FROM the current model's weights
+# v4 adds two heads (wall type: interior / exterior; floor level: normal / raised / open to below), the CubiCasa5K
+# level labels (its cache is rebuilt once, ~30 min) and Structured3D.
+EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad", "archcad", "structured3d"]   # remove any you do not want
+# Structured3D (3,500 apartments, real wall thickness): NON-COMMERCIAL, may NOT be redistributed. Upload
+# Structured3D_annotation_3d.zip to a PRIVATE Kaggle dataset and attach it to this notebook (Add Input).
+# It is converted in every run (~10 min) and never uploaded to Hugging Face. Not attached = skipped.
 # ArchCAD-400K: real CAD drawings (schools, offices, public buildings); teaches columns, glass, and that axis lines,
 # beams and text are NOT walls. Gated on Hugging Face: open https://huggingface.co/datasets/jackluoluo/ArchCAD
 # with the account of HF_TOKEN and accept the access agreement once. Licence CC BY-NC 4.0 (non-commercial).
@@ -52,7 +57,9 @@ EXTRA_SOURCES = ["resplan", "synthetic", "floorplancad", "archcad"]   # remove a
 ARCHCAD_LIMIT = None          # None = all public slices (~40K); e.g. 15000 for a faster first build
 N_SYNTHETIC   = 3000          # synthetic angled buildings (wings at 30 / 45 / 60 degrees, curved fronts)
 FPCAD_DOORS   = False         # FloorPlanCAD door openings rebuilt from strokes are ~75% right: off by default
-SOURCE_WEIGHTS = {"cubicasa": 0.35, "resplan": 0.20, "synthetic": 0.15, "floorplancad": 0.12, "archcad": 0.18}
+SOURCE_WEIGHTS = {"cubicasa": 0.32, "resplan": 0.17, "synthetic": 0.12, "floorplancad": 0.11, "archcad": 0.16,
+                  "structured3d": 0.12}
+LOSS_WEIGHTS  = [1.0, 1.0, 1.0, 0.5, 0.5]   # room, icon, junctions, wall type, floor level
 ROT_PROB      = 0.6           # share of crops turned by 30 / 45 / 60 degrees (+-3) or any angle
 SCALE_RANGE   = [0.6, 1.8]    # zoom range of training crops
 
@@ -66,10 +73,10 @@ print("config ok")''')
 code('''!pip install -q "segmentation-models-pytorch==0.6.0" "timm==1.0.31" "huggingface_hub>=0.25" svgpathtools shapely 2>&1 | grep -v "already satisfied" | tail -3
 !pip install -q hf_xet 2>&1 | tail -1 || true''')
 
-for fn in ["fp_common.py", "fp_prep.py", "fp_render.py", "fp_extra_fpcad.py", "fp_extra_archcad.py", "train.py",
-           "viz.py", "ddp_check.py"]:
+for fn in ["fp_common.py", "fp_prep.py", "fp_render.py", "fp_extra_fpcad.py", "fp_extra_archcad.py",
+           "fp_extra_s3d.py", "s3d/s3d_convert.py", "s3d/s3d_pairs.py", "train.py", "viz.py", "ddp_check.py"]:
     body = open(SRC + fn).read()
-    code(f"%%writefile {{SRC_DIR}}/{fn}\n".replace("{SRC_DIR}", "/kaggle/working/fp_src") + body)
+    code(f"%%writefile {{SRC_DIR}}/{os.path.basename(fn)}\n".replace("{SRC_DIR}", "/kaggle/working/fp_src") + body)
 
 code('''# ===================== SANITY CHECKS (fail fast, clear messages) =====================
 import urllib.request
@@ -184,6 +191,10 @@ if "archcad" in EXTRA_SOURCES:
                                         ARCHCAD_LIMIT, FPCAD_DOORS, archcad_token=ARCHCAD_TOKEN)
     except Exception as e:
         print(f"WARNING: ArchCAD skipped ({type(e).__name__}: {e}); training continues without it.")
+if "structured3d" in EXTRA_SOURCES:
+    import fp_extra_s3d
+    got = fp_extra_s3d.prepare_s3d(CACHE_DIR, MAX_SIDE, log=print)
+    index = got or index
 import collections
 for split in ("train", "val"):
     print(split, dict(collections.Counter(it.get("source", "cubicasa") for it in index[split])))
@@ -230,7 +241,7 @@ cfg = {"cache_root": CACHE_DIR, "ckpt_dir": CKPT_DIR, "encoder": ENCODER, "crop"
        "max_side": MAX_SIDE, "sigma": SIGMA, "batch_per_gpu": 4, "workers": max(2, min(4, cpus // 2)),
        "lr": LR, "encoder_lr_mult": 0.5, "weight_decay": 1e-2, "warmup_epochs": 1,
        "max_epochs": MAX_EPOCHS, "force_total_epochs": force_total, "ema_decay": 0.999,
-       "grad_clip": 1.0, "loss_weights": [1.0, 1.0, 1.0], "val_every": 1, "log_every": 50,
+       "grad_clip": 1.0, "loss_weights": LOSS_WEIGHTS, "val_every": 1, "log_every": 50,
        "seed": SEED, "final_margin_s": 900, "probe_batches": [8, 6, 5, 4, 3, 2],
        "deadline_ts": NOTEBOOK_START + TIME_BUDGET_HOURS * 3600, "hf_repo": MODEL_REPO,
        "data_version": DATA_VERSION, "source_weights": SOURCE_WEIGHTS, "rot_prob": ROT_PROB,

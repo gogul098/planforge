@@ -24,7 +24,7 @@ import numpy as np
 
 ZENODO_URL = "https://zenodo.org/records/2613548/files/cubicasa5k.zip?download=1"
 ZENODO_MD5 = "0ce0b203d1e3c125b51087b219bd23b9"
-CACHE_VERSION = "v1"
+CACHE_VERSION = "v2"          # v2: third label channel = floor level (normal / raised / open to below)
 
 _PARSER_DIR = None
 
@@ -179,6 +179,39 @@ def _parse_stairs(svg_path, shape, icons):
     return n
 
 
+LEVEL_OF = {"Elevated": 1, "OpenToBelow": 2}
+
+
+def _parse_levels(svg_path, shape):
+    """Floor level classes from the room polygons: every room 0 (normal), "Space Elevated" 1 (raised floor),
+    "Space OpenToBelow" 2 (void over the floor below); off the rooms (walls, outside) unknown (255).
+    Returns (level map, number of raised / open-to-below rooms)."""
+    from xml.dom import minidom
+    from svg_utils import get_polygon
+    h, w = shape
+    level = np.full((h, w), 255, np.uint8)
+    special, n = [], 0
+    for g in minidom.parse(svg_path).getElementsByTagName("g"):
+        cls = g.getAttribute("class")
+        if not cls.startswith("Space "):
+            continue
+        name = cls.replace("Space ", "").split(" ")[0]
+        try:
+            rr, cc = get_polygon(g)
+        except Exception:
+            continue
+        keep = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        rr, cc = rr[keep], cc[keep]
+        if name in LEVEL_OF:
+            special.append((rr, cc, LEVEL_OF[name]))
+        else:
+            level[rr, cc] = 0
+    for rr, cc, v in special:                   # painted last: a raised area inside a room keeps its class
+        level[rr, cc] = v
+        n += 1
+    return level, n
+
+
 def _heat_group(ch):
     return 0 if ch <= 12 else (1 if ch <= 16 else 2)
 
@@ -202,6 +235,8 @@ def process_one(args):
         room = house.walls.astype(np.uint8)
         icon = house.icons.astype(np.uint8)
         n_stairs = _parse_stairs(os.path.join(d, "model.svg"), (h, w), icon)
+        level, n_level = _parse_levels(os.path.join(d, "model.svg"), (h, w))
+        level[room == 2] = 255                                 # walls are not floor
         pts = []
         for ch, plist in house.get_heatmap_dict().items():
             g = _heat_group(int(ch))
@@ -214,13 +249,15 @@ def process_one(args):
             img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
             room = cv2.resize(room, (nw, nh), interpolation=cv2.INTER_NEAREST)
             icon = cv2.resize(icon, (nw, nh), interpolation=cv2.INTER_NEAREST)
+            level = cv2.resize(level, (nw, nh), interpolation=cv2.INTER_NEAREST)
             pts[:, :2] *= s
             h, w = nh, nw
         cv2.imwrite(os.path.join(out_dir, sid + "_img.png"), img)  # BGR on disk
-        lbl = np.dstack([room, icon, np.zeros_like(room)])
+        lbl = np.dstack([room, icon, level])
         cv2.imwrite(os.path.join(out_dir, sid + "_lbl.png"), lbl)
         np.save(os.path.join(out_dir, sid + "_pts.npy"), pts)
-        return {"id": sid, "h": h, "w": w, "n_pts": int(len(pts)), "stairs": n_stairs}
+        return {"id": sid, "h": h, "w": w, "n_pts": int(len(pts)), "stairs": n_stairs, "level": True,
+                "levels": n_level}
     except Exception as e:
         return {"id": sid, "error": f"{type(e).__name__}: {e}",
                 "tb": traceback.format_exc(limit=3)}
@@ -230,7 +267,7 @@ def build_cache(raw_root, cache_root, parser_dir, max_side, workers=None):
     out_dir = os.path.join(cache_root, "data")
     os.makedirs(out_dir, exist_ok=True)
     workers = workers or os.cpu_count() or 2
-    index, failures, stairs_total = {}, [], 0
+    index, failures, stairs_total, level_total = {}, [], 0, 0
     for split in ("train", "val", "test"):
         folders = [l.strip() for l in open(os.path.join(raw_root, f"{split}.txt")) if l.strip()]
         log(f"Parsing {split}: {len(folders)} floorplans with {workers} workers ...")
@@ -243,6 +280,7 @@ def build_cache(raw_root, cache_root, parser_dir, max_side, workers=None):
                 else:
                     items.append(r)
                     stairs_total += r["stairs"]
+                    level_total += r.get("levels", 0)
                 if k % 100 == 0 or k == len(jobs):
                     el = time.time() - t0
                     log(f"  parsing {split}: {k}/{len(jobs)} ({100 * k / len(jobs):.0f}%)  "
@@ -250,7 +288,8 @@ def build_cache(raw_root, cache_root, parser_dir, max_side, workers=None):
         items.sort(key=lambda r: r["id"])
         index[split] = items
     n_total = sum(len(v) for v in index.values()) + len(failures)
-    log(f"Done. ok={n_total - len(failures)} failed={len(failures)} stair polygons={stairs_total}")
+    log(f"Done. ok={n_total - len(failures)} failed={len(failures)} stair polygons={stairs_total} "
+        f"raised / open-to-below rooms={level_total}")
     for f in failures[:5]:
         log("  failure:", f["id"], f["error"])
     if len(failures) > 0.05 * n_total:
@@ -370,7 +409,8 @@ def prepare_extra(cache_root, work_dir, max_side, api, dataset_repo, token,
     """Add ResPlan, synthetic angled plans and FloorPlanCAD to the cache (after prepare_data).
     Restored from the HF dataset repo when an earlier run already built them."""
     from huggingface_hub import hf_hub_download
-    sources = sorted(s_ for s_ in sources if s_ != "archcad")    # ArchCAD has its own cache: prepare_archcad
+    # ArchCAD has its own cache (prepare_archcad); Structured3D is rebuilt every run, never uploaded (fp_extra_s3d)
+    sources = sorted(s_ for s_ in sources if s_ not in ("archcad", "structured3d"))
     name = extra_name(max_side, sources)
     data_dir = os.path.join(cache_root, "data")
     listing = os.path.join(cache_root, "extra_index.json")
