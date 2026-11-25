@@ -18,8 +18,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from fp_common import (CachedFloorplans, SourceWeightedSampler, MultiTaskLoss, EMA, build_model, split_logits,
-                       update_confusion, iou_from_confusion, ROOM_CLASSES, ICON_CLASSES,
-                       N_ROOM, N_ICON)
+                       split_aux, expand_head, update_confusion, iou_from_confusion, ROOM_CLASSES, ICON_CLASSES,
+                       LEVEL_CLASSES, N_ROOM, N_ICON, N_WT, N_LV, N_OUT, IGNORE)
 
 
 def log(*a):
@@ -102,12 +102,15 @@ def atomic_save(obj, path):
 
 def signature(cfg):
     return {k: cfg[k] for k in ("encoder", "crop", "max_side", "sigma")} | {
-        "n_room": N_ROOM, "n_icon": N_ICON, "data_version": cfg.get("data_version", "v1")}
+        "n_room": N_ROOM, "n_icon": N_ICON, "n_out": N_OUT, "data_version": cfg.get("data_version", "v1")}
 
 
 def _same_arch(a, b):
-    return {k: v for k, v in (a or {}).items() if k != "data_version"} == \
-           {k: v for k, v in (b or {}).items() if k != "data_version"}
+    """Same network apart from the training data or extra output channels (v1 -> v2 heads): a new run can start
+    from the old weights (the head grows, see fp_common.expand_head)."""
+    skip = ("data_version", "n_out")
+    return {k: v for k, v in (a or {}).items() if k not in skip} == \
+           {k: v for k, v in (b or {}).items() if k not in skip}
 
 
 def make_optimizer(model, cfg):
@@ -141,9 +144,11 @@ def probe(cfg):
                 room = torch.randint(0, N_ROOM, (bs, cfg["crop"], cfg["crop"]), device=dev)
                 icon = torch.randint(0, N_ICON, (bs, cfg["crop"], cfg["crop"]), device=dev)
                 heat = torch.rand(bs, 3, cfg["crop"], cfg["crop"], device=dev)
+                wt = torch.randint(0, N_WT, (bs, cfg["crop"], cfg["crop"]), device=dev)
+                lv = torch.randint(0, N_LV, (bs, cfg["crop"], cfg["crop"]), device=dev)
                 with torch.autocast("cuda", dtype=torch.float16):
                     out = model(x)
-                loss, _ = crit(out, room, icon, heat)
+                loss, _ = crit(out, room, icon, heat, wt, lv)
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
@@ -174,23 +179,35 @@ def validate(net, ds, rank, world, dev):
     loader = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, idx), batch_size=1,
                                          shuffle=False, num_workers=2,
                                          pin_memory=dev.type == "cuda")
-    for x, room, icon, _ in loader:
+    cm_w = torch.zeros(N_WT, N_WT, dtype=torch.long, device=dev)
+    cm_l = torch.zeros(N_LV, N_LV, dtype=torch.long, device=dev)
+    for x, room, icon, _, wt, lv in loader:
         x, room, icon = x.to(dev, non_blocking=True), room.to(dev), icon.to(dev)
         with torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
             out = net(x)
         r, i, _h = split_logits(out.float())
         update_confusion(cm_r, r.argmax(1), room, N_ROOM)
         update_confusion(cm_i, i.argmax(1), icon, N_ICON)
+        if out.shape[1] >= N_OUT:
+            w_, l_ = split_aux(out.float())
+            update_confusion(cm_w, w_.argmax(1), wt.to(dev), N_WT)
+            update_confusion(cm_l, l_.argmax(1), lv.to(dev), N_LV)
     if world > 1:
-        dist.all_reduce(cm_r)
-        dist.all_reduce(cm_i)
+        for cm in (cm_r, cm_i, cm_w, cm_l):
+            dist.all_reduce(cm)
     torch.backends.cudnn.benchmark = bench
     iou_r, iou_i = iou_from_confusion(cm_r).cpu(), iou_from_confusion(cm_i).cpu()
     acc_r = (cm_r.diag().sum() / cm_r.sum().clamp(min=1)).item()
     miou_r = float(np.nanmean(iou_r.numpy()))
     miou_i = float(np.nanmean(iou_i.numpy()))
+    # v2 heads: reported, not part of the score (so "best" stays comparable with earlier runs)
+    wt_acc = (cm_w.diag().sum() / cm_w.sum()).item() if cm_w.sum() > 0 else float("nan")
+    lv_iou = iou_from_confusion(cm_l).cpu() if cm_l.sum() > 0 else torch.full((N_LV,), float("nan"))
     return {"room_mIoU": miou_r, "icon_mIoU": miou_i, "room_pixacc": acc_r,
             "score": (miou_r + miou_i) / 2,
+            "walltype_acc": round(wt_acc, 4), "walltype_pixels": int(cm_w.sum().item()),
+            "level_IoU": {c: round(float(v), 4) for c, v in zip(LEVEL_CLASSES, lv_iou)},
+            "level_pixels": int(cm_l.sum().item()),
             "room_IoU": {c: round(float(v), 4) for c, v in zip(ROOM_CLASSES, iou_r)},
             "icon_IoU": {c: round(float(v), 4) for c, v in zip(ICON_CLASSES, iou_i)}}
 
@@ -242,7 +259,7 @@ def main():
         extra_val["cubicasa_rot{}".format(ang)] = CachedFloorplans(
             cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], fixed_angle=ang, sources=["cubicasa"],
             limit=cfg.get("extra_val_limit", 100))
-    for src in ("resplan", "synthetic", "floorplancad", "archcad"):
+    for src in ("resplan", "synthetic", "floorplancad", "archcad", "structured3d"):
         d_ = CachedFloorplans(cfg["cache_root"], "val", False, cfg["crop"], cfg["sigma"], sources=[src],
                               limit=cfg.get("extra_val_limit", 100))
         if len(d_):
@@ -286,7 +303,11 @@ def main():
     if ckpt:
         model.load_state_dict(ckpt["model"])
     elif init_weights:
+        init_weights, grown = expand_head(init_weights, model)
         model.load_state_dict(init_weights)
+        if grown and rank == 0:
+            log(f"Started from the previous weights; output head grown from {grown} to {N_OUT} channels "
+                f"(new: wall type, floor level)")
     if world > 1 and dev.type == "cuda":
         from timm.layers import convert_sync_batchnorm
         model = convert_sync_batchnorm(model)
@@ -342,17 +363,18 @@ def main():
         t_ep = time.time()
         ddp.train()
         sampler.set_epoch(epoch)
-        run = {"loss": 0.0, "room": 0.0, "icon": 0.0, "heat": 0.0}
+        run = {"loss": 0.0, "room": 0.0, "icon": 0.0, "heat": 0.0, "wtype": 0.0, "level": 0.0}
         n_seen = 0
-        for it, (x, room, icon, heat) in enumerate(train_loader):
+        for it, (x, room, icon, heat, wt, lv) in enumerate(train_loader):
             step = epoch * spe + it
             set_lr(opt, step, spe, total_epochs, cfg["warmup_epochs"])
             x = x.to(dev, non_blocking=True)
             room, icon = room.to(dev, non_blocking=True), icon.to(dev, non_blocking=True)
             heat = heat.to(dev, non_blocking=True)
+            wt, lv = wt.to(dev, non_blocking=True), lv.to(dev, non_blocking=True)
             with torch.autocast(dev.type, dtype=torch.float16, enabled=dev.type == "cuda"):
                 out = ddp(x)
-            loss, parts = crit(out, room, icon, heat)
+            loss, parts = crit(out, room, icon, heat, wt, lv)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
@@ -375,7 +397,8 @@ def main():
                 bar = "#" * int(frac * 20) + "-" * (20 - int(frac * 20))
                 log(f"ep {epoch + 1}/{total_epochs} [{bar}] {frac * 100:5.1f}% it {it + 1}/{spe} | "
                     f"loss {run['loss'] / d:.3f} (room {run['room'] / d:.3f} icon {run['icon'] / d:.3f} "
-                    f"heat {run['heat'] / d:.3f}) | {ips:.1f} img/s | epoch ETA {_hms(ep_eta)} | "
+                    f"heat {run['heat'] / d:.3f} walltype {run['wtype'] / d:.3f} level {run['level'] / d:.3f}) | "
+                    f"{ips:.1f} img/s | epoch ETA {_hms(ep_eta)} | "
                     f"run ETA {_hms(run_eta)} | best {max(best_score, 0):.4f}")
         train_secs = time.time() - t_ep
 
@@ -410,6 +433,7 @@ def main():
             d = max(1, n_seen)
             rec = {"epoch": epoch, "train_loss": run["loss"] / d, "room_loss": run["room"] / d,
                    "icon_loss": run["icon"] / d, "heat_loss": run["heat"] / d,
+                   "walltype_loss": run["wtype"] / d, "level_loss": run["level"] / d,
                    "epoch_min": round(epoch_secs / 60, 2), "train_min": round(train_secs / 60, 2)}
             improved = False
             if metrics:
@@ -421,6 +445,9 @@ def main():
                     f"{metrics['icon_mIoU']:.4f} | wall {metrics['room_IoU']['Wall']:.3f} "
                     f"door {metrics['icon_IoU']['Door']:.3f} window {metrics['icon_IoU']['Window']:.3f} "
                     f"stairs {metrics['icon_IoU']['Stairs']:.3f} {'*BEST*' if improved else ''}")
+                log(f"    v2 heads: wall type acc {metrics['walltype_acc']:.3f} ({metrics['walltype_pixels']} px) | "
+                    f"level IoU " + " ".join(f"{k} {v:.3f}" for k, v in metrics["level_IoU"].items()) +
+                    f" ({metrics['level_pixels']} px)")
                 for k_, v_ in metrics.items():
                     if k_.startswith("val_"):
                         log(f"    {k_[4:]:18s} wall {v_['wall']:.3f} door {v_['door']:.3f} "
@@ -437,7 +464,7 @@ def main():
             if improved:
                 atomic_save({"ema": ema.module.state_dict(), "epoch": epoch, "metrics": metrics,
                              "signature": signature(cfg), "room_classes": ROOM_CLASSES,
-                             "rotation_trained": cfg.get("rot_prob", 0) > 0,
+                             "rotation_trained": cfg.get("rot_prob", 0) > 0, "n_out": N_OUT,
                              "icon_classes": ICON_CLASSES, "encoder": cfg["encoder"]}, best_path)
                 files.append((best_path, "checkpoints/best.pt"))
             mpath = os.path.join(cfg["ckpt_dir"], "metrics.json")

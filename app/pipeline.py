@@ -291,7 +291,8 @@ def _load_model(force_check=False):
     import torch, segmentation_models_pytorch as smp
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=27,
+    n_out = int(ck.get("n_out") or ck["ema"]["segmentation_head.0.weight"].shape[0])   # 27 (v1) or 32 (v2 heads)
+    net = smp.Unet(ck.get("encoder", "tu-efficientnet_b3"), encoder_weights=None, classes=n_out,
                    decoder_attention_type="scse")
     net.load_state_dict(ck["ema"]); net.to(dev).eval()
     info = "epoch {}, val score {:.3f}".format(ck.get("epoch", -1) + 1, ck.get("metrics", {}).get("score", float("nan")))
