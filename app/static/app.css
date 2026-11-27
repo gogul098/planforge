@@ -324,7 +324,8 @@ h4 {
 .pl { display: grid; grid-template-columns: 1fr auto 22px; align-items: center; gap: 4px 10px; padding: 12px 8px; border-bottom: 1px solid var(--line); border-radius: 8px; }
 .pl.can { cursor: pointer; transition: background .2s ease; }
 .pl.can:hover, .pl.can:focus-visible { background: var(--sel); outline: none; }
-.pl.can .pl-st:after { content: " · Open"; color: var(--acc); }
+.pl.can.done .pl-st:after { content: " · Open"; color: var(--acc); }
+.pl.can.running .pl-st:after, .pl.can.queued .pl-st:after { content: " · Watch"; color: var(--acc); }
 .pl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pl-st { color: var(--mut); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .pl.done .pl-st { color: var(--ok); } .pl.error .pl-st { color: var(--bad); } .pl.cur .pl-st { color: var(--acc); }

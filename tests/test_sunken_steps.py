@@ -63,7 +63,7 @@ def test_steps_beside_open_ground_go_down(job):
 def test_architect_switches_stairs(job):
     S, jp = job
     from fastapi.testclient import TestClient
-    c = TestClient(S.app)
+    c = TestClient(S.app, headers={"X-Plan-Key": S.new_key("t")})
     sid = json.load(open(jp))["stairs"][0]["id"]
     with contextlib.redirect_stdout(io.StringIO()):
         assert c.post("/api/stair/t", json={"id": sid, "mode": "up", "depth": 0.9}).status_code == 200
