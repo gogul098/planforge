@@ -144,6 +144,8 @@ def check_image(path):
     try:
         with Image.open(path) as im:
             w, h = im.size
+    except Image.DecompressionBombError:
+        raise HTTPException(413, "The image is too large. Please send it at a lower resolution.")
     except Exception:
         raise HTTPException(415, "The file is not a readable image")
     if w * h > MAX_PIXELS or max(w, h) > 30000:
