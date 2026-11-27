@@ -1,5 +1,7 @@
 // Conversion page: uploads the plan, follows the engine's progress, then opens the viewer.
 import { get, put, clear } from "./handoff.js";
+import { MODELS, planSvg, axoSvg } from "./buildings.js";
+import * as Jobs from "./jobs.js";
 
 const q = new URLSearchParams(location.search);
 const API = (q.get("api") || window.PLANFORGE_API || "").replace(/\/$/, "");
@@ -10,15 +12,15 @@ const scene = $("#scene");
 const commons = (f) => "https://commons.wikimedia.org/wiki/Special:FilePath/" + encodeURIComponent(f) + "?width=2200";
 const BUILDINGS = [
   { f: "Fallingwater, also known as the Edgar J. Kaufmann, Sr., residence, Pennsylvania, by Carol M. Highsmith.jpg",
-    name: "Fallingwater", meta: "Frank Lloyd Wright, Pennsylvania, 1939", credit: "Photo: Carol M. Highsmith, Library of Congress, public domain" },
+    name: "Fallingwater", model: "fallingwater", meta: "Frank Lloyd Wright, Pennsylvania, 1939", credit: "Photo: Carol M. Highsmith, Library of Congress, public domain" },
   { f: "Lotus Temple-Panoroma-Visit During WCI 2016- IMG 6471.jpg",
-    name: "Lotus Temple", meta: "Fariborz Sahba, New Delhi, 1986", credit: "Photo: Bijay Chaurasia, Wikimedia Commons, CC BY-SA" },
+    name: "Lotus Temple", model: "lotus", meta: "Fariborz Sahba, New Delhi, 1986", credit: "Photo: Bijay Chaurasia, Wikimedia Commons, CC BY-SA" },
   { f: "Farnsworth House 2006.jpg",
-    name: "Farnsworth House", meta: "Ludwig Mies van der Rohe, Plano, Illinois, 1951", credit: "Photo: Carol M. Highsmith, Library of Congress, public domain" },
+    name: "Farnsworth House", model: "farnsworth", meta: "Ludwig Mies van der Rohe, Plano, Illinois, 1951", credit: "Photo: Carol M. Highsmith, Library of Congress, public domain" },
   { f: "Taj Mahal (Edited).jpeg",
-    name: "Taj Mahal", meta: "Ustad Ahmad Lahauri (attributed), Agra, 1653", credit: "Photo: Yann, Wikimedia Commons, CC BY-SA" },
+    name: "Taj Mahal", model: "taj", meta: "Ustad Ahmad Lahauri (attributed), Agra, 1653", credit: "Photo: Yann, Wikimedia Commons, CC BY-SA" },
   { f: "Gamble House 2016-1.jpg",
-    name: "Gamble House", meta: "Greene and Greene, Pasadena, 1908", credit: "Photo: Jim Heaphy, Wikimedia Commons, CC BY-SA 3.0" },
+    name: "Gamble House", model: "gamble", meta: "Greene and Greene, Pasadena, 1908", credit: "Photo: Jim Heaphy, Wikimedia Commons, CC BY-SA 3.0" },
 ];
 const ready = [];           // slides whose photograph has loaded, in display order
 let at = -1, timer = null;
@@ -48,6 +50,10 @@ function show(n) {
   const plate = $("#plate"); plate.classList.remove("swap"); void plate.offsetWidth;
   $("#meta").textContent = s.b.meta; $("#name").textContent = s.b.name; $("#credit").textContent = s.b.credit;
   plate.classList.add("swap");
+  const e = MODELS[s.b.model](), sh = $("#sheetIn");
+  sh.classList.remove("swap", "on-sheet"); void sh.offsetWidth;
+  $("#dPlan").innerHTML = planSvg(e); $("#dAxo").innerHTML = axoSvg(e);
+  sh.classList.add("swap", "on-sheet");
 }
 BUILDINGS.forEach(addSlide);
 setTimeout(() => { if (!ready.length) scene.classList.add("nophoto"); }, 9000);
@@ -83,6 +89,7 @@ function fail(msg) {
 
 // ---- run ----
 const abort = new AbortController();
+let leaving = false;
 $("#cancel").onclick = async () => { abort.abort(); try { const r = await get(); if (r) await put({ file: r.file, opt: r.opt }); } catch (e) {} back({ error: "cancelled" }); };
 
 (async () => {
@@ -98,8 +105,16 @@ $("#cancel").onclick = async () => { abort.abort(); try { const r = await get();
       const r = await fetch(API + "/api/convert", { method: "POST", body: fd, signal: abort.signal });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
       job = (await r.json()).job;
-      await put({ ...rec, job });                            // a reload resumes this job instead of starting another
+      await put({ ...rec, job });
+      Jobs.upsert(job, { name: rec.file.name, state: "queued", opt: rec.opt });                            // a reload resumes this job instead of starting another
     } else progress(0.05, "Reconnecting");
+    $("#later").classList.remove("hidden");
+    $("#later").onclick = async () => {               // leave: the plan keeps converting; any PlanForge tab tells you when it's done
+      await Jobs.askToNotify();
+      await clear().catch(() => {});
+      leaving = true; abort.abort();
+      location.replace("app.html" + (q.get("api") ? "?api=" + encodeURIComponent(q.get("api")) : "") + (q.get("api") ? "&" : "?") + "waiting=" + job);
+    };
     let st, misses = 0;
     for (;;) {
       let r2;
@@ -112,6 +127,7 @@ $("#cancel").onclick = async () => { abort.abort(); try { const r = await get();
       if (r2.status === 404) throw new Error("the engine restarted and lost this job. Please convert again.");
       misses = 0; st = await r2.json();
       progress(st.progress, st.msg);
+      Jobs.upsert(job, { state: st.state, progress: st.progress, msg: st.msg });
       if (st.state === "done" || st.state === "error") break;
     }
     if (st.state === "error") throw new Error(st.msg);
@@ -120,7 +136,7 @@ $("#cancel").onclick = async () => { abort.abort(); try { const r = await get();
     await new Promise((res) => setTimeout(res, 1400));
     back({ job, ...(rec.opt && rec.opt.furniture === "manual" ? { edit: "1" } : {}) });
   } catch (err) {
-    if (abort.signal.aborted) return;
+    if (abort.signal.aborted || leaving) return;
     await put({ file: rec.file, opt: rec.opt }).catch(() => {});   // keep the plan so the workspace can restore it
     fail(err.message || String(err));
   }

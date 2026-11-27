@@ -39,9 +39,18 @@
     </div>
   </section>
 
+  <figure class="sheet" id="sheet" aria-hidden="true">
+    <div class="sheet-in" id="sheetIn">
+      <div class="dw"><div class="dw-art" id="dPlan"></div><figcaption>Plan</figcaption></div>
+      <div class="dw"><div class="dw-art" id="dAxo"></div><figcaption>Axonometric</figcaption></div>
+    </div>
+    <p class="sheet-note">Schematic, redrawn by PlanForge from published plans</p>
+  </figure>
+
   <section class="readout" role="status" aria-live="polite">
     <p class="msg" id="msg">Uploading</p>
     <div class="pct" aria-hidden="true"><span id="pct">0</span><sup>%</sup></div>
+    <button class="later hidden" id="later" type="button">Notify me when it's ready</button>
     <div class="fail hidden" id="fail">
       <p id="failMsg"></p>
       <div><a class="btn pri" id="retry" href="app.html">Back to the workspace</a></div>
