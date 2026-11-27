@@ -114,9 +114,9 @@ $("#cancel").onclick = async () => {
       const fd = new FormData(); fd.append("file", rec.file); fd.append("options", JSON.stringify(rec.opt || {}));
       const r = await fetch(API + "/api/convert", { method: "POST", body: fd, signal: abort.signal });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
-      job = (await r.json()).job;
-      await put({ ...rec, job });
-      Jobs.upsert(job, { name: rec.file.name, state: "queued", opt: rec.opt });                            // a reload resumes this job instead of starting another
+      const got = await r.json(); job = got.job;
+      Jobs.upsert(job, { name: rec.file.name, state: "queued", opt: rec.opt, key: got.key });   // key stays in this browser
+      await put({ ...rec, job });                            // a reload resumes this job instead of starting another
     } else progress(0.05, "Reconnecting");
     $("#later").classList.remove("hidden");
     $("#later").onclick = async () => {               // leave: the plan keeps converting; any PlanForge tab tells you when it's done
@@ -128,7 +128,7 @@ $("#cancel").onclick = async () => {
     let st, misses = 0;
     for (;;) {
       let r2;
-      try { r2 = await fetch(`${API}/api/status/${job}?wait=25`, { signal: abort.signal }); } catch (e) { if (abort.signal.aborted) return; r2 = null; }
+      try { r2 = await fetch(`${API}/api/status/${job}?wait=25`, { signal: abort.signal, headers: Jobs.auth(job) }); } catch (e) { if (abort.signal.aborted) return; r2 = null; }
       if (!r2 || r2.status >= 500) {
         if (++misses > 12) throw new Error("lost contact with the engine (it may have restarted or run out of memory)");
         progress(st ? st.progress : 0.05, "Waiting for the engine");

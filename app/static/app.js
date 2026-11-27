@@ -111,6 +111,7 @@ function matFor(name) {
   return m;
 }
 async function loadBuilding(url, faithful = false) {
+  loader.setRequestHeader(Jobs.auth(S.job));
   const gltf = await loader.loadAsync(url + "?t=" + Date.now());
   building.clear();
   gltf.scene.traverse((o) => {
@@ -694,10 +695,10 @@ async function editStair(s, mode) {
   const btns = $$("#props [data-smode]"); btns.forEach((x) => (x.disabled = true));
   try {
     const depth = parseFloat($("#stairDepth")?.value);
-    const r = await fetch(`${API}/api/stair/${S.job}`, { method: "POST", headers: { "Content-Type": "application/json" },
+    const r = await fetch(`${API}/api/stair/${S.job}`, { method: "POST", headers: Jobs.auth(S.job, { "Content-Type": "application/json" }),
       body: JSON.stringify({ id: s.id, mode, depth: isFinite(depth) ? depth : null }) });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    S.plan = await (await fetch(`${API}/api/files/${S.job}/plan.json?t=${Date.now()}`)).json();
+    S.plan = await (await fetch(`${API}/api/files/${S.job}/plan.json?t=${Date.now()}`, { headers: Jobs.auth(S.job) })).json();
     await loadBuilding(`${API}/api/files/${S.job}/shell.glb`);
     const again = (S.plan.stairs || []).find((x) => x.id === s.id);
     select(again ? { kind: "stair", s: again } : null);
@@ -716,9 +717,9 @@ $("#btnApply").onclick = async () => {
       type: f.type, center: f.center, width: f.width, depth: f.depth, height: f.height,
       angle_deg: THREE.MathUtils.radToDeg(f.angle), front: [Math.cos(f.angle + f.frontRel), Math.sin(f.angle + f.frontRel)],
       source: f.source, confidence: f.confidence })) };
-    const r = await fetch(`${API}/api/export/${S.job}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(`${API}/api/export/${S.job}`, { method: "POST", headers: Jobs.auth(S.job, { "Content-Type": "application/json" }), body: JSON.stringify(body) });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    S.plan = await (await fetch(`${API}/api/files/${S.job}/plan.json?t=${Date.now()}`)).json();
+    S.plan = await (await fetch(`${API}/api/files/${S.job}/plan.json?t=${Date.now()}`, { headers: Jobs.auth(S.job) })).json();
     toast(`Saved · IFC, GLB, plan.json and zip rebuilt with ${S.furn.length} items`);
     $("#saveState").textContent = "furniture edited · exports up to date";
     leaveEdit(); renderStats();
@@ -812,14 +813,17 @@ async function loadJob(job, st) {
   if (S.job && S.job !== job) Jobs.discard(S.job);     // moving on to another plan removes the previous one
   S.deleted = false; S.got = new Set();
   S.job = job; S.rawLoaded = false;
-  S.plan = await (await fetch(`${API}/api/files/${job}/plan.json?t=${Date.now()}`)).json();
+  const pr = await fetch(`${API}/api/files/${job}/plan.json?t=${Date.now()}`, { headers: Jobs.auth(job) });
+  if (!pr.ok) throw new Error("not available in this browser");
+  S.plan = await pr.json();
   S.furn = (S.plan.furniture || []).map(fromPlan);
   await loadBuilding(`${API}/api/files/${job}/shell.glb`);
   drawGrids(); rebuildFurniture(); renderStats(st); renderRooms();
   $("#report").textContent = st?.report || "";
-  $("#traceImg").src = `${API}/api/files/${job}/preview.png?t=${Date.now()}`;
-  $$("#dls .dl").forEach((a) => { a.href = `${API}/api/files/${job}/${a.dataset.f}`; a.setAttribute("download", a.dataset.f); a.classList.remove("disabled"); });
-  const ex = $("#btnExport"); ex.href = `${API}/api/files/${job}/floorplan_3d.zip`; ex.setAttribute("download", "floorplan_3d.zip"); ex.classList.remove("disabled");
+  fetch(`${API}/api/files/${job}/preview.png?t=${Date.now()}`, { headers: Jobs.auth(job) }).then((r) => r.ok && r.blob())
+    .then((b) => { if (b) { URL.revokeObjectURL($("#traceImg").src); $("#traceImg").src = URL.createObjectURL(b); } }).catch(() => {});
+  $$("#dls .dl").forEach((a) => { a.href = "#"; a.classList.remove("disabled"); });
+  const ex = $("#btnExport"); ex.href = "#"; ex.classList.remove("disabled");
   $("#btnEdit").disabled = false; $("#empty").classList.add("hidden");
   setGate("ready"); resize();
   $("#saveState").textContent = "";
@@ -896,7 +900,7 @@ Jobs.onChange((all) => {
 function esc(t) { return String(t || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 async function openJob(job) {
   try {
-    const r = await fetch(`${API}/api/status/${job}`);
+    const r = await fetch(`${API}/api/status/${job}`, { headers: Jobs.auth(job) });
     if (!r.ok) throw new Error();
     const st = await r.json();
     if (st.state !== "done") throw new Error();
@@ -922,25 +926,36 @@ function downloaded(name) {
   S.got.add(name);
   if (name === "floorplan_3d.zip" || SINGLE.every((n) => S.got.has(n))) {
     const job = S.job;
-    setTimeout(() => {                                   // give the browser time to finish the download first
+    setTimeout(() => {                                   // the file is already in the browser; a short grace period
       if (S.job !== job) return;
       Jobs.discard(job); S.deleted = true;
       $$("#dls .dl").forEach((a) => a.classList.add("disabled")); $("#btnExport").classList.add("disabled"); $("#btnEdit").disabled = true;
       $("#saveState").textContent = "Downloaded. Files removed from the server";
-    }, 20000);
+    }, 3000);
   }
 }
-$$("#dls .dl").forEach((a) => a.addEventListener("click", () => downloaded(a.dataset.f)));
-$("#btnExport").addEventListener("click", () => downloaded("floorplan_3d.zip"));
+async function fetchDownload(name) {          // files need the plan's key, so they are fetched, then saved
+  const job = S.job;
+  try {
+    const r = await fetch(`${API}/api/files/${job}/${name}?t=${Date.now()}`, { headers: Jobs.auth(job) });
+    if (!r.ok) throw new Error(r.status === 404 ? "the file is no longer on the server" : r.statusText);
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a"); a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    downloaded(name);
+  } catch (e) { toast("Could not download " + name + ": " + e.message, true); }
+}
+$$("#dls .dl").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); fetchDownload(a.dataset.f); }));
+$("#btnExport").addEventListener("click", (e) => { e.preventDefault(); fetchDownload("floorplan_3d.zip"); });
 Jobs.follow();
 
 // deep links: ?job=<id> opens a finished conversion; ?error=... comes back from convert.html with the plan restored
 const qp = new URLSearchParams(location.search), qj = qp.get("job");
 if (qj) {
   pickBtn.classList.add("hidden"); $("#empty .muted").textContent = "Opening your model";
-  fetch(`${API}/api/status/${qj}`).then((r) => r.ok && r.json()).then(async (st) => {
+  fetch(`${API}/api/status/${qj}`, { headers: Jobs.auth(qj) }).then((r) => r.ok && r.json()).then(async (st) => {
     if (st && st.state === "done") { await loadJob(qj, st); if (qp.get("edit")) enterEdit(); }
-    else { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = "That model is no longer available. Choose the plan again to rebuild it."; }
+    else { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = Jobs.find(qj) ? "That model is no longer on the server. Choose the plan again to rebuild it." : "This model can only be opened in the browser that uploaded it."; }
   }).catch(() => { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = "Could not reach the engine. Try again in a moment."; });
 } else if (qp.has("waiting")) {
   const w = Jobs.find(qp.get("waiting"));

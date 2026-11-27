@@ -14,11 +14,14 @@ export function upsert(job, patch) {
   save(a);
 }
 export const find = (job) => list().find((j) => j.job === job);
+// the plan's secret key (given only to the browser that uploaded it) goes with every request for that plan
+export const auth = (job, extra = {}) => ({ ...extra, "X-Plan-Key": (find(job) || {}).key || "" });
 
 // remove the plan from the engine (upload + outputs) and from the list
 export async function discard(job) {
+  const headers = auth(job);
   save(list().filter((j) => j.job !== job));
-  try { await fetch(`${API}/api/jobs/${job}`, { method: "DELETE", keepalive: true }); } catch (e) {}
+  try { await fetch(`${API}/api/jobs/${job}`, { method: "DELETE", keepalive: true, headers }); } catch (e) {}
 }
 
 export async function askToNotify() {
@@ -43,7 +46,7 @@ export function follow(skip = null) {
   const tick = async () => {
     for (const j of list().filter((x) => (x.state === "queued" || x.state === "running") && x.job !== skip)) {
       try {
-        const r = await fetch(`${API}/api/status/${j.job}`);
+        const r = await fetch(`${API}/api/status/${j.job}`, { headers: auth(j.job) });
         if (r.status === 404) { upsert(j.job, { state: "error", msg: "the engine restarted and lost this plan" }); notify(find(j.job)); continue; }
         if (!r.ok) continue;
         const st = await r.json();

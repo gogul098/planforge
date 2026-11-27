@@ -66,7 +66,7 @@ def test_queue_is_bounded():
         r = TestClient(S.app).post("/api/convert", files={"file": ("a.png", b"x", "image/png")})
         assert r.status_code == 503 and "busy" in r.json()["detail"]
         S.STATUS["late"] = {"state": "queued", "queued_at": 99}
-        st = TestClient(S.app).get("/api/status/late").json()
+        st = TestClient(S.app, headers={"X-Plan-Key": S.new_key("late")}).get("/api/status/late").json()
         assert "ahead" in st["msg"]
     finally:
         S.STATUS.clear()

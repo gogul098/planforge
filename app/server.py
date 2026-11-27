@@ -9,6 +9,9 @@ import traceback
 import uuid
 import zipfile
 import contextlib
+import hashlib
+import hmac
+import secrets
 import io
 
 os.environ["P3D_NO_MAIN"] = "1"
@@ -81,6 +84,7 @@ def _cleanup_loop():
         time.sleep(3600)
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402  the website may be hosted elsewhere
+from fastapi import Request  # noqa: E402
 # The website lives on Vercel; this engine only answers /api/*. Set ALLOWED_ORIGINS (comma separated) to lock it to
 # your site(s), e.g. "https://planforge.vercel.app,https://planforge.tech". Default "*" = any site.
 _ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
@@ -226,6 +230,36 @@ def run_job(job, src, ext, opt):
                  report=_clean(log.getvalue())[-4000:])
 
 
+# ----------------------------------------------------------------------------- plan ownership
+# Each upload gets a secret key, returned only to the browser that sent it. The server keeps just its hash.
+# Every later request for that plan must carry the key (X-Plan-Key header), so knowing a job id is not enough.
+def _hash(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def new_key(job):
+    key = secrets.token_urlsafe(32)
+    d = os.path.join(JOBS, os.path.basename(job))
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "owner.key"), "w") as f:
+        f.write(_hash(key))
+    return key
+
+
+def owner(job, request):
+    """Raise 404 (never 403: do not confirm that the plan exists) unless the request carries this plan's key."""
+    job = os.path.basename(job)
+    key = request.headers.get("x-plan-key") or ""
+    kp = os.path.join(JOBS, job, "owner.key")
+    try:
+        stored = open(kp).read().strip()
+    except OSError:
+        raise HTTPException(404, "unknown job")
+    if not key or not hmac.compare_digest(_hash(key), stored):
+        raise HTTPException(404, "unknown job")
+    return job
+
+
 def _queue():
     """Jobs waiting or running, oldest first."""
     q = [(v.get("queued_at", 0), j) for j, v in STATUS.items() if v.get("state") in ("queued", "running")]
@@ -238,9 +272,10 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
         raise HTTPException(503, "The engine is busy ({} plans in the queue). Please try again in a minute."
                             .format(len(_queue())))
     ext = os.path.splitext(file.filename or "")[1].lower()
-    job = uuid.uuid4().hex[:12]
+    job = uuid.uuid4().hex
     work = os.path.join(JOBS, job)
     os.makedirs(work)
+    key = new_key(job)
     src = os.path.join(work, "input" + ext)
     size = 0
     with open(src, "wb") as f:                     # stop as soon as the limit is passed, not after the whole upload
@@ -259,14 +294,14 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
     _set(job, state="queued", progress=0.0, queued_at=time.time(), name=file.filename,
          msg="Waiting in queue ({} plan{} ahead)".format(ahead, "" if ahead == 1 else "s") if ahead else "Starting")
     threading.Thread(target=run_job, args=(job, src, ext, opt), daemon=True).start()
-    return {"job": job}
+    return {"job": job, "key": key}
 
 
 @app.get("/api/status/{job}")
-def status(job: str, wait: float = 0):
+def status(job: str, request: Request, wait: float = 0):
     """wait > 0: long poll - the answer comes as soon as the status changes, or after `wait` seconds
     (max 25 s, well under Azure's 230 s request limit). One request every ~25 s instead of every second."""
-    job = os.path.basename(job)
+    job = owner(job, request)
     sp = os.path.join(JOBS, job, "status.json")
     if job not in STATUS and os.path.exists(sp):
         STATUS[job] = json.load(open(sp))
@@ -300,8 +335,8 @@ logging.getLogger("uvicorn.access").addFilter(_QuietStatus())
 
 
 @app.get("/api/files/{job}/{name}")
-def files(job: str, name: str):
-    base = os.path.join(JOBS, os.path.basename(job))
+def files(job: str, name: str, request: Request):
+    base = os.path.join(JOBS, owner(job, request))
     p = os.path.join(base, "floorplan_3d.zip") if name == "floorplan_3d.zip" else \
         os.path.join(base, "out", os.path.basename(name))
     if not os.path.exists(p):
@@ -310,10 +345,10 @@ def files(job: str, name: str):
 
 
 @app.delete("/api/jobs/{job}")
-def delete_job(job: str):
+def delete_job(job: str, request: Request):
     """The user is done with this plan (downloaded it, or moved on): remove the upload and every output now
     instead of waiting for the 24 h cleanup. A plan still in the queue or converting is not touched."""
-    job = os.path.basename(job)
+    job = owner(job, request)
     work = os.path.join(JOBS, job)
     if STATUS.get(job, {}).get("state") in ("queued", "running"):
         raise HTTPException(409, "This plan is still converting")
@@ -347,8 +382,8 @@ def furniture_from_edit(items):
 
 
 @app.post("/api/export/{job}")
-def export(job: str, body: dict):
-    work = os.path.join(JOBS, os.path.basename(job))
+def export(job: str, body: dict, request: Request):
+    work = os.path.join(JOBS, owner(job, request))
     out = os.path.join(work, "out")
     jp = os.path.join(out, "plan.json")
     if not os.path.exists(jp):
@@ -449,8 +484,8 @@ def _rebuild(work, out, plan):
 
 
 @app.post("/api/stair/{job}")
-def stair_edit(job: str, body: dict):
-    work = os.path.join(JOBS, os.path.basename(job))
+def stair_edit(job: str, body: dict, request: Request):
+    work = os.path.join(JOBS, owner(job, request))
     out = os.path.join(work, "out")
     jp = os.path.join(out, "plan.json")
     if not os.path.exists(jp):
