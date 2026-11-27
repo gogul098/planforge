@@ -39,7 +39,9 @@ const DEFAULT_SIZE = {
 const LIB = ["bed", "sofa", "chair", "table", "wardrobe", "tv_cabinet", "toilet", "sink", "bath_tub",
   "gas_stove", "refrigerator", "washing_machine", "bedside_cupboard", "high_cabinet", "half_height_cabinet"];
 let CATALOG = {};
-const label = (t) => t.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+// everything drawn from a plan (room names, text read off the drawing, file names) is escaped before it reaches the page
+const escH = (t) => String(t ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const label = (t) => escH(String(t ?? "").replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()));
 
 // ------------------------------------------------------------------ three setup
 const canvas = $("#c3d");
@@ -568,7 +570,7 @@ $$("#ctx span").forEach((s) => (s.onclick = () => ctxAct(s.dataset.c)));
 
 // ------------------------------------------------------------------ panels
 const fmt = (v, n = 3) => (v === undefined || v === null ? "—" : (+v).toFixed(n));
-function prop(k, v) { return `<div class="prop"><span>${k}</span><span>${v}</span></div>`; }
+function prop(k, v) { return `<div class="prop"><span>${escH(k)}</span><span>${escH(v)}</span></div>`; }
 function renderProps() {
   const P = $("#props"), sel = S.sel, edit = app.classList.contains("mode-edit");
   if (!sel) { $("#selTitle").textContent = "Selection"; P.innerHTML = `<p class="muted small">${S.plan ? (edit ? "Click a furniture item to edit it, or add one from the left." : "Click a wall, room or furniture item.") : "Nothing loaded yet."}</p>`; return; }
@@ -591,8 +593,8 @@ function renderProps() {
       prop("Width", s.shape === "flared" ? `${fmt(s.width_low, 2)} → ${fmt(s.width_high, 2)} m` : fmt(s.width, 2) + " m") +
       prop("Run", fmt(s.run, 2) + " m") + prop("Levels", `${s.base_z >= 0 ? "+" : ""}${fmt(s.base_z, 2)} → ${s.top_z >= 0 ? "+" : ""}${fmt(s.top_z, 2)} m`) +
       prop("Direction", s.direction || "—") +
-      Object.entries(src).map(([k, v]) => prop("From · " + k, `<span class="muted">${v}</span>`)).join("") +
-      (s.warnings || []).map((w) => `<p class="small" style="color:#ffb86b">Check: ${w}</p>`).join("") +
+      Object.entries(src).map(([k, v]) => prop("From · " + k, v)).join("") +
+      (s.warnings || []).map((w) => `<p class="small" style="color:#ffb86b">Check: ${escH(w)}</p>`).join("") +
       `<div class="stair-edit">
          <p class="small muted">Is it right? Set what these steps really do:</p>
          <div class="seg">
@@ -624,7 +626,7 @@ function renderProps() {
       prop("Rotation", deg.toFixed(1) + "°") + prop("Room", roomAt(it.center)?.name || "—") + prop("Source", src);
     return;
   }
-  const opts = [...new Set([...Object.keys(CATALOG), ...LIB, it.type])].map((t) => `<option value="${t}" ${t === it.type ? "selected" : ""}>${label(t)}</option>`).join("");
+  const opts = [...new Set([...Object.keys(CATALOG), ...LIB, it.type])].map((t) => `<option value="${escH(t)}" ${t === it.type ? "selected" : ""}>${label(t)}</option>`).join("");
   const num = (k, v, st = "0.01") => `<input type="number" step="${st}" data-k="${k}" value="${(+v).toFixed(st === "1" ? 0 : 3)}">`;
   P.innerHTML = `<div class="prop"><span>Type</span><select data-k="type">${opts}</select></div>` +
     `<div class="prop"><span>Width (m)</span>${num("width", it.width)}</div><div class="prop"><span>Depth (m)</span>${num("depth", it.depth)}</div>` +
@@ -645,13 +647,13 @@ function renderPlaced() {
   $("#placedN").textContent = S.furn.length;
   $("#placed").innerHTML = S.furn.map((f) => {
     const tag = f.source === "user" ? "yours" : f.source === "furniture detector" ? Math.round(f.confidence * 100) + "%" : "model";
-    return `<div class="prop ${S.sel?.uid === f.uid ? "sel" : ""}" data-u="${f.uid}"><span>${label(f.type)} · ${roomAt(f.center)?.name || "—"}</span><span>${tag}</span></div>`;
+    return `<div class="prop ${S.sel?.uid === f.uid ? "sel" : ""}" data-u="${f.uid}"><span>${label(f.type)} · ${escH(roomAt(f.center)?.name || "—")}</span><span>${tag}</span></div>`;
   }).join("");
   $$("#placed .prop").forEach((d) => (d.onclick = () => select({ kind: "furn", uid: +d.dataset.u })));
 }
 function renderRooms() {
   const rs = S.plan?.rooms || [];
-  $("#roomList").innerHTML = rs.map((r) => `<div class="prop ${S.sel?.r === r ? "sel" : ""}" data-r="${r.id}"><span>${r.name}</span><span>${fmt(r.area_m2, 2)} m²</span></div>`).join("") || `<p class="muted small">No rooms yet.</p>`;
+  $("#roomList").innerHTML = rs.map((r) => `<div class="prop ${S.sel?.r === r ? "sel" : ""}" data-r="${escH(r.id)}"><span>${escH(r.name)}</span><span>${fmt(r.area_m2, 2)} m²</span></div>`).join("") || `<p class="muted small">No rooms yet.</p>`;
   $$("#roomList .prop").forEach((d) => (d.onclick = () => select({ kind: "room", r: rs.find((r) => r.id === +d.dataset.r) })));
 }
 function renderLib() {

@@ -134,6 +134,62 @@ def dxf_to_png(path, out, unit_override=None, max_px=7000):
     return out, upm / ppu
 
 
+MAX_PIXELS = int(float(os.environ.get("PLANFORGE_MAX_MP", "80")) * 1e6)   # a large A0 scan; a bigger image would exhaust memory
+
+
+def check_image(path):
+    """Read only the header: refuse files that are not images and 'image bombs' (tiny file, huge pixel count)
+    before anything decodes them into memory."""
+    from PIL import Image
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+    except Exception:
+        raise HTTPException(415, "The file is not a readable image")
+    if w * h > MAX_PIXELS or max(w, h) > 30000:
+        raise HTTPException(413, "The image is too large ({} x {} px). Please send it at a lower resolution.".format(w, h))
+
+
+def _num(opt, key, default, lo, hi):
+    """A number from the user's options, kept inside a sensible range (no NaN, no absurd sizes)."""
+    v = opt.get(key)
+    if v in (None, ""):
+        return default
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Option {} must be a number".format(key))
+    if not (lo <= v <= hi):
+        raise HTTPException(400, "Option {} must be between {} and {}".format(key, lo, hi))
+    return v
+
+
+def clean_options(raw):
+    try:
+        opt = json.loads(raw or "{}")
+    except ValueError:
+        raise HTTPException(400, "Options are not valid JSON")
+    if not isinstance(opt, dict):
+        raise HTTPException(400, "Options must be an object")
+    out = {
+        "building_width": _num(opt, "building_width", None, 1, 1000),
+        "wall_height": _num(opt, "wall_height", 3.0, 2, 12),
+        "door_height": _num(opt, "door_height", 2.1, 1.5, 6),
+        "head": _num(opt, "head", 2.1, 0.5, 10),
+        "sill": _num(opt, "sill", 0.9, 0, 5),
+        "ext_wall": _num(opt, "ext_wall", None, 50, 2000),
+        "int_wall": _num(opt, "int_wall", None, 30, 1000),
+        "plinth": _num(opt, "plinth", None, 0, 5),
+        "furniture": opt.get("furniture") if opt.get("furniture") in ("copy", "manual", "none") else "copy",
+        "dxf_units": None,
+    }
+    if opt.get("dxf_units") not in (None, ""):
+        if str(opt["dxf_units"]) not in {str(k) for k in UNIT_M}:
+            raise HTTPException(400, "Unknown DXF unit")
+        out["dxf_units"] = int(opt["dxf_units"])
+    return out
+
+
 def load_input(path, ext, dxf_units):
     """-> (png path, metres per pixel of that png or None)"""
     if ext == ".dxf":
@@ -148,6 +204,7 @@ def load_input(path, ext, dxf_units):
         doc[0].get_pixmap(dpi=dpi).save(path + ".png")
         return path + ".png", None
     if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"):
+        check_image(path)
         return path, None
     raise HTTPException(415, "Unsupported file type " + ext)
 
@@ -272,6 +329,9 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
         raise HTTPException(503, "The engine is busy ({} plans in the queue). Please try again in a minute."
                             .format(len(_queue())))
     ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".dxf", ".dwg", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"):
+        raise HTTPException(415, "Unsupported file type. Send DXF, PDF, PNG, JPG, WEBP, BMP or TIFF.")
+    opt = clean_options(options)
     job = uuid.uuid4().hex
     work = os.path.join(JOBS, job)
     os.makedirs(work)
@@ -289,9 +349,8 @@ async def convert(file: UploadFile = File(...), options: str = Form("{}")):
                 shutil.rmtree(work, ignore_errors=True)
                 raise HTTPException(413, "File is larger than 50 MB")
             f.write(chunk)
-    opt = json.loads(options or "{}")
     ahead = len(_queue())
-    _set(job, state="queued", progress=0.0, queued_at=time.time(), name=file.filename,
+    _set(job, state="queued", progress=0.0, queued_at=time.time(), name=os.path.basename(file.filename or "plan")[:120],
          msg="Waiting in queue ({} plan{} ahead)".format(ahead, "" if ahead == 1 else "s") if ahead else "Starting")
     threading.Thread(target=run_job, args=(job, src, ext, opt), daemon=True).start()
     return {"job": job, "key": key}
