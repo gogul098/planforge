@@ -282,3 +282,17 @@ h4 {
 .stair-edit .seg .btn { justify-content: center; padding: 0 6px; }
 .stair-edit label { display: grid; gap: 4px; }
 .stair-edit input { width: 100%; }
+
+/* ================= gate: the 3D view exists only once a plan is converted ================= */
+.gate-empty #c3d, .gate-empty #cube, .gate-empty .home, .gate-empty .vp-label,
+.gate-empty .trace, .gate-empty .section-ui, .gate-empty .measure-out { display: none !important; }
+.gate-ready .empty { display: none; }
+/* tools that need a model stay in place but read as switched off */
+.gate-empty .tb, .gate-empty .tabs,
+.gate-empty .cmdbar, .gate-empty #btnEdit, .gate-empty #btnExport{
+  opacity: .34; filter: saturate(.2); pointer-events: none; user-select: none;
+}
+.gate-empty .tb i, .gate-empty .tabs span{ cursor: not-allowed; }
+.tb, .tabs, .cmdbar { transition: opacity .5s ease, filter .5s ease; }
+.empty .btn { pointer-events: auto; margin-top: 10px; height: 42px; padding: 0 22px; font-size: 13px; max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+.view.drag-over { box-shadow: inset 0 0 0 2px var(--acc); }

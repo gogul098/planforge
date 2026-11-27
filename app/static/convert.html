@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlanForge — building your model</title>
+<meta name="robots" content="noindex">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://commons.wikimedia.org">
+<link rel="preconnect" href="https://upload.wikimedia.org" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="convert.css">
+</head>
+<body>
+<main class="scene" id="scene">
+  <div class="photos" id="photos" aria-hidden="true"></div>
+  <svg class="fallback" viewBox="0 0 800 500" aria-hidden="true">
+    <path d="M120 80H680V420H120Z M360 80V300 M360 300H680 M120 260H360 M520 340H660 M520 360H660 M520 380H660 M520 400H660 M520 340V420"/>
+  </svg>
+  <div class="shade"></div>
+  <i class="crop tl"></i><i class="crop tr"></i><i class="crop bl"></i><i class="crop br"></i>
+
+  <header class="bar">
+    <a class="logo" href="app.html" aria-label="PlanForge">
+      <svg width="16" height="20" viewBox="0 0 26 30" fill="none" aria-hidden="true"><path d="M2 29V13C2 6.5 7 2 13 2s11 4.5 11 11v16"/><path d="M1 29h24"/></svg>
+      <span>PlanForge</span>
+    </a>
+    <span class="file" id="file"></span>
+    <button class="cancel" id="cancel" type="button">Cancel</button>
+  </header>
+
+  <section class="plate" aria-live="off">
+    <div class="plate-in" id="plate">
+      <p class="meta" id="meta"></p>
+      <h1 id="name"></h1>
+      <p class="credit" id="credit"></p>
+    </div>
+  </section>
+
+  <section class="readout" role="status" aria-live="polite">
+    <p class="msg" id="msg">Uploading</p>
+    <div class="pct" aria-hidden="true"><span id="pct">0</span><sup>%</sup></div>
+    <div class="fail hidden" id="fail">
+      <p id="failMsg"></p>
+      <div><a class="btn pri" id="retry" href="app.html">Back to the workspace</a></div>
+    </div>
+  </section>
+
+  <footer class="line">
+    <div class="rail"><i class="fill" id="fill"></i></div>
+    <ol class="steps" id="steps">
+      <li>Read the plan</li><li>Find walls</li><li>Doors and windows</li><li>Stairs</li><li>Build 3D</li><li>Export</li>
+    </ol>
+  </footer>
+</main>
+<script src="config.js"></script>
+<script type="module" src="convert.js"></script>
+</body>
+</html>
