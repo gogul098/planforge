@@ -869,7 +869,7 @@ Jobs.onChange((all) => {
   b.textContent = fresh || busy; b.classList.toggle("ready", !!fresh);
   $("#qEmpty").classList.toggle("hidden", !!all.length);
   $("#plans").innerHTML = all.map((j) => {
-    const can = j.state === "done" && j.job !== S.job;
+    const can = (j.state === "done" && j.job !== S.job) || j.state === "queued" || j.state === "running";
     const st = j.job === S.job ? "On screen" : j.state === "running" ? Math.round((j.progress || 0) * 100) + "%" : STATE_TXT[j.state] || "";
     return `<li class="pl ${j.state}${j.job === S.job ? " cur" : ""}${can ? " can" : ""}" ${can ? `data-open="${j.job}" tabindex="0" role="button"` : ""}>
     <span class="pl-name" title="${esc(j.name)}">${esc(j.name || "Plan")}</span>
@@ -880,7 +880,14 @@ Jobs.onChange((all) => {
   </li>`;
   }).join("");
   $$("#plans [data-open]").forEach((li) => {
-    const go = () => { setQueue(false); openJob(li.dataset.open); };
+    const go = () => {
+      setQueue(false);
+      const j = Jobs.find(li.dataset.open);
+      if (j && (j.state === "queued" || j.state === "running")) {       // still working: watch it on the loading page
+        const p = new URLSearchParams(); if (qp.get("api")) p.set("api", qp.get("api")); p.set("job", j.job);
+        location.href = "convert.html?" + p;
+      } else openJob(li.dataset.open);
+    };
     li.onclick = (e) => { if (!e.target.closest(".pl-x")) go(); };
     li.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
   });

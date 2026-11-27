@@ -78,7 +78,7 @@ function progress(p, msg) {
 
 function back(params) {
   const p = new URLSearchParams(location.search);
-  Object.entries(params).forEach(([k, v]) => p.set(k, v));
+  Object.entries(params).forEach(([k, v]) => (v === "" ? p.delete(k) : p.set(k, v)));
   location.replace("app.html?" + p.toString());
 }
 function fail(msg) {
@@ -89,16 +89,26 @@ function fail(msg) {
 
 // ---- run ----
 const abort = new AbortController();
-let leaving = false;
-$("#cancel").onclick = async () => { abort.abort(); try { const r = await get(); if (r) await put({ file: r.file, opt: r.opt }); } catch (e) {} back({ error: "cancelled" }); };
+let leaving = false, job0 = () => null;
+const watchJob = q.get("job");                  // opened from the Plans sidebar: watch a plan already in the queue
+$("#cancel").onclick = async () => {
+  abort.abort();
+  if (watchJob) { leaving = true; return back({ job: "" }); }   // only stop watching; the plan keeps converting
+  try { const r = await get(); if (r) await put({ file: r.file, opt: r.opt }); } catch (e) {}
+  back({ error: "cancelled" });
+};
 
 (async () => {
   let rec;
-  try { rec = await get(); } catch (e) { rec = null; }
+  if (watchJob) {
+    const j = Jobs.find(watchJob);
+    rec = { job: watchJob, file: { name: j ? j.name : "Your plan" }, opt: j && j.opt, watching: true };
+    $("#cancel").textContent = "Back to the workspace";
+  } else { try { rec = await get(); } catch (e) { rec = null; } }
   if (!rec || !rec.file) return back({});                    // opened directly: nothing to convert
   $("#file").textContent = rec.file.name;
   try {
-    let job = rec.job;
+    let job = rec.job; job0 = () => job;
     if (!job) {
       progress(0.02, "Uploading");
       const fd = new FormData(); fd.append("file", rec.file); fd.append("options", JSON.stringify(rec.opt || {}));
@@ -111,7 +121,7 @@ $("#cancel").onclick = async () => { abort.abort(); try { const r = await get();
     $("#later").classList.remove("hidden");
     $("#later").onclick = async () => {               // leave: the plan keeps converting; any PlanForge tab tells you when it's done
       await Jobs.askToNotify();
-      await clear().catch(() => {});
+      if (!rec.watching) await clear().catch(() => {});
       leaving = true; abort.abort();
       location.replace("app.html" + (q.get("api") ? "?api=" + encodeURIComponent(q.get("api")) : "") + (q.get("api") ? "&" : "?") + "waiting=" + job);
     };
@@ -132,12 +142,13 @@ $("#cancel").onclick = async () => { abort.abort(); try { const r = await get();
     }
     if (st.state === "error") throw new Error(st.msg);
     progress(1, "Opening your model");
-    await clear().catch(() => {});
+    if (!rec.watching) await clear().catch(() => {});
     await new Promise((res) => setTimeout(res, 1400));
     back({ job, ...(rec.opt && rec.opt.furniture === "manual" ? { edit: "1" } : {}) });
   } catch (err) {
     if (abort.signal.aborted || leaving) return;
-    await put({ file: rec.file, opt: rec.opt }).catch(() => {});   // keep the plan so the workspace can restore it
+    if (!rec.watching) await put({ file: rec.file, opt: rec.opt }).catch(() => {});
+    if (job0()) Jobs.upsert(job0(), { state: "error", msg: err.message || String(err) });   // keep the plan so the workspace can restore it
     fail(err.message || String(err));
   }
 })();
