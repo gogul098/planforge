@@ -24,7 +24,7 @@ html, body { height: 100%; background: var(--ink); color: var(--tx); font-family
 }
 /* shown only if no photograph can load (offline, blocked) */
 .fallback { position: absolute; left: 50%; top: 42%; width: min(70vw, 820px); transform: translate(-50%, -50%); fill: none; stroke: var(--brass); stroke-width: 2; opacity: 0; transition: opacity 1s ease; }
-.nophoto .fallback { opacity: .5; stroke-dasharray: 2400; animation: trace 6s ease forwards; }
+.nophoto .fallback { opacity: 0; stroke-dasharray: 2400; animation: trace 6s ease forwards; }
 @keyframes trace { from { stroke-dashoffset: 2400; } to { stroke-dashoffset: 0; } }
 .scene.nophoto { background: radial-gradient(ellipse 80% 70% at 50% 40%, #2a302b, var(--ink)); }
 

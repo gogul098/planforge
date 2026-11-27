@@ -45,7 +45,7 @@ function show(n) {
   const s = ready[at];
   if (prev && prev !== s) prev.el.classList.remove("on");
   // restart the slow zoom on the incoming photo
-  const img = s.el.firstChild; img.style.animation = "none"; void img.offsetWidth; img.style.animation = "";
+  const img = s.el.firstChild; if (img) { img.style.animation = "none"; void img.offsetWidth; img.style.animation = ""; }
   s.el.classList.add("on");
   const plate = $("#plate"); plate.classList.remove("swap"); void plate.offsetWidth;
   $("#meta").textContent = s.b.meta; $("#name").textContent = s.b.name; $("#credit").textContent = s.b.credit;
@@ -56,7 +56,13 @@ function show(n) {
   sh.classList.add("swap", "on-sheet");
 }
 BUILDINGS.forEach(addSlide);
-setTimeout(() => { if (!ready.length) scene.classList.add("nophoto"); }, 9000);
+// no photograph could load (offline, blocked network): still show each building's name and drawings
+setTimeout(() => {
+  if (ready.length) return;
+  scene.classList.add("nophoto");
+  BUILDINGS.forEach((b) => { const el = document.createElement("div"); el.className = "ph"; el.append(document.createElement("i")); ready.push({ el, b: { ...b, credit: "" } }); });
+  show(0); timer = setInterval(() => show(at + 1), 7000);
+}, 4000);
 
 // ---- progress ----
 const STEPS = [...document.querySelectorAll("#steps li")];
