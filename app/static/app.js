@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { get as getHandoff, put as putHandoff } from "./handoff.js";
 
 // API location: same site by default; a static host (Vercel) points it at the
 // conversion engine via config.js or ?api=https://... in the URL.
@@ -17,6 +18,13 @@ const S = {
   etool: "select", snap: true, xray: false, edges: false, section: false, placing: null,
   hist: [], fut: [], beforeEdit: null, dirty: false,
 };
+// gate: "empty" (no model yet) | "ready" (3D model on screen). Viewer tools work only in "ready". Converting happens on convert.html.
+function setGate(g) {
+  app.classList.remove("gate-empty", "gate-ready"); app.classList.add("gate-" + g);
+  const c = document.querySelector("#cmd"); if (c) c.disabled = g !== "ready";
+  document.querySelectorAll("#tbView i, #tabs span").forEach((i) => i.setAttribute("aria-disabled", g !== "ready"));
+  if (g !== "ready") { document.activeElement?.blur?.(); resize?.(); }
+}
 const ACC = 0xc89b5e;                               // brass: selection, measure, markers (both themes)
 const CAT_COL = { furniture: 0xb0845c, plumbing: 0xeef0f4, appliance: 0x969ba2 };
 const LAYER_COL = { wall: 0xe9e4dc, door: 0x8a5a3b, glass: 0x8fc3e8, floor: 0xc9b9a2, stairs: 0xbfb3a3, plinth: 0xa8a096, ground: 0xa89a82 };
@@ -390,7 +398,7 @@ function startWalk() {
   toast("Walk: W A S D to move, drag to look, Q/E down/up, Esc to exit");
 }
 addEventListener("keydown", (e) => {
-  if (e.target.matches("input,select")) return;
+  if (e.target.matches("input,select") || !app.classList.contains("gate-ready")) return;
   walk.keys[e.key.toLowerCase()] = true;
   if (e.key === "Escape") { if (walk.on) setTool("orbit"); select(null); }
   if (!walk.on) {
@@ -756,8 +764,19 @@ function setFile(f) {
   $$(".dxf-only").forEach((d) => d.classList.toggle("hidden", ext !== "dxf"));
   $("#btnConvert").disabled = ext === "dwg";
   $("#crumb").textContent = "/ " + f.name;
+  pickLabel(ext, f.name);
   if (ext === "dwg") toast("DWG is closed: in AutoCAD run SAVEAS → DXF and upload that.", true);
 }
+const pickBtn = $("#btnPick");
+pickBtn.onclick = () => (S.file && !pickBtn.dataset.again ? $("#btnConvert").click() : $("#file").click());
+function pickLabel(ext, name) {
+  pickBtn.dataset.again = ext === "dwg" ? "1" : "";
+  pickBtn.textContent = ext === "dwg" ? "Choose another plan" : "Convert " + name + " to 3D";
+}
+const viewEl = $("#view");
+["dragenter", "dragover"].forEach((ev) => viewEl.addEventListener(ev, (e) => { e.preventDefault(); viewEl.classList.add("drag-over"); }));
+["dragleave", "drop"].forEach((ev) => viewEl.addEventListener(ev, (e) => { e.preventDefault(); viewEl.classList.remove("drag-over"); }));
+viewEl.addEventListener("drop", (e) => { if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
 const furnState = { need: true, mode: "copy" };
 $("#togFurn").onclick = () => {
   furnState.need = !furnState.need;
@@ -777,35 +796,12 @@ $("#btnConvert").onclick = async () => {
     ext_wall: val("#o_ew"), int_wall: val("#o_iw"), door_height: val("#o_dh") ?? 2.1, head: val("#o_dh") ?? 2.1,
     sill: val("#o_ws") ?? 0.9, dxf_units: $("#o_units").value || null, plinth: val("#o_pl"),
   };
-  const fd = new FormData(); fd.append("file", S.file); fd.append("options", JSON.stringify(opt));
-  $("#btnConvert").disabled = true; $("#prog").classList.remove("hidden"); progress(0.02, "Uploading");
-  try {
-    const r = await fetch(API + "/api/convert", { method: "POST", body: fd });
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    const { job } = await r.json();
-    let st;
-    let misses = 0;
-    for (;;) {
-      let r2;
-      try { r2 = await fetch(`${API}/api/status/${job}?wait=25`); }      // answers when progress changes
-      catch (e) { r2 = null; }
-      if (!r2 || r2.status >= 500) {                                      // network blip / engine busy: wait, ask again
-        if (++misses > 12) throw new Error("lost contact with the engine (it may have restarted or run out of memory)");
-        progress(st ? st.progress : 0.05, "Waiting for the engine…");
-        await new Promise((res) => setTimeout(res, 5000));
-        continue;
-      }
-      if (r2.status === 404) throw new Error("the engine restarted and lost this job — please convert again");
-      misses = 0;
-      st = await r2.json();
-      progress(st.progress, st.msg);
-      if (st.state === "done" || st.state === "error") break;
-    }
-    if (st.state === "error") { $("#report").textContent = st.report || ""; throw new Error(st.msg); }
-    await loadJob(job, st);
-    if (furnState.need && furnState.mode === "manual") enterEdit();
-  } catch (err) { toast("Could not convert: " + err.message, true); progress(0, "Failed: " + err.message); }
-  $("#btnConvert").disabled = false;
+  $("#btnConvert").disabled = true;
+  try { await putHandoff({ file: S.file, opt }); }
+  catch (e) { $("#btnConvert").disabled = false; return toast("Your browser blocked local storage, so the plan can't be passed on. Allow site data and try again.", true); }
+  // the conversion runs on its own page; it sends you back here with the finished model
+  const p = new URLSearchParams(location.search); p.delete("job"); p.delete("edit"); p.delete("error");
+  location.href = "convert.html" + (p.toString() ? "?" + p : "");
 };
 function progress(p, m) { $("#progBar").style.width = Math.round(p * 100) + "%"; $("#progMsg").textContent = m || ""; }
 
@@ -820,6 +816,7 @@ async function loadJob(job, st) {
   $$("#dls .dl").forEach((a) => { a.href = `${API}/api/files/${job}/${a.dataset.f}`; a.setAttribute("download", a.dataset.f); a.classList.remove("disabled"); });
   const ex = $("#btnExport"); ex.href = `${API}/api/files/${job}/floorplan_3d.zip`; ex.setAttribute("download", "floorplan_3d.zip"); ex.classList.remove("disabled");
   $("#btnEdit").disabled = false; $("#empty").classList.add("hidden");
+  setGate("ready"); resize();
   $("#saveState").textContent = "";
   setTab("3d"); setTool("orbit"); fit(); select(null);
   window.__planforge = { ready: true, walls: S.plan.walls.length, furniture: S.furn.length,
@@ -848,11 +845,21 @@ fetch(API + "/api/catalog").then((r) => r.json()).then((c) => (CATALOG = c)).cat
   $("#progMsg").textContent = "Conversion engine is offline right now: start it, or open the site with ?api=<engine URL>";
   $("#prog").classList.remove("hidden");
 });
-resize(); fit(); requestAnimationFrame(loop);
-// deep link: /?job=<id> reopens a finished conversion
-const qj = new URLSearchParams(location.search).get("job");
-if (qj) fetch(`${API}/api/status/${qj}`).then((r) => r.ok && r.json()).then((st) => st && st.state === "done" && loadJob(qj, st)).catch(() => {});
-
+setGate("empty"); resize(); fit(); requestAnimationFrame(loop);
+// deep links: ?job=<id> opens a finished conversion; ?error=... comes back from convert.html with the plan restored
+const qp = new URLSearchParams(location.search), qj = qp.get("job");
+if (qj) {
+  pickBtn.classList.add("hidden"); $("#empty .muted").textContent = "Opening your model";
+  fetch(`${API}/api/status/${qj}`).then((r) => r.ok && r.json()).then(async (st) => {
+    if (st && st.state === "done") { await loadJob(qj, st); if (qp.get("edit")) enterEdit(); }
+    else { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = "That model is no longer available. Choose the plan again to rebuild it."; }
+  }).catch(() => { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = "Could not reach the engine. Try again in a moment."; });
+} else if (qp.has("error")) {
+  getHandoff().then((rec) => { if (rec && rec.file) setFile(rec.file); }).catch(() => {});
+  if (qp.get("error") !== "cancelled" && qp.get("error") !== "1") toast("Conversion stopped: " + qp.get("error"), true);
+  else if (qp.get("error") === "1") toast("Conversion stopped. Your plan is still selected; try Convert to 3D again.", true);
+  history.replaceState(null, "", location.pathname);
+}
 
 // ------------------------------------------------------------------ AutoCAD-style command line + coordinates
 const CMD = {

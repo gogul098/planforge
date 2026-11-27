@@ -14,7 +14,7 @@
 <script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/":"./vendor/addons/"}}</script>
 </head>
 <body>
-<div id="app" class="mode-view">
+<div id="app" class="mode-view gate-empty">
 
   <!-- ===== the scape: the 3D view fills the screen ===== -->
   <main class="view" id="view">
@@ -28,7 +28,8 @@
     <div class="empty" id="empty">
       <svg class="emark" viewBox="0 0 26 30" fill="none" aria-hidden="true"><path d="M2 29V13C2 6.5 7 2 13 2s11 4.5 11 11v16"/><path d="M7 29V15c0-3.6 2.7-6.5 6-6.5s6 2.9 6 6.5v14"/><path d="M1 29h24"/></svg>
       <b>Every plan holds a building.</b>
-      <span class="muted">Add a floor plan to begin · DXF gives exact scale, PDF and images use the written dimensions</span>
+      <span class="muted">The 3D view opens once your plan is converted. DXF gives exact scale; PDF and images use the written dimensions.</span>
+      <button class="btn pri" id="btnPick" type="button">Choose a floor plan</button>
     </div>
     <div class="section-ui hidden" id="sectionUi"><small>Cut height</small><input type="range" id="cutH" min="0.1" max="3.2" step="0.05" value="1.2" aria-label="Cut height"><b id="cutV">1.20 m</b></div>
     <div class="measure-out hidden" id="measOut"></div>
@@ -150,7 +151,7 @@
   <!-- ===== command line + status bar ===== -->
   <footer class="cmdbar glass">
     <span class="prompt" aria-hidden="true">›</span>
-    <input id="cmd" placeholder="Type a command — ORBIT, PAN, FIT, SECTION, MEASURE, WALK, LAYERS, PLAN, 3D" aria-label="Command line" autocomplete="off" spellcheck="false">
+    <input id="cmd" placeholder="Type a command — ORBIT, PAN, FIT, SECTION, MEASURE, WALK, LAYERS, PLAN, 3D" aria-label="Command line" autocomplete="off" spellcheck="false" disabled>
     <span class="cmd-out" id="cmdOut" aria-live="polite"></span>
     <span class="coords" id="coords">0.000, 0.000, 0.000</span>
     <span class="flags"><b>GRID</b><span>SNAP</span><b>ORTHO</b><span>1:100 · m</span></span>
