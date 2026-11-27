@@ -855,16 +855,36 @@ setGate("empty"); resize(); fit(); requestAnimationFrame(loop);
 { const keys = Object.keys(MODELS), k = keys[Math.floor(Math.random() * keys.length)]; $("#eart").innerHTML = axoSvg(MODELS[k]()); }
 // ------------------------------------------------------------------ your plans (queue), notifications, clean-up
 const STATE_TXT = { queued: "Waiting", running: "Converting", done: "Ready", error: "Stopped" };
+function setQueue(open) {
+  $("#queue").classList.toggle("open", open); $("#queue").setAttribute("aria-hidden", !open);
+  $("#btnQueue").setAttribute("aria-expanded", open);
+}
+$("#btnQueue").onclick = () => setQueue(!$("#queue").classList.contains("open"));
+$("#qClose").onclick = () => setQueue(false);
+addEventListener("keydown", (e) => { if (e.key === "Escape") setQueue(false); });
 Jobs.onChange((all) => {
-  $("#plansSec").classList.toggle("hidden", !all.length);
-  $("#plans").innerHTML = all.map((j) => `<li class="pl ${j.state}${j.job === S.job ? " cur" : ""}" data-j="${j.job}">
+  const busy = all.filter((j) => j.state === "queued" || j.state === "running").length;
+  const fresh = all.filter((j) => j.state === "done" && !j.opened).length;
+  const b = $("#qBadge"); b.classList.toggle("hidden", !busy && !fresh);
+  b.textContent = fresh || busy; b.classList.toggle("ready", !!fresh);
+  $("#qEmpty").classList.toggle("hidden", !!all.length);
+  $("#plans").innerHTML = all.map((j) => {
+    const can = j.state === "done" && j.job !== S.job;
+    const st = j.job === S.job ? "On screen" : j.state === "running" ? Math.round((j.progress || 0) * 100) + "%" : STATE_TXT[j.state] || "";
+    return `<li class="pl ${j.state}${j.job === S.job ? " cur" : ""}${can ? " can" : ""}" ${can ? `data-open="${j.job}" tabindex="0" role="button"` : ""}>
     <span class="pl-name" title="${esc(j.name)}">${esc(j.name || "Plan")}</span>
-    <span class="pl-st">${j.job === S.job ? "On screen" : j.state === "running" ? Math.round((j.progress || 0) * 100) + "%" : STATE_TXT[j.state] || ""}</span>
-    ${j.state === "done" && j.job !== S.job ? `<button class="pl-go" data-open="${j.job}">Open</button>` : ""}
-    ${j.state !== "queued" && j.state !== "running" ? `<button class="pl-x" data-del="${j.job}" aria-label="Remove ${esc(j.name)}" title="Remove from the server">×</button>` : ""}
-  </li>`).join("");
-  $$("#plans [data-open]").forEach((b) => (b.onclick = () => openJob(b.dataset.open)));
-  $$("#plans [data-del]").forEach((b) => (b.onclick = () => Jobs.discard(b.dataset.del)));
+    <span class="pl-st">${st}</span>
+    ${j.state !== "queued" && j.state !== "running" ? `<button class="pl-x" data-del="${j.job}" aria-label="Remove ${esc(j.name)}" title="Remove from the server">×</button>` : "<span></span>"}
+    ${j.state === "running" || j.state === "queued" ? `<i class="pl-bar"><i style="width:${Math.round((j.progress || 0) * 100)}%"></i></i>` : ""}
+    ${j.state === "error" && j.msg ? `<small class="pl-msg">${esc(j.msg)}</small>` : ""}
+  </li>`;
+  }).join("");
+  $$("#plans [data-open]").forEach((li) => {
+    const go = () => { setQueue(false); openJob(li.dataset.open); };
+    li.onclick = (e) => { if (!e.target.closest(".pl-x")) go(); };
+    li.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+  });
+  $$("#plans [data-del]").forEach((x) => (x.onclick = (e) => { e.stopPropagation(); Jobs.discard(x.dataset.del); }));
 });
 function esc(t) { return String(t || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 async function openJob(job) {
@@ -879,7 +899,7 @@ async function openJob(job) {
 }
 window.addEventListener("pf-job-finished", (e) => {
   const j = e.detail;
-  if (j.state === "done") toastAction(`${j.name} is ready.`, "View model", () => openJob(j.job));
+  if (j.state === "done") toastAction(`${j.name} is ready.`, "View model", () => { setQueue(false); openJob(j.job); });
   else toast(`${j.name} could not be converted: ${j.msg || "unknown error"}`, true);
 });
 function toastAction(m, label, fn) {
@@ -918,6 +938,7 @@ if (qj) {
 } else if (qp.has("waiting")) {
   const w = Jobs.find(qp.get("waiting"));
   toast(`We'll tell you when ${w ? w.name : "your plan"} is ready. You can add another plan meanwhile.`);
+  setQueue(true);
   history.replaceState(null, "", location.pathname + (qp.get("api") ? "?api=" + encodeURIComponent(qp.get("api")) : ""));
 } else if (qp.has("error")) {
   getHandoff().then((rec) => { if (rec && rec.file) setFile(rec.file); }).catch(() => {});
