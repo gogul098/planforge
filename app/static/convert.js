@@ -117,7 +117,10 @@ $("#cancel").onclick = async () => {
       const got = await r.json(); job = got.job;
       Jobs.upsert(job, { name: rec.file.name, state: "queued", opt: rec.opt, key: got.key });   // key stays in this browser
       await put({ ...rec, job });                            // a reload resumes this job instead of starting another
-    } else progress(0.05, "Reconnecting");
+    } else {                                       // watching a plan already in the queue: show where it is now
+      const known = Jobs.find(job);
+      progress(known && known.progress ? known.progress : 0.05, (known && known.msg) || "Reconnecting");
+    }
     $("#later").classList.remove("hidden");
     $("#later").onclick = async () => {               // leave: the plan keeps converting; any PlanForge tab tells you when it's done
       await Jobs.askToNotify();
@@ -125,17 +128,17 @@ $("#cancel").onclick = async () => {
       leaving = true; abort.abort();
       location.replace("app.html" + (q.get("api") ? "?api=" + encodeURIComponent(q.get("api")) : "") + (q.get("api") ? "&" : "?") + "waiting=" + job);
     };
-    let st, misses = 0;
+    let st, misses = 0, first = true;
     for (;;) {
       let r2;
-      try { r2 = await fetch(`${API}/api/status/${job}?wait=25`, { signal: abort.signal, headers: Jobs.auth(job) }); } catch (e) { if (abort.signal.aborted) return; r2 = null; }
+      try { r2 = await fetch(`${API}/api/status/${job}?wait=${first ? 0 : 25}`, { signal: abort.signal, headers: Jobs.auth(job) }); } catch (e) { if (abort.signal.aborted) return; r2 = null; }
       if (!r2 || r2.status >= 500) {
         if (++misses > 12) throw new Error("lost contact with the engine (it may have restarted or run out of memory)");
         progress(st ? st.progress : 0.05, "Waiting for the engine");
         await new Promise((res) => setTimeout(res, 5000)); continue;
       }
       if (r2.status === 404) throw new Error("the engine restarted and lost this job. Please convert again.");
-      misses = 0; st = await r2.json();
+      misses = 0; first = false; st = await r2.json();
       progress(st.progress, st.msg);
       Jobs.upsert(job, { state: st.state, progress: st.progress, msg: st.msg });
       if (st.state === "done" || st.state === "error") break;
