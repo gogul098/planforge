@@ -84,7 +84,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402  the website ma
 # The website lives on Vercel; this engine only answers /api/*. Set ALLOWED_ORIGINS (comma separated) to lock it to
 # your site(s), e.g. "https://planforge.vercel.app,https://planforge.tech". Default "*" = any site.
 _ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=_ORIGINS, allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=_ORIGINS, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 
 
 # ----------------------------------------------------------------------------- input formats
@@ -307,6 +307,20 @@ def files(job: str, name: str):
     if not os.path.exists(p):
         raise HTTPException(404, "not found")
     return FileResponse(p, filename=name, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/jobs/{job}")
+def delete_job(job: str):
+    """The user is done with this plan (downloaded it, or moved on): remove the upload and every output now
+    instead of waiting for the 24 h cleanup. A plan still in the queue or converting is not touched."""
+    job = os.path.basename(job)
+    work = os.path.join(JOBS, job)
+    if STATUS.get(job, {}).get("state") in ("queued", "running"):
+        raise HTTPException(409, "This plan is still converting")
+    existed = os.path.isdir(work)
+    shutil.rmtree(work, ignore_errors=True)
+    STATUS.pop(job, None)
+    return {"deleted": existed}
 
 
 # ----------------------------------------------------------------------------- furniture edits

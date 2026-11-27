@@ -4,6 +4,8 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { get as getHandoff, put as putHandoff } from "./handoff.js";
+import * as Jobs from "./jobs.js";
+import { MODELS, axoSvg } from "./buildings.js";
 
 // API location: same site by default; a static host (Vercel) points it at the
 // conversion engine via config.js or ?api=https://... in the URL.
@@ -275,7 +277,7 @@ function setTab(t) {
   canvas.style.visibility = t === "trace" ? "hidden" : "visible";
   if (t === "plan") { setCamera(ortho); fit(); }
   else if (t === "3d" || t === "raw") { if (camera !== persp) { setCamera(persp); fit(); } }
-  if (S.job && (t === "raw") !== !!S.rawLoaded) {
+  if (S.job && !S.deleted && (t === "raw") !== !!S.rawLoaded) {
     S.rawLoaded = t === "raw";
     loadBuilding(`${API}/api/files/${S.job}/${t === "raw" ? "model_faithful.glb" : "shell.glb"}`, t === "raw")
       .then(() => { furnG.visible = t !== "raw"; });
@@ -797,6 +799,7 @@ $("#btnConvert").onclick = async () => {
     sill: val("#o_ws") ?? 0.9, dxf_units: $("#o_units").value || null, plinth: val("#o_pl"),
   };
   $("#btnConvert").disabled = true;
+  if (S.job) await Jobs.discard(S.job);                 // moving on: the model on screen is no longer needed on the server
   try { await putHandoff({ file: S.file, opt }); }
   catch (e) { $("#btnConvert").disabled = false; return toast("Your browser blocked local storage, so the plan can't be passed on. Allow site data and try again.", true); }
   // the conversion runs on its own page; it sends you back here with the finished model
@@ -806,6 +809,8 @@ $("#btnConvert").onclick = async () => {
 function progress(p, m) { $("#progBar").style.width = Math.round(p * 100) + "%"; $("#progMsg").textContent = m || ""; }
 
 async function loadJob(job, st) {
+  if (S.job && S.job !== job) Jobs.discard(S.job);     // moving on to another plan removes the previous one
+  S.deleted = false; S.got = new Set();
   S.job = job; S.rawLoaded = false;
   S.plan = await (await fetch(`${API}/api/files/${job}/plan.json?t=${Date.now()}`)).json();
   S.furn = (S.plan.furniture || []).map(fromPlan);
@@ -818,6 +823,7 @@ async function loadJob(job, st) {
   $("#btnEdit").disabled = false; $("#empty").classList.add("hidden");
   setGate("ready"); resize();
   $("#saveState").textContent = "";
+  Jobs.upsert(job, { state: "done", opened: true, name: Jobs.find(job)?.name || S.file?.name || "Plan" });
   setTab("3d"); setTool("orbit"); fit(); select(null);
   window.__planforge = { ready: true, walls: S.plan.walls.length, furniture: S.furn.length,
     stairs: (S.plan.stairs || []).length, selectStair: (i) => select({ kind: "stair", s: S.plan.stairs[i] }), fit };
@@ -846,6 +852,61 @@ fetch(API + "/api/catalog").then((r) => r.json()).then((c) => (CATALOG = c)).cat
   $("#prog").classList.remove("hidden");
 });
 setGate("empty"); resize(); fit(); requestAnimationFrame(loop);
+{ const keys = Object.keys(MODELS), k = keys[Math.floor(Math.random() * keys.length)]; $("#eart").innerHTML = axoSvg(MODELS[k]()); }
+// ------------------------------------------------------------------ your plans (queue), notifications, clean-up
+const STATE_TXT = { queued: "Waiting", running: "Converting", done: "Ready", error: "Stopped" };
+Jobs.onChange((all) => {
+  $("#plansSec").classList.toggle("hidden", !all.length);
+  $("#plans").innerHTML = all.map((j) => `<li class="pl ${j.state}${j.job === S.job ? " cur" : ""}" data-j="${j.job}">
+    <span class="pl-name" title="${esc(j.name)}">${esc(j.name || "Plan")}</span>
+    <span class="pl-st">${j.job === S.job ? "On screen" : j.state === "running" ? Math.round((j.progress || 0) * 100) + "%" : STATE_TXT[j.state] || ""}</span>
+    ${j.state === "done" && j.job !== S.job ? `<button class="pl-go" data-open="${j.job}">Open</button>` : ""}
+    ${j.state !== "queued" && j.state !== "running" ? `<button class="pl-x" data-del="${j.job}" aria-label="Remove ${esc(j.name)}" title="Remove from the server">×</button>` : ""}
+  </li>`).join("");
+  $$("#plans [data-open]").forEach((b) => (b.onclick = () => openJob(b.dataset.open)));
+  $$("#plans [data-del]").forEach((b) => (b.onclick = () => Jobs.discard(b.dataset.del)));
+});
+function esc(t) { return String(t || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+async function openJob(job) {
+  try {
+    const r = await fetch(`${API}/api/status/${job}`);
+    if (!r.ok) throw new Error();
+    const st = await r.json();
+    if (st.state !== "done") throw new Error();
+    await loadJob(job, st);
+    history.replaceState(null, "", "?job=" + job + (qp.get("api") ? "&api=" + encodeURIComponent(qp.get("api")) : ""));
+  } catch (e) { toast("That plan is no longer on the server. Convert it again to rebuild it.", true); Jobs.discard(job); }
+}
+window.addEventListener("pf-job-finished", (e) => {
+  const j = e.detail;
+  if (j.state === "done") toastAction(`${j.name} is ready.`, "View model", () => openJob(j.job));
+  else toast(`${j.name} could not be converted: ${j.msg || "unknown error"}`, true);
+});
+function toastAction(m, label, fn) {
+  const t = $("#toast"); t.textContent = m + " ";
+  const b = document.createElement("button"); b.className = "toast-btn"; b.textContent = label; b.onclick = () => { t.classList.add("hidden"); fn(); };
+  t.append(b); t.classList.remove("err", "hidden");
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.add("hidden"), 12000);
+}
+// downloading the whole package (or every file) means the person has their export: remove it from the server
+const SINGLE = ["model.ifc", "build_in_revit.py", "plan.json", "model.glb"];
+function downloaded(name) {
+  if (!S.job || S.deleted) return;
+  S.got.add(name);
+  if (name === "floorplan_3d.zip" || SINGLE.every((n) => S.got.has(n))) {
+    const job = S.job;
+    setTimeout(() => {                                   // give the browser time to finish the download first
+      if (S.job !== job) return;
+      Jobs.discard(job); S.deleted = true;
+      $$("#dls .dl").forEach((a) => a.classList.add("disabled")); $("#btnExport").classList.add("disabled"); $("#btnEdit").disabled = true;
+      $("#saveState").textContent = "Downloaded. Files removed from the server";
+    }, 20000);
+  }
+}
+$$("#dls .dl").forEach((a) => a.addEventListener("click", () => downloaded(a.dataset.f)));
+$("#btnExport").addEventListener("click", () => downloaded("floorplan_3d.zip"));
+Jobs.follow();
+
 // deep links: ?job=<id> opens a finished conversion; ?error=... comes back from convert.html with the plan restored
 const qp = new URLSearchParams(location.search), qj = qp.get("job");
 if (qj) {
@@ -854,6 +915,10 @@ if (qj) {
     if (st && st.state === "done") { await loadJob(qj, st); if (qp.get("edit")) enterEdit(); }
     else { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = "That model is no longer available. Choose the plan again to rebuild it."; }
   }).catch(() => { pickBtn.classList.remove("hidden"); $("#empty .muted").textContent = "Could not reach the engine. Try again in a moment."; });
+} else if (qp.has("waiting")) {
+  const w = Jobs.find(qp.get("waiting"));
+  toast(`We'll tell you when ${w ? w.name : "your plan"} is ready. You can add another plan meanwhile.`);
+  history.replaceState(null, "", location.pathname + (qp.get("api") ? "?api=" + encodeURIComponent(qp.get("api")) : ""));
 } else if (qp.has("error")) {
   getHandoff().then((rec) => { if (rec && rec.file) setFile(rec.file); }).catch(() => {});
   if (qp.get("error") !== "cancelled" && qp.get("error") !== "1") toast("Conversion stopped: " + qp.get("error"), true);
